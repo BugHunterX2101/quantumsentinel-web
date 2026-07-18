@@ -1,0 +1,20 @@
+version: "3.9"
+services:
+  quantumsentinel:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      - DATABASE_URL=sqlite:////data/quantumsentinel.db
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-dev-secret-change-me}
+      - ALPACA_API_KEY=${ALPACA_API_KEY:-}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY:-}
+    volumes:
+      - qs_data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/meta')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  qs_data:

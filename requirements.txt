@@ -1,0 +1,12 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy>=2.0
+pyjwt>=2.8
+cryptography>=42
+kyber-py>=1.2.0
+dilithium-py>=1.4.0
+yfinance>=0.2.40
+numpy>=1.26
+requests>=2.31
+python-multipart>=0.0.9
+email-validator>=2.0

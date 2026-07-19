@@ -8,32 +8,38 @@
 </head>
 <body>
 
+<canvas id="bg-canvas"></canvas>
+<div id="loading-bar"></div>
+<div id="toast-container"></div>
+
 <div id="auth-screen" class="auth-screen">
-  <div class="auth-card">
+  <div class="auth-card fade-in-up">
     <div class="brand">
-      <span class="brand-mark">◈</span>
+      <span class="brand-mark pulse-glow">◈</span>
       <h1>QuantumSentinel</h1>
     </div>
-    <p class="tagline">The world's first open-source, mobile-first, post-quantum secure trading terminal.</p>
+    <p class="tagline" id="tagline"></p>
 
     <div class="auth-tabs">
       <button class="auth-tab active" data-tab="login">Log In</button>
       <button class="auth-tab" data-tab="register">Register</button>
     </div>
 
-    <form id="login-form" class="auth-form">
-      <label>Email<input type="email" id="login-email" required placeholder="trader@example.com"></label>
-      <label>Password<input type="password" id="login-password" required placeholder="••••••••"></label>
-      <button type="submit" class="btn-primary">Log In &amp; Establish PQC Session</button>
-      <div class="auth-error" id="login-error"></div>
-    </form>
+    <div class="auth-form-wrap">
+      <form id="login-form" class="auth-form">
+        <label>Email<input type="email" id="login-email" required placeholder="trader@example.com"></label>
+        <label>Password<input type="password" id="login-password" required placeholder="••••••••"></label>
+        <button type="submit" class="btn-primary ripple-btn"><span class="btn-label">Log In &amp; Establish PQC Session</span></button>
+        <div class="auth-error" id="login-error"></div>
+      </form>
 
-    <form id="register-form" class="auth-form hidden">
-      <label>Email<input type="email" id="register-email" required placeholder="trader@example.com"></label>
-      <label>Password<input type="password" id="register-password" required minlength="6" placeholder="min 6 characters"></label>
-      <button type="submit" class="btn-primary">Create Quantum-Safe Account</button>
-      <div class="auth-error" id="register-error"></div>
-    </form>
+      <form id="register-form" class="auth-form hidden">
+        <label>Email<input type="email" id="register-email" required placeholder="trader@example.com"></label>
+        <label>Password<input type="password" id="register-password" required minlength="6" placeholder="min 6 characters"></label>
+        <button type="submit" class="btn-primary ripple-btn"><span class="btn-label">Create Quantum-Safe Account</span></button>
+        <div class="auth-error" id="register-error"></div>
+      </form>
+    </div>
 
     <div class="auth-footnote">
       Every session begins with a hybrid <b>X25519 + ML-KEM-768</b> handshake and
@@ -42,22 +48,35 @@
   </div>
 </div>
 
+<div id="handshake-overlay" class="handshake-overlay hidden">
+  <div class="handshake-modal fade-in-up">
+    <div class="orbit-loader"><div class="orbit-core"></div><div class="orbit-ring r1"></div><div class="orbit-ring r2"></div><div class="orbit-ring r3"></div></div>
+    <div id="handshake-overlay-text">Generating X25519 ephemeral keypair…</div>
+  </div>
+</div>
+
 <div id="app" class="app hidden">
   <header class="topbar">
-    <div class="brand-small"><span class="brand-mark">◈</span> QuantumSentinel</div>
+    <div class="brand-small"><span class="brand-mark pulse-glow">◈</span> QuantumSentinel</div>
     <nav class="tabs">
       <button class="tab-btn active" data-view="dashboard">Dashboard</button>
       <button class="tab-btn" data-view="trading">Trading</button>
       <button class="tab-btn" data-view="portfolio">Portfolio</button>
       <button class="tab-btn" data-view="security">Security</button>
+      <span class="tab-indicator"></span>
     </nav>
     <div class="topbar-right">
+      <span class="live-dot" id="live-indicator" title="Live auto-refresh"><span class="dot-core"></span></span>
       <div class="safety-score" id="safety-score-badge" title="Quantum Safety Score">
+        <svg viewBox="0 0 44 44" class="score-ring">
+          <circle class="score-ring-bg" cx="22" cy="22" r="18"></circle>
+          <circle class="score-ring-fill" id="score-ring-fill" cx="22" cy="22" r="18"></circle>
+        </svg>
         <span id="safety-score-value">--</span>
       </div>
       <span id="user-email" class="user-email"></span>
-      <button id="beginner-toggle" class="btn-ghost">Beginner Mode: <b id="beginner-state">On</b></button>
-      <button id="logout-btn" class="btn-ghost">Log Out</button>
+      <button id="beginner-toggle" class="btn-ghost ripple-btn">Beginner Mode: <b id="beginner-state">On</b></button>
+      <button id="logout-btn" class="btn-ghost ripple-btn">Log Out</button>
     </div>
   </header>
 
@@ -67,8 +86,8 @@
     <!-- DASHBOARD -->
     <section id="view-dashboard" class="view active">
       <div class="section-header">
-        <h2>Quantum-Inspired Signal Engine</h2>
-        <button id="refresh-signals" class="btn-secondary">↻ Refresh Signals</button>
+        <h2>Quantum-Inspired Signal Engine <span class="live-tag">LIVE</span></h2>
+        <button id="refresh-signals" class="btn-secondary ripple-btn"><span class="refresh-icon">↻</span> Refresh Signals</button>
       </div>
       <p class="hint" data-beginner>Signals are generated by the <b>Simulated Bifurcation Algorithm (SBA)</b> —
         a quantum-inspired optimizer that runs on ordinary CPUs and analyzes real market data
@@ -99,7 +118,7 @@
               </label>
               <label id="limit-price-wrap" class="hidden">Limit Price <input type="number" id="order-limit-price" step="0.01"></label>
             </div>
-            <button type="submit" class="btn-primary">Sign with ML-DSA-65 &amp; Submit</button>
+            <button type="submit" class="btn-primary ripple-btn" id="order-submit-btn"><span class="btn-label">Sign with ML-DSA-65 &amp; Submit</span></button>
             <div class="auth-error" id="order-error"></div>
           </form>
         </div>
@@ -131,8 +150,8 @@
         <div class="card">
           <h3>Cryptographic Health</h3>
           <div id="key-health"></div>
-          <button id="rotate-dsa" class="btn-secondary">Rotate ML-DSA-65 Keys</button>
-          <button id="rotate-kem" class="btn-secondary">Rotate ML-KEM-768 Keys</button>
+          <button id="rotate-dsa" class="btn-secondary ripple-btn">Rotate ML-DSA-65 Keys</button>
+          <button id="rotate-kem" class="btn-secondary ripple-btn">Rotate ML-KEM-768 Keys</button>
         </div>
         <div class="card">
           <h3>PQC Handshake Trace</h3>

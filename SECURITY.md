@@ -24,6 +24,22 @@
   convenience. In the full mobile architecture, private keys are generated
   on-device and never leave the Secure Enclave / Android Keystore.
 - JWT uses HS256 for simplicity; the spec calls for RS256 with rotated keys.
+- The reference deployment rate limiter is process-local. Deployments with
+  more than one application process must replace it with a shared, atomic
+  Redis-backed limiter before being exposed to the internet.
+- The server audit-signing identity is generated at process start in this
+  demo. Persist it in an HSM/KMS (and retain public-key history) before
+  relying on audit verification across restarts.
+
+## Deployment baseline
+
+- Set `ENVIRONMENT=production`, a unique 32+ character `JWT_SECRET_KEY`,
+  explicit `CORS_ORIGINS`, and explicit `ALLOWED_HOSTS`.
+- Terminate TLS 1.3 at a managed reverse proxy; do not expose Uvicorn
+  directly to the public internet.
+- Use PostgreSQL, Redis-backed rate limiting/replay protection, a managed
+  secret store, and a hardened liboqs/HSM crypto service for production.
+  This repository remains paper-trading only.
 
 ## Reporting a vulnerability
 

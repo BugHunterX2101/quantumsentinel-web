@@ -92,7 +92,8 @@ def risk_metrics(db: Session, user_id: str) -> dict:
     if len(trades) < 2:
         return {
             "sharpe_ratio": 0.0, "max_drawdown": 0.0, "win_rate": 0.0,
-            "total_trades": len(trades), "var_95": 0.0,
+            "total_trades": len(trades), "var_95": 0.0, "var_99": 0.0,
+            "equity_curve": equity_curve_from_trades(db, user_id),
         }
 
     curve = equity_curve_from_trades(db, user_id)
@@ -120,6 +121,8 @@ def risk_metrics(db: Session, user_id: str) -> dict:
     sorted_returns = sorted(returns)
     var_idx = max(0, int(0.05 * len(sorted_returns)) - 1)
     var_95 = sorted_returns[var_idx] if sorted_returns else 0.0
+    var99_idx = max(0, int(0.01 * len(sorted_returns)) - 1)
+    var_99 = sorted_returns[var99_idx] if sorted_returns else 0.0
 
     return {
         "sharpe_ratio": round(sharpe, 3),
@@ -127,5 +130,6 @@ def risk_metrics(db: Session, user_id: str) -> dict:
         "win_rate": round(win_rate, 3),
         "total_trades": total_trades,
         "var_95": round(var_95, 4),
+        "var_99": round(var_99, 4),
         "equity_curve": [round(v, 2) for v in curve],
     }

@@ -60,6 +60,50 @@ class Strategy(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
+class Backtest(Base):
+    __tablename__ = "backtests"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    strategy_id = Column(String, ForeignKey("strategies.id"), nullable=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    start_date = Column(DateTime(timezone=True), nullable=True)
+    end_date = Column(DateTime(timezone=True), nullable=True)
+    initial_capital = Column(Numeric, default=100_000)
+    final_capital = Column(Numeric, nullable=False)
+    sharpe_ratio = Column(Numeric, default=0)
+    max_drawdown = Column(Numeric, default=0)
+    win_rate = Column(Numeric, default=0)
+    total_trades = Column(Integer, default=0)
+    status = Column(String, default="COMPLETED")
+    result_json = Column(JSON, default=dict)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(80), nullable=False)
+    key_prefix = Column(String(16), nullable=False)
+    key_hash = Column(String(128), nullable=False, unique=True, index=True)
+    scopes = Column(JSON, default=list)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    is_revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class Webhook(Base):
+    __tablename__ = "webhooks"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    url = Column(String(2048), nullable=False)
+    secret_hash = Column(String(128), nullable=False)
+    event_types = Column(JSON, default=list)
+    is_active = Column(Boolean, default=True)
+    last_delivery_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
 class Trade(Base):
     __tablename__ = "trades"
     id = Column(String, primary_key=True, default=gen_uuid)
@@ -69,6 +113,7 @@ class Trade(Base):
     quantity = Column(Numeric, nullable=False)
     order_type = Column(String, default="market")  # market | limit
     limit_price = Column(Numeric, nullable=True)
+    stop_price = Column(Numeric, nullable=True)
     time_in_force = Column(String, default="day")
     status = Column(String, default="PENDING")
     alpaca_order_id = Column(String, nullable=True)

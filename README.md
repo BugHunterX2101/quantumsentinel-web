@@ -1,50 +1,139 @@
 # QuantumSentinel
 
-**The world's first open-source, mobile-first, post-quantum secure trading terminal — web edition.**
+**A paper-trading terminal for experimenting with post-quantum security, quantum-inspired signals, and auditable execution.**
 
-QuantumSentinel is a working reference implementation of a post-quantum
-secure algorithmic-trading web app, built from the QuantumSentinel PRD and
-Technical Architecture spec. It runs genuine NIST-standardized cryptography
-end-to-end — not mocked byte sizes, actual algorithm execution — combined
-with a quantum-inspired signal engine driven by real market data.
+QuantumSentinel is an open-source reference implementation based on the product requirements and technical architecture documents in this repository. It combines a mobile-friendly dashboard, real market-data signal generation, paper execution, portfolio risk analytics, signed audit evidence, scoped SDK access, and signed webhooks.
 
-![Dashboard](https://gumloop.com/artifacts/LG8YkrmpgXibTs4g92H3Cz?version_id=TGxXfaBBCxKbqm8bRP7D2B)
+> **Safety boundary:** QuantumSentinel is paper-trading software. It is not a live brokerage, custodian, financial adviser, or production-certified cryptographic service. Never connect production financial credentials without completing the hardening steps in [SECURITY.md](SECURITY.md).
 
-## What's real here
+## What is implemented
 
-| Capability | Implementation |
-|---|---|
-| **ML-KEM-768** (FIPS 203) key encapsulation | [`kyber-py`](https://github.com/GiacomoPope/kyber-py) — pure-Python, spec-exact byte sizes (pk 1184B / sk 2400B / ct 1088B / ss 32B) |
-| **ML-DSA-65** (FIPS 204) digital signatures | [`dilithium-py`](https://github.com/GiacomoPope/dilithium-py) — signs every order and every audit-log entry; signatures are re-verified on read |
-| **Hybrid handshake** | Real X25519 ECDH (via `cryptography`/OpenSSL) + ML-KEM-768, mixed with HKDF-SHA256, exactly as specified in the architecture doc |
-| **Quantum-inspired Simulated Bifurcation Algorithm (SBA)** signal engine | NumPy port of the Rust reference design, computing RSI/MACD/momentum/Bollinger features and a coupling matrix over **real Yahoo Finance data** |
-| **Paper trading** | Routes to the real Alpaca paper API if `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` are set, otherwise fills orders against live market prices with a built-in simulated broker |
-| **Portfolio analytics** | Sharpe ratio, max drawdown, VaR 95%, equity curve — computed from the actual trade ledger |
-| **Security dashboard** | Key-rotation schedule (ML-KEM-768 daily / ML-DSA-65 90-day), Quantum Safety Score, ML-DSA-65-signed + re-verified audit trail |
-| **Crypto-agility** | Algorithm registry pattern (`backend/crypto/pqc.py`) — add ML-KEM-1024 / ML-DSA-87 / SLH-DSA by adding a registry entry |
-| **Beginner Mode** | Plain-language tooltips throughout the UI |
+| Product capability | Current implementation |
+| --- | --- |
+| PQC handshake | X25519 + ML-KEM-768 mixed with HKDF-SHA256; ML-DSA-65 signs the server hello |
+| Signed execution | ML-DSA-65 order signatures and signed, re-verified audit entries |
+| Signal engine | NumPy SBA implementation with RSI, MACD, momentum, Bollinger width, and market correlations from Yahoo Finance |
+| Real-time dashboard | Authenticated WebSocket signal stream with reconnect backoff and polling fallback |
+| Paper trading | Alpaca paper API integration or a local market-price simulator |
+| Order controls | Market, limit, stop, stop-limit, DAY/GTC/IOC, duplicate blocking, oversell prevention, and concentration limits |
+| Strategy workflow | Moving-average strategy builder, persisted strategies, and historical backtests |
+| Portfolio | Positions, P&L, equity curve, Sharpe ratio, max drawdown, VaR 95/99, and CSV export |
+| Security operations | Key health, rotation, Quantum Safety Score, signed audit log, and compliance evidence export |
+| Enterprise SDK | Hashed scoped `X-QS-API-KEY` credentials for read/trade operations |
+| Webhooks | Public HTTPS-only endpoints with encrypted-at-rest signing secrets and HMAC event signatures |
+| Beginner experience | Five-step onboarding tour, plain-language tips, and a visual community hub |
 
-This is a single-process web port of the full multi-service architecture
-described in the design docs (API Gateway + Trading Engine + PQC Crypto
-Service + Signal Engine collapsed into one FastAPI app, SQLite instead of
-PostgreSQL+Redis) — intentionally simplified for a portable, easy-to-run
-web demo rather than a Rust/Docker-Compose microservice mesh. The mobile
-React Native client and Rust signal engine from the original spec are out
-of scope for this repo; the SBA math and API surface are preserved so a
-native client could be built against the same backend.
+## Architecture
+
+The checked-in application is intentionally portable: FastAPI, SQLAlchemy, SQLite, and in-process services run as one process. The PRD's distributed Postgres/Redis/Rust/liboqs deployment is the production evolution path, not a claim about this demo's default runtime.
+
+```mermaid
+flowchart LR
+    Browser[Browser dashboard\nVanilla JS + Web Crypto]
+    Gateway[FastAPI gateway\nAuth, CORS, rate limits, headers]
+    Auth[JWT + PQC handshake]
+    Signals[SBA signal engine\nYahoo Finance + NumPy]
+    Trading[Paper trading engine\nAlpaca or simulator]
+    Portfolio[Portfolio and risk analytics]
+    Security[Audit + key health\nML-DSA signatures]
+    Integrations[SDK keys + signed webhooks]
+    DB[(SQLite / PostgreSQL-compatible SQLAlchemy)]
+    ExternalAlpaca[(Alpaca paper API)]
+    ExternalGitHub[(GitHub public API)]
+
+    Browser -->|HTTPS / WebSocket| Gateway
+    Gateway --> Auth
+    Gateway --> Signals
+    Gateway --> Trading
+    Gateway --> Portfolio
+    Gateway --> Security
+    Gateway --> Integrations
+    Trading --> ExternalAlpaca
+    Signals -->|Market data| Yahoo[(Yahoo Finance)]
+    Integrations -->|Signed HTTPS events| Consumer[Customer automation]
+    Browser -->|Read-only community data| ExternalGitHub
+    Auth --> DB
+    Trading --> DB
+    Portfolio --> DB
+    Security --> DB
+    Integrations --> DB
+```
+
+### Secure session and order flow
+
+```mermaid
+sequenceDiagram
+    participant C as Browser / SDK
+    participant G as FastAPI gateway
+    participant P as PQC service layer
+    participant T as Trading service
+    participant A as Alpaca paper API
+    participant D as SQL database
+
+    C->>G: Login (email + password)
+    G-->>C: Short-lived JWT
+    C->>G: PQC handshake (X25519 public key + nonce)
+    G->>P: Generate ML-KEM encapsulation
+    P-->>G: Ciphertext + shared secret
+    G-->>C: Signed ServerHello + derived session metadata
+    C->>G: Order request / X-QS-API-KEY (where applicable)
+    G->>T: Validate side, quantity, limits, duplicate, position
+    T->>P: ML-DSA-65 sign order payload
+    T->>A: Submit paper order with APCA headers
+    A-->>T: Accepted / filled / rejected
+    T->>D: Persist trade and signed audit event
+    T-->>C: Order status
+    T-->>C: HMAC-signed webhook event (if configured)
+```
+
+### Repository structure
+
+```mermaid
+mindmap
+  root((quantumsentinel-web))
+    backend
+      main.py
+        REST routes
+        WebSocket stream
+        security middleware
+      crypto
+        pqc.py
+      services
+        auth_service.py
+        signal_engine.py
+        trading_service.py
+        portfolio_service.py
+        security_service.py
+        backtest_service.py
+        integration_service.py
+      models.py
+      schemas.py
+      database.py
+      config.py
+    frontend
+      index.html
+      app.js
+      styles.css
+    Dockerfile
+    docker-compose.yml
+    requirements.txt
+    SECURITY.md
+    README.md
+```
 
 ## Quick start
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/BugHunterX2101/quantumsentinel-web.git
 cd quantumsentinel-web
+python -m venv .venv
+# Windows: .venv\\Scripts\\activate
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn backend.main:app --host 0.0.0.0 --port 8000
+uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Open `http://localhost:8000`, register an account, and you're in — real
-PQC handshake, live signals, paper trading, portfolio analytics, and a
-signed audit log all work with **zero configuration**.
+Open <http://127.0.0.1:8000>, register an account, complete the onboarding tour, and run a paper workflow. Interactive OpenAPI documentation is available at <http://127.0.0.1:8000/docs>.
 
 ### Docker
 
@@ -52,46 +141,56 @@ signed audit log all work with **zero configuration**.
 docker compose up --build
 ```
 
-### Optional: connect real Alpaca paper trading
+The default container uses a persistent SQLite volume for portability. Set `DATABASE_URL` to PostgreSQL for a multi-instance deployment and add a shared Redis implementation for distributed rate limits, sessions, and event delivery.
+
+### Alpaca paper trading
 
 ```bash
-cp .env.example .env
-# fill in ALPACA_API_KEY / ALPACA_SECRET_KEY from https://alpaca.markets
+copy .env.example .env       # Windows
+# cp .env.example .env       # macOS/Linux
 ```
 
-Without these, orders fill against live Yahoo Finance prices via a
-built-in paper broker — the whole order lifecycle still works end-to-end.
+Set `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and the paper API base URL. If credentials are absent, the simulator fills marketable orders against the latest market price and keeps the full order lifecycle locally.
 
-## Architecture
+## API surface
 
+| Area | Endpoints |
+| --- | --- |
+| Auth | `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/pqc-handshake` |
+| Signals | `GET /api/signals/latest`, `GET /api/signals/refresh`, `WS /api/signals/stream` |
+| Trading | `POST/GET /api/trading/orders`, `DELETE /api/trading/orders/{order_id}` |
+| Strategies | `GET /api/strategies/templates`, `GET/POST /api/strategies`, `POST/GET /api/backtests` |
+| Portfolio | `GET /api/portfolio/positions`, `GET /api/portfolio/risk-metrics`, `GET /api/portfolio/export` |
+| Security | `GET /api/security/health`, `GET /api/security/audit-log`, `GET /api/security/compliance-report`, `POST /api/security/rotate-keys` |
+| SDK | `GET /api/sdk/portfolio` with `X-QS-API-KEY: <read-key>`, `POST /api/sdk/orders` with a `trade` key |
+| Integrations | `/api/integrations/api-keys` and `/api/integrations/webhooks` |
+
+API keys are returned only once at creation. Store them in a secret manager, grant the minimum scope, and revoke them immediately if exposed.
+
+## Configuration
+
+Important variables are documented in [.env.example](.env.example):
+
+- `ENVIRONMENT`, `JWT_SECRET_KEY`, `CORS_ORIGINS`, and `ALLOWED_HOSTS`
+- `DATABASE_URL`
+- `WEBHOOK_ENCRYPTION_KEY`
+- `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `ALPACA_BASE_URL`
+
+Production mode refuses weak/missing secrets and wildcard CORS. Put TLS 1.3, a managed secret store, PostgreSQL, Redis, and a hardened liboqs/HSM-backed PQC service in front of this reference process before handling sensitive workloads.
+
+## Verification
+
+```bash
+node --check frontend/app.js
+python -m py_compile backend/main.py backend/schemas.py backend/models.py
+git diff --check
 ```
-backend/
-  main.py                 FastAPI app — all routes
-  crypto/pqc.py           ML-KEM-768, ML-DSA-65, hybrid handshake, algorithm registry
-  services/
-    signal_engine.py      SBA quantum-inspired signal engine (real market data)
-    trading_service.py    Paper broker (Alpaca or simulated)
-    portfolio_service.py  Positions, Sharpe/drawdown/VaR
-    security_service.py   Audit log signing/verification, key rotation
-    auth_service.py       JWT + PQC session handshake
-  models.py, schemas.py, database.py
-frontend/
-  index.html / styles.css / app.js   Vanilla-JS single-page dashboard
-```
 
-## API
+The full Docker startup check requires a running Docker Engine. Market-data and Alpaca integration tests also require network access and credentials where applicable.
 
-Interactive OpenAPI docs are served at `/docs` once the server is running.
-Key endpoints: `POST /api/auth/register`, `POST /api/auth/pqc-handshake`,
-`GET /api/signals/latest`, `POST /api/trading/orders`,
-`GET /api/portfolio/risk-metrics`, `GET /api/security/audit-log`,
-`POST /api/security/rotate-keys`, `GET /api/algorithms`.
+## Security and limitations
 
-## Disclaimer
-
-Paper trading only — no live brokerage or custodial capability. Signals
-from the SBA engine are informational/simulation-only, not financial
-advice. See [SECURITY.md](SECURITY.md) for the threat model.
+Read [SECURITY.md](SECURITY.md) before deployment. The bundled pure-Python PQC packages are reference implementations and are not constant-time. The local limiter and audit signing identity are process-local simplifications. This project does not claim FIPS 140-3 validation, legal compliance certification, zero-day immunity, or protection against every possible breach.
 
 ## License
 

@@ -47,12 +47,17 @@ def _alpaca_headers():
 
 
 def submit_alpaca_order(asset: str, side: str, qty: float, order_type: str,
-                         limit_price: float | None, time_in_force: str) -> dict:
+                         limit_price: float | None, stop_price: float | None,
+                         time_in_force: str) -> dict:
     body = {
         "symbol": asset, "qty": str(qty), "side": side,
         "type": order_type, "time_in_force": time_in_force,
     }
     if order_type == "limit" and limit_price:
+        body["limit_price"] = str(limit_price)
+    if order_type in ("stop", "stop_limit") and stop_price:
+        body["stop_price"] = str(stop_price)
+    if order_type == "stop_limit" and limit_price:
         body["limit_price"] = str(limit_price)
     resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=body,
                           headers=_alpaca_headers(), timeout=10)
@@ -61,12 +66,19 @@ def submit_alpaca_order(asset: str, side: str, qty: float, order_type: str,
 
 
 def simulate_fill(asset: str, side: str, qty: float, order_type: str,
-                   limit_price: float | None) -> dict:
+                   limit_price: float | None, stop_price: float | None = None) -> dict:
     """Local paper-broker matching engine using the latest real market price."""
     last_price = get_last_price(asset)
     if order_type == "market":
         return {"status": "FILLED", "filled_price": last_price, "alpaca_order_id": None}
-    # limit order: fill immediately if marketable, else leave pending
+    if order_type in ("stop", "stop_limit"):
+        triggered = (side == "buy" and last_price >= (stop_price or float("inf"))) or \
+                    (side == "sell" and last_price <= (stop_price or 0))
+        if not triggered:
+            return {"status": "ACCEPTED", "filled_price": None, "alpaca_order_id": None}
+        if order_type == "stop":
+            return {"status": "FILLED", "filled_price": last_price, "alpaca_order_id": None}
+    # limit and triggered stop-limit order: fill immediately if marketable, else pending
     marketable = (side == "buy" and last_price <= limit_price) or \
                  (side == "sell" and last_price >= limit_price)
     if marketable:

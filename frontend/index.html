@@ -35,7 +35,7 @@
 
       <form id="register-form" class="auth-form hidden">
         <label>Email<input type="email" id="register-email" required placeholder="trader@example.com"></label>
-        <label>Password<input type="password" id="register-password" required minlength="6" placeholder="min 6 characters"></label>
+        <label>Password<input type="password" id="register-password" required minlength="12" placeholder="12+ characters, upper/lower case and number"></label>
         <button type="submit" class="btn-primary ripple-btn"><span class="btn-label">Create Quantum-Safe Account</span></button>
         <div class="auth-error" id="register-error"></div>
       </form>
@@ -61,8 +61,11 @@
     <nav class="tabs">
       <button class="tab-btn active" data-view="dashboard">Dashboard</button>
       <button class="tab-btn" data-view="trading">Trading</button>
+      <button class="tab-btn" data-view="strategies">Strategies</button>
       <button class="tab-btn" data-view="portfolio">Portfolio</button>
       <button class="tab-btn" data-view="security">Security</button>
+      <button class="tab-btn" data-view="integrations">Integrations</button>
+      <button class="tab-btn" data-view="community">Community</button>
       <span class="tab-indicator"></span>
     </nav>
     <div class="topbar-right">
@@ -114,9 +117,10 @@
             </div>
             <div class="row">
               <label>Order Type
-                <select id="order-type"><option value="market">Market</option><option value="limit">Limit</option></select>
+                <select id="order-type"><option value="market">Market</option><option value="limit">Limit</option><option value="stop">Stop</option><option value="stop_limit">Stop Limit</option></select>
               </label>
               <label id="limit-price-wrap" class="hidden">Limit Price <input type="number" id="order-limit-price" step="0.01"></label>
+              <label id="stop-price-wrap" class="hidden">Stop Price <input type="number" id="order-stop-price" step="0.01"></label>
             </div>
             <button type="submit" class="btn-primary ripple-btn" id="order-submit-btn"><span class="btn-label">Sign with ML-DSA-65 &amp; Submit</span></button>
             <div class="auth-error" id="order-error"></div>
@@ -130,8 +134,45 @@
     </section>
 
     <!-- PORTFOLIO -->
+    <section id="view-strategies" class="view">
+      <div class="section-header"><h2>Visual Strategy Builder</h2></div>
+      <p class="hint" data-beginner>Start with a proven moving-average template, tune its windows, then backtest it against historical market data before paper trading.</p>
+      <div class="trading-grid">
+        <div class="card">
+          <h3>Moving-average crossover template</h3>
+          <form id="strategy-form">
+            <label>Strategy name <input id="strategy-name" maxlength="80" value="My MA Crossover" required></label>
+            <label>Asset <select id="strategy-asset"></select></label>
+            <div class="row"><label>Fast window <input id="strategy-fast" type="number" min="2" max="100" value="20" required></label><label>Slow window <input id="strategy-slow" type="number" min="5" max="250" value="50" required></label></div>
+            <label>Historical period <select id="strategy-period"><option value="6mo">6 months</option><option value="1y" selected>1 year</option><option value="2y">2 years</option><option value="5y">5 years</option></select></label>
+            <button type="submit" class="btn-primary ripple-btn"><span class="btn-label">Save &amp; Run Backtest</span></button>
+            <div class="auth-error" id="strategy-error"></div>
+          </form>
+        </div>
+        <div class="card"><h3>Latest Backtest</h3><div id="backtest-result" class="empty-state">Choose a template and run historical validation.</div><h3>Saved Strategies</h3><div id="strategy-list" class="order-list"></div></div>
+      </div>
+    </section>
+
+    <section id="view-integrations" class="view">
+      <div class="section-header"><h2>Enterprise Integrations</h2></div>
+      <p class="hint" data-beginner>Create least-privilege SDK credentials and event webhooks. Secrets are shown once—store them in your own secret manager.</p>
+      <div class="trading-grid">
+        <div class="card"><h3>Create scoped API key</h3><form id="api-key-form"><label>Name <input id="api-key-name" value="Automation key" maxlength="80" required></label><label>Scopes <select id="api-key-scopes" multiple size="3"><option value="read" selected>Read portfolio</option><option value="trade">Place paper orders</option><option value="admin">Administration</option></select></label><button class="btn-primary ripple-btn" type="submit"><span class="btn-label">Create API Key</span></button></form><div id="api-key-secret" class="hint"></div><div id="api-key-list" class="order-list"></div></div>
+        <div class="card"><h3>Signed webhooks</h3><form id="webhook-form"><label>HTTPS endpoint <input id="webhook-url" type="url" placeholder="https://example.com/qs-events" required></label><label>Events <select id="webhook-events" multiple size="4"><option value="order.filled" selected>Order filled</option><option value="order.rejected">Order rejected</option><option value="order.cancelled">Order cancelled</option><option value="key.rotated" selected>Key rotated</option></select></label><button class="btn-primary ripple-btn" type="submit"><span class="btn-label">Add Webhook</span></button></form><div id="webhook-secret" class="hint"></div><div id="webhook-list" class="order-list"></div></div>
+      </div>
+    </section>
+
+    <section id="view-community" class="view">
+      <div class="section-header"><h2>Open-Source Contribution Hub</h2><a class="btn-secondary" href="https://github.com/BugHunterX2101/quantumsentinel-web" target="_blank" rel="noopener noreferrer">Open GitHub</a></div>
+      <p class="hint" data-beginner>Browse contribution opportunities and repository health. Data comes from the public GitHub API and refreshes when this tab opens.</p>
+      <div id="community-stats" class="metrics-row"></div>
+      <div class="trading-grid"><div class="card"><h3>Good first issues</h3><div id="community-issues" class="order-list"></div></div><div class="card"><h3>Recent releases</h3><div id="community-releases" class="order-list"></div></div></div>
+    </section>
+
+    <!-- PORTFOLIO -->
     <section id="view-portfolio" class="view">
       <div class="metrics-row" id="risk-metrics"></div>
+      <div class="section-header compact"><p class="hint">Portfolio exports contain paper-trading positions and calculated risk metrics.</p><button class="btn-secondary ripple-btn" id="portfolio-export">Export CSV</button></div>
       <div class="portfolio-grid">
         <div class="card">
           <h3>Open Positions</h3>
@@ -152,6 +193,7 @@
           <div id="key-health"></div>
           <button id="rotate-dsa" class="btn-secondary ripple-btn">Rotate ML-DSA-65 Keys</button>
           <button id="rotate-kem" class="btn-secondary ripple-btn">Rotate ML-KEM-768 Keys</button>
+          <button id="compliance-export" class="btn-secondary ripple-btn">Download Compliance Evidence</button>
         </div>
         <div class="card">
           <h3>PQC Handshake Trace</h3>
@@ -166,6 +208,10 @@
       </div>
     </section>
   </main>
+</div>
+
+<div id="onboarding-modal" class="handshake-overlay hidden" role="dialog" aria-modal="true" aria-label="Beginner onboarding">
+  <div class="handshake-modal"><h2 id="onboarding-title">Welcome to QuantumSentinel</h2><p id="onboarding-body" class="hint"></p><button id="onboarding-next" class="btn-primary ripple-btn"><span class="btn-label">Start tour</span></button><button id="onboarding-skip" class="btn-ghost">Skip</button></div>
 </div>
 
 <script src="/assets/app.js"></script>

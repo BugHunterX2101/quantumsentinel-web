@@ -6,6 +6,8 @@ const state = {
   meta: null,
   lastSignals: {},   // asset -> last confidence, for diff-highlighting
   pollTimer: null,
+  signalSocket: null,
+  signalReconnectMs: 1000,
   activeView: 'dashboard',
 };
 
@@ -39,7 +41,12 @@ function toast(title, body, type = 'info', duration = 3800) {
   const container = document.getElementById('toast-container');
   const el = document.createElement('div');
   el.className = `toast ${type}`;
-  el.innerHTML = `<div class="toast-title">${title}</div><div class="toast-body">${body || ''}</div>`;
+  // Error text can originate at the API boundary; never inject it as HTML.
+  const titleEl = document.createElement('div');
+  titleEl.className = 'toast-title'; titleEl.textContent = title;
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'toast-body'; bodyEl.textContent = body || '';
+  el.append(titleEl, bodyEl);
   container.appendChild(el);
   setTimeout(() => {
     el.classList.add('leaving');
@@ -65,6 +72,9 @@ function api(path, opts = {}, opts2 = {}) {
 }
 
 const b64encode = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (char) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+}[char]));
 
 // ===========================================================================
 // Ripple effect on all buttons
@@ -348,6 +358,7 @@ function switchView(view) {
     dashboard: 'Beginner tip: green BUY badges and higher confidence bars mean the signal engine found stronger multi-asset agreement — it is not a guarantee.',
     trading: 'Beginner tip: every order you submit here is cryptographically signed with ML-DSA-65 before it is sent, and settles as a paper (simulated) trade.',
     portfolio: 'Beginner tip: Sharpe ratio > 1 is generally considered good risk-adjusted performance; max drawdown shows your worst peak-to-trough loss.',
+    strategies: 'Beginner tip: validate a strategy on historical data first. A positive backtest is not a prediction of future returns.',
     security: 'Beginner tip: the Quantum Safety Score reflects how fresh your cryptographic keys are — green means fully rotated and compliant.',
   };
   const banner = document.getElementById('beginner-banner');
@@ -359,14 +370,17 @@ function switchView(view) {
   }
   if (view === 'dashboard') loadDashboard();
   if (view === 'trading') loadTrading();
+  if (view === 'strategies') loadStrategies();
   if (view === 'portfolio') loadPortfolio();
   if (view === 'security') loadSecurity();
+  if (view === 'integrations') loadIntegrations();
+  if (view === 'community') loadCommunity();
   restartPolling();
 }
 
 function restartPolling() {
   if (state.pollTimer) clearInterval(state.pollTimer);
-  const loaders = { dashboard: loadDashboard, trading: refreshOrders, portfolio: loadPortfolio, security: loadSecurity };
+  const loaders = { dashboard: loadDashboard, trading: refreshOrders, strategies: loadStrategies, portfolio: loadPortfolio, security: loadSecurity, integrations: loadIntegrations, community: loadCommunity };
   const fn = loaders[state.activeView];
   if (!fn) return;
   state.pollTimer = setInterval(() => fn(true), 20000);
@@ -385,6 +399,7 @@ document.getElementById('beginner-toggle').addEventListener('click', () => {
 });
 
 document.getElementById('logout-btn').addEventListener('click', () => {
+  if (state.signalSocket) state.signalSocket.close();
   localStorage.removeItem('qs_token');
   localStorage.removeItem('qs_user');
   location.reload();
@@ -395,8 +410,75 @@ async function bootstrapApp() {
   state.meta = await api('/api/meta');
   const sel = document.getElementById('order-asset');
   sel.innerHTML = state.meta.tracked_assets.map((a) => `<option value="${a}">${a}</option>`).join('');
+  document.getElementById('strategy-asset').innerHTML = sel.innerHTML;
   switchView('dashboard');
+  connectSignalStream();
+  startOnboardingIfNeeded();
 }
+
+function connectSignalStream() {
+  if (!state.token || state.signalSocket) return;
+  const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${scheme}//${location.host}/api/signals/stream`, ['qs', state.token]);
+  state.signalSocket = socket;
+  socket.onopen = () => { state.signalReconnectMs = 1000; };
+  socket.onmessage = (event) => {
+    try { if (state.activeView === 'dashboard') loadDashboard(true, JSON.parse(event.data)); } catch (_) {}
+  };
+  socket.onclose = () => {
+    if (state.signalSocket !== socket) return;
+    state.signalSocket = null;
+    const delay = state.signalReconnectMs;
+    state.signalReconnectMs = Math.min(30000, delay * 2);
+    if (state.token) setTimeout(connectSignalStream, delay);
+  };
+}
+
+async function loadStrategies() {
+  const list = document.getElementById('strategy-list');
+  const strategies = await api('/api/strategies', {}, { silent: true }).catch(() => []);
+  list.innerHTML = strategies.map((s) => `<div class="order-row"><span>${escapeHtml(s.name)} · ${escapeHtml((s.assets || []).join(', '))}</span><span>${Number(s.config.fast_window)}/${Number(s.config.slow_window)} day</span></div>`).join('') || '<div class="empty-state">No saved strategies yet.</div>';
+}
+
+document.getElementById('strategy-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const error = document.getElementById('strategy-error'); error.textContent = '';
+  const btn = e.currentTarget.querySelector('button[type=submit]');
+  const body = {
+    name: document.getElementById('strategy-name').value,
+    asset: document.getElementById('strategy-asset').value,
+    fast_window: Number(document.getElementById('strategy-fast').value),
+    slow_window: Number(document.getElementById('strategy-slow').value),
+    period: document.getElementById('strategy-period').value,
+  };
+  setButtonLoading(btn, true, 'Backtesting historical data…');
+  try {
+    await api('/api/strategies', { method: 'POST', body: JSON.stringify(body) });
+    const result = await api('/api/backtests', { method: 'POST', body: JSON.stringify(body) });
+    document.getElementById('backtest-result').innerHTML = `<div class="metrics-row"><div class="metric-box"><div class="val">${(result.total_return * 100).toFixed(1)}%</div><div class="lbl">Total Return</div></div><div class="metric-box"><div class="val">${result.sharpe_ratio.toFixed(2)}</div><div class="lbl">Sharpe</div></div><div class="metric-box"><div class="val">${(result.max_drawdown * 100).toFixed(1)}%</div><div class="lbl">Max Drawdown</div></div></div><p class="hint">${result.asset} · ${result.period} · ${result.total_trades} order events · historical simulation only.</p>`;
+    await loadStrategies(); toast('Backtest completed', `${result.asset} total return: ${(result.total_return * 100).toFixed(1)}%`, 'success');
+  } catch (err) { error.textContent = err.message; } finally { setButtonLoading(btn, false); }
+});
+
+const onboardingSteps = [
+  ['Welcome to QuantumSentinel', 'This five-step tour shows how to read signals, test a strategy, place a paper order, review risk, and check cryptographic health.'],
+  ['1 · Read signals', 'The dashboard combines market indicators with a quantum-inspired optimizer. Confidence describes model conviction, not certainty.'],
+  ['2 · Test before trading', 'Use Strategies to tune a moving-average template and validate it against historical data.'],
+  ['3 · Paper trade only', 'Orders are simulated or routed only to an Alpaca paper account. No real-money brokerage is included.'],
+  ['4 · Monitor safety', 'Portfolio shows risk metrics and Security shows key freshness plus verifiable audit records.'],
+];
+let onboardingIndex = 0;
+function startOnboardingIfNeeded() {
+  if (!state.beginner || localStorage.getItem('qs_onboarding_complete') === 'true') return;
+  const modal = document.getElementById('onboarding-modal'); modal.classList.remove('hidden'); renderOnboarding();
+}
+function renderOnboarding() {
+  document.getElementById('onboarding-title').textContent = onboardingSteps[onboardingIndex][0];
+  document.getElementById('onboarding-body').textContent = onboardingSteps[onboardingIndex][1];
+  document.querySelector('#onboarding-next .btn-label').textContent = onboardingIndex === onboardingSteps.length - 1 ? 'Finish tour' : 'Next';
+}
+document.getElementById('onboarding-next').addEventListener('click', () => { onboardingIndex++; if (onboardingIndex >= onboardingSteps.length) { localStorage.setItem('qs_onboarding_complete', 'true'); document.getElementById('onboarding-modal').classList.add('hidden'); } else renderOnboarding(); });
+document.getElementById('onboarding-skip').addEventListener('click', () => { localStorage.setItem('qs_onboarding_complete', 'true'); document.getElementById('onboarding-modal').classList.add('hidden'); });
 
 function skeletonGrid(container, count, cardClass) {
   container.innerHTML = Array.from({ length: count })
@@ -406,12 +488,12 @@ function skeletonGrid(container, count, cardClass) {
 // ===========================================================================
 // Dashboard
 // ===========================================================================
-async function loadDashboard(isPoll) {
+async function loadDashboard(isPoll, streamedSignals = null) {
   const grid = document.getElementById('signal-grid');
   if (!isPoll && !grid.children.length) skeletonGrid(grid, 8, 'skeleton-card');
 
   const [signals, health] = await Promise.all([
-    api('/api/signals/latest', {}, { silent: isPoll }),
+    streamedSignals || api('/api/signals/latest', {}, { silent: isPoll }),
     api('/api/security/health', {}, { silent: true }).catch(() => null),
   ]);
   if (health) animateScoreRing(health.quantum_safety_score);
@@ -463,7 +545,9 @@ document.getElementById('refresh-signals').addEventListener('click', async (e) =
 function loadTrading() { refreshOrders(); }
 
 document.getElementById('order-type').addEventListener('change', (e) => {
-  document.getElementById('limit-price-wrap').classList.toggle('hidden', e.target.value !== 'limit');
+  const type = e.target.value;
+  document.getElementById('limit-price-wrap').classList.toggle('hidden', !['limit', 'stop_limit'].includes(type));
+  document.getElementById('stop-price-wrap').classList.toggle('hidden', !['stop', 'stop_limit'].includes(type));
 });
 
 document.getElementById('order-form').addEventListener('submit', async (e) => {
@@ -477,7 +561,10 @@ document.getElementById('order-form').addEventListener('submit', async (e) => {
     quantity: parseFloat(document.getElementById('order-qty').value),
     order_type: document.getElementById('order-type').value,
     limit_price: document.getElementById('order-type').value === 'limit'
+      || document.getElementById('order-type').value === 'stop_limit'
       ? parseFloat(document.getElementById('order-limit-price').value) : null,
+    stop_price: ['stop', 'stop_limit'].includes(document.getElementById('order-type').value)
+      ? parseFloat(document.getElementById('order-stop-price').value) : null,
   };
   setButtonLoading(btn, true, 'Signing with ML-DSA-65…');
   try {
@@ -497,7 +584,7 @@ async function refreshOrders(isPoll) {
   const orders = await api('/api/trading/orders', {}, { silent: isPoll });
   list.innerHTML = orders.map((o, i) => `
     <div class="order-row" style="animation-delay:${i * 45}ms">
-      <span>${o.side.toUpperCase()} ${o.quantity} ${o.asset} ${o.order_type === 'limit' ? '@ $' + o.limit_price : ''}</span>
+      <span>${o.side.toUpperCase()} ${o.quantity} ${o.asset} ${o.order_type === 'limit' ? '@ $' + o.limit_price : o.order_type === 'stop' ? 'stop $' + o.stop_price : o.order_type === 'stop_limit' ? 'stop $' + o.stop_price + ' / limit $' + o.limit_price : ''}</span>
       <span class="status status-${o.status}">${o.status}${o.filled_price ? ' @ $' + o.filled_price.toFixed(2) : ''}</span>
     </div>
   `).join('') || '<div class="empty-state">No orders yet — place your first paper trade.</div>';
@@ -521,12 +608,14 @@ async function loadPortfolio(isPoll) {
     <div class="metric-box"><div class="val" id="m-win" data-raw-value="0">0%</div><div class="lbl">Win Rate</div></div>
     <div class="metric-box"><div class="val" id="m-trades" data-raw-value="0">0</div><div class="lbl">Filled Trades</div></div>
     <div class="metric-box"><div class="val" id="m-var" data-raw-value="0">0%</div><div class="lbl">VaR 95%</div></div>
+    <div class="metric-box"><div class="val" id="m-var99" data-raw-value="0">0%</div><div class="lbl">VaR 99%</div></div>
   `;
   animateCounter(document.getElementById('m-sharpe'), metrics.sharpe_ratio, { decimals: 2 });
   animateCounter(document.getElementById('m-dd'), metrics.max_drawdown * 100, { decimals: 1, suffix: '%' });
   animateCounter(document.getElementById('m-win'), metrics.win_rate * 100, { decimals: 0, suffix: '%' });
   animateCounter(document.getElementById('m-trades'), metrics.total_trades, { decimals: 0 });
   animateCounter(document.getElementById('m-var'), metrics.var_95 * 100, { decimals: 2, suffix: '%' });
+  animateCounter(document.getElementById('m-var99'), metrics.var_99 * 100, { decimals: 2, suffix: '%' });
 
   const list = document.getElementById('positions-list');
   list.innerHTML = positions.map((p, i) => `
@@ -538,6 +627,19 @@ async function loadPortfolio(isPoll) {
 
   animateEquityCurve(metrics.equity_curve || []);
 }
+
+document.getElementById('portfolio-export').addEventListener('click', async () => {
+  try {
+    const response = await fetch('/api/portfolio/export', {
+      headers: { Authorization: 'Bearer ' + state.token },
+    });
+    if (!response.ok) throw new Error('Export could not be generated');
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = url; link.download = 'quantumsentinel-portfolio.csv'; link.click();
+    URL.revokeObjectURL(url);
+  } catch (err) { toast('Export failed', err.message, 'error'); }
+});
 
 let equityAnimFrame = null;
 function animateEquityCurve(curve) {
@@ -626,6 +728,83 @@ document.getElementById('rotate-kem').addEventListener('click', (e) => {
   if (!btn.querySelector('.btn-label')) { btn.innerHTML = `<span class="btn-label">${btn.textContent}</span>`; }
   rotateKeys('ML-KEM-768', btn);
 });
+document.getElementById('compliance-export').addEventListener('click', async () => {
+  try {
+    const report = await api('/api/security/compliance-report');
+    const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
+    const link = document.createElement('a'); link.href = url; link.download = 'quantumsentinel-compliance-evidence.json'; link.click();
+    URL.revokeObjectURL(url); toast('Evidence downloaded', 'Signed audit-verification and key-health report generated.', 'success');
+  } catch (err) { toast('Report failed', err.message, 'error'); }
+});
+
+// ===========================================================================
+// Enterprise integrations
+// ===========================================================================
+function selectedValues(id) {
+  return Array.from(document.getElementById(id).selectedOptions).map((option) => option.value);
+}
+
+async function loadIntegrations() {
+  const [keys, hooks] = await Promise.all([
+    api('/api/integrations/api-keys', {}, { silent: true }).catch(() => []),
+    api('/api/integrations/webhooks', {}, { silent: true }).catch(() => []),
+  ]);
+  document.getElementById('api-key-list').innerHTML = keys.map((key) =>
+    `<div class="order-row"><span>${escapeHtml(key.name)} · ${escapeHtml(key.prefix)}…</span><span>${key.is_revoked ? 'REVOKED' : escapeHtml(key.scopes.join(', '))}</span></div>`
+  ).join('') || '<div class="empty-state">No API keys yet.</div>';
+  document.getElementById('webhook-list').innerHTML = hooks.map((hook) =>
+    `<div class="order-row"><span>${escapeHtml(hook.url)}</span><span>${hook.is_active ? escapeHtml(hook.event_types.join(', ')) : 'DISABLED'}</span></div>`
+  ).join('') || '<div class="empty-state">No webhooks yet.</div>';
+}
+
+document.getElementById('api-key-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const result = await api('/api/integrations/api-keys', { method: 'POST', body: JSON.stringify({
+    name: document.getElementById('api-key-name').value, scopes: selectedValues('api-key-scopes'),
+  }) });
+  document.getElementById('api-key-secret').textContent = `Copy this API key now; it will not be shown again: ${result.api_key}`;
+  await loadIntegrations();
+});
+
+document.getElementById('webhook-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const result = await api('/api/integrations/webhooks', { method: 'POST', body: JSON.stringify({
+    url: document.getElementById('webhook-url').value, event_types: selectedValues('webhook-events'),
+  }) });
+  document.getElementById('webhook-secret').textContent = `Copy this signing secret now: ${result.signing_secret}`;
+  await loadIntegrations();
+});
+
+async function loadCommunity() {
+  const stats = document.getElementById('community-stats');
+  const issuesEl = document.getElementById('community-issues');
+  const releasesEl = document.getElementById('community-releases');
+  try {
+    const repo = 'BugHunterX2101/quantumsentinel-web';
+    const [info, issues, releases] = await Promise.all([
+      fetch(`https://api.github.com/repos/${repo}`).then((r) => r.ok ? r.json() : Promise.reject()),
+      fetch(`https://api.github.com/repos/${repo}/issues?state=open&labels=good%20first%20issue&per_page=8`).then((r) => r.ok ? r.json() : []),
+      fetch(`https://api.github.com/repos/${repo}/releases?per_page=5`).then((r) => r.ok ? r.json() : []),
+    ]);
+    stats.innerHTML = '';
+    [['Stars', info.stargazers_count], ['Forks', info.forks_count], ['Open Issues', info.open_issues_count]].forEach(([label, value]) => {
+      const box = document.createElement('div'); box.className = 'metric-box';
+      const val = document.createElement('div'); val.className = 'val'; val.textContent = String(value);
+      const lbl = document.createElement('div'); lbl.className = 'lbl'; lbl.textContent = label;
+      box.append(val, lbl); stats.append(box);
+    });
+    function renderItems(container, rows, label) {
+      container.replaceChildren();
+      if (!rows.length) { container.textContent = `No ${label} available yet.`; return; }
+      rows.forEach((row) => { const item = document.createElement('a'); item.className = 'order-row'; item.href = row.html_url; item.target = '_blank'; item.rel = 'noopener noreferrer'; item.textContent = row.title || row.name || row.tag_name; container.append(item); });
+    }
+    renderItems(issuesEl, issues.filter((issue) => !issue.pull_request), 'good first issues');
+    renderItems(releasesEl, releases, 'releases');
+  } catch (_) {
+    stats.textContent = 'GitHub data is unavailable right now.';
+    issuesEl.textContent = ''; releasesEl.textContent = '';
+  }
+}
 
 // ===========================================================================
 // Resume session on page load

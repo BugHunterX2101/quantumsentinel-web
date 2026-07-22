@@ -171,18 +171,19 @@ API keys are returned only once at creation. Store them in a secret manager, gra
 
 Important variables are documented in [.env.example](.env.example):
 
-- `ENVIRONMENT`, `JWT_SECRET_KEY`, `CORS_ORIGINS`, and `ALLOWED_HOSTS`
+- `ENVIRONMENT`, `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `CORS_ORIGINS`, and `ALLOWED_HOSTS`
 - `DATABASE_URL`
-- `WEBHOOK_ENCRYPTION_KEY`
+- `WEBHOOK_ENCRYPTION_KEY`, `PRIVATE_KEY_ENCRYPTION_KEY`, and persisted server ML-DSA identity keys
 - `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `ALPACA_BASE_URL`
 
-Production mode refuses weak/missing secrets and wildcard CORS. Put TLS 1.3, a managed secret store, PostgreSQL, Redis, and a hardened liboqs/HSM-backed PQC service in front of this reference process before handling sensitive workloads.
+Production mode refuses missing key material and wildcard CORS. Put TLS 1.3, a managed secret store, PostgreSQL, Redis, and a hardened liboqs/HSM-backed PQC service in front of this reference process before handling sensitive workloads.
 
 ## Verification
 
 ```bash
 node --check frontend/app.js
 python -m py_compile backend/main.py backend/schemas.py backend/models.py
+pytest -q
 git diff --check
 ```
 

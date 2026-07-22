@@ -20,10 +20,12 @@
   Signal Engine / Trading Engine / PQC Crypto Service).
 - SQLite instead of PostgreSQL + Redis (swap `DATABASE_URL` for Postgres in
   production; add a real cache/pubsub layer for horizontal scaling).
-- User PQC private keys are generated and stored server-side for demo
-  convenience. In the full mobile architecture, private keys are generated
-  on-device and never leave the Secure Enclave / Android Keystore.
-- JWT uses HS256 for simplicity; the spec calls for RS256 with rotated keys.
+- The portable web mode encrypts user PQC private keys at rest with
+  `PRIVATE_KEY_ENCRYPTION_KEY`. A production mobile client should generate
+  private keys on-device and never upload them from a Secure Enclave or
+  Android Keystore.
+- JWT uses RS256. Production deployments must provide stable `JWT_PRIVATE_KEY`
+  and `JWT_PUBLIC_KEY` values and rotate them through a key-management system.
 - The reference deployment rate limiter is process-local. Deployments with
   more than one application process must replace it with a shared, atomic
   Redis-backed limiter before being exposed to the internet.
@@ -33,8 +35,9 @@
 
 ## Deployment baseline
 
-- Set `ENVIRONMENT=production`, a unique 32+ character `JWT_SECRET_KEY`,
-  explicit `CORS_ORIGINS`, and explicit `ALLOWED_HOSTS`.
+- Set `ENVIRONMENT=production`, stable RS256 JWT keys, encryption keys for
+  private material/webhooks, explicit `CORS_ORIGINS`, and explicit
+  `ALLOWED_HOSTS`.
 - Terminate TLS 1.3 at a managed reverse proxy; do not expose Uvicorn
   directly to the public internet.
 - Use PostgreSQL, Redis-backed rate limiting/replay protection, a managed

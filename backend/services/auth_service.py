@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..crypto import pqc
-from ..config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRE_SECONDS
+from ..config import JWT_SIGNING_KEY, JWT_VERIFY_KEY, JWT_ALGORITHM, JWT_EXPIRE_SECONDS
 
 PBKDF2_ITERATIONS = 200_000
 
@@ -34,12 +34,12 @@ def verify_password(password: str, stored: str) -> bool:
 def create_access_token(user_id: str, tier: str) -> str:
     now = int(time.time())
     payload = {"sub": user_id, "tier": tier, "iat": now, "exp": now + JWT_EXPIRE_SECONDS}
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(payload, JWT_SIGNING_KEY, algorithm=JWT_ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict | None:
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return jwt.decode(token, JWT_VERIFY_KEY, algorithms=[JWT_ALGORITHM])
     except jwt.PyJWTError:
         return None
 

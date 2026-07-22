@@ -1,12 +1,31 @@
 """QuantumSentinel — Security service: server PQC identity, audit logging, key rotation."""
 import json
 import datetime as dt
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..crypto import pqc
+from ..config import (PRIVATE_KEY_ENCRYPTION_KEY, SERVER_DSA_PRIVATE_KEY,
+                      SERVER_DSA_PUBLIC_KEY, SERVER_DSA_CREATED_AT)
 
 SERVER_KEY_ROTATION_DAYS = 90
+_PRIVATE_KEY_FERNET = Fernet(PRIVATE_KEY_ENCRYPTION_KEY.encode() if PRIVATE_KEY_ENCRYPTION_KEY else Fernet.generate_key())
+
+
+def protect_private_key(value: str) -> str:
+    return "enc:" + _PRIVATE_KEY_FERNET.encrypt(value.encode()).decode()
+
+
+def unprotect_private_key(value: str) -> str:
+    if not value.startswith("enc:"):
+        # Legacy demo rows were base64 only; keep reads compatible so a
+        # deployment can rotate them without losing access to old orders.
+        return value
+    try:
+        return _PRIVATE_KEY_FERNET.decrypt(value[4:].encode()).decode()
+    except InvalidToken as exc:
+        raise ValueError("private key cannot be decrypted with the configured key") from exc
 
 
 class ServerIdentity:
@@ -14,20 +33,35 @@ class ServerIdentity:
     at process start. Signs ServerHello handshake payloads and audit logs —
     mirrors the PQC Crypto Service role in the full architecture."""
     def __init__(self):
-        pk, sk, ms = pqc.dsa_keygen()
+        if SERVER_DSA_PRIVATE_KEY and SERVER_DSA_PUBLIC_KEY:
+            pk = pqc.unb64(SERVER_DSA_PUBLIC_KEY)
+            sk = pqc.unb64(SERVER_DSA_PRIVATE_KEY)
+            ms = 0.0
+        else:
+            # ML-DSA reference key generation is intentionally expensive. Do
+            # not block process import/startup; generate on first signature in
+            # development, while production requires a persisted identity.
+            pk, sk, ms = None, None, None
         self.dsa_pk, self.dsa_sk = pk, sk
-        self.created_at = dt.datetime.now(dt.timezone.utc)
+        self.created_at = dt.datetime.fromisoformat(SERVER_DSA_CREATED_AT) if SERVER_DSA_CREATED_AT else dt.datetime.now(dt.timezone.utc)
+        if self.created_at.tzinfo is None:
+            self.created_at = self.created_at.replace(tzinfo=dt.timezone.utc)
         self.keygen_ms = ms
 
     def sign(self, message: bytes) -> bytes:
+        if self.dsa_sk is None:
+            self._ensure_keypair()
         sig, _ = pqc.dsa_sign(self.dsa_sk, message)
         return sig
 
-    def rotate(self):
+    def _ensure_keypair(self):
         pk, sk, ms = pqc.dsa_keygen()
-        self.dsa_pk, self.dsa_sk = pk, sk
+        self.dsa_pk, self.dsa_sk, self.keygen_ms = pk, sk, ms
         self.created_at = dt.datetime.now(dt.timezone.utc)
-        self.keygen_ms = ms
+
+    def rotate(self):
+        self.dsa_pk = self.dsa_sk = None
+        self._ensure_keypair()
 
 
 server_identity = ServerIdentity()

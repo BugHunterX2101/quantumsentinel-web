@@ -6,7 +6,6 @@ import ipaddress
 import json
 import secrets
 import socket
-import os
 from urllib.parse import urlparse
 
 import requests
@@ -31,7 +30,7 @@ def encrypt_secret(value: str) -> str:
 def verify_api_key(db: Session, raw_key: str, scope: str) -> models.ApiKey | None:
     key = db.query(models.ApiKey).filter(models.ApiKey.key_hash == hashlib.sha256(raw_key.encode()).hexdigest(),
                                          models.ApiKey.is_revoked.is_(False)).first()
-    if not key or scope not in (key.scopes or []):
+    if not key or (scope not in (key.scopes or []) and "admin" not in (key.scopes or [])):
         return None
     if key.expires_at and key.expires_at.replace(tzinfo=dt.timezone.utc) < dt.datetime.now(dt.timezone.utc):
         return None
@@ -58,15 +57,17 @@ def emit_webhooks(db: Session, user_id: str, event_type: str, payload: dict) -> 
                                              models.Webhook.is_active.is_(True)).all()
     envelope = json.dumps({"event": event_type, "data": payload}, sort_keys=True, separators=(",", ":"))
     for hook in hooks:
-        if event_type not in (hook.event_types or []) or not _is_public_https(hook.url):
-            continue
-        secret = _FERNET.decrypt(hook.secret_hash.encode())
-        signature = hmac.new(secret, envelope.encode(), hashlib.sha256).hexdigest()
         try:
+            if event_type not in (hook.event_types or []) or not _is_public_https(hook.url):
+                continue
+            secret = _FERNET.decrypt(hook.secret_hash.encode())
+            signature = hmac.new(secret, envelope.encode(), hashlib.sha256).hexdigest()
             requests.post(hook.url, data=envelope, timeout=3, allow_redirects=False,
                           headers={"Content-Type": "application/json", "X-QS-Event": event_type,
                                    "X-QS-Signature": f"sha256={signature}"}).raise_for_status()
             hook.last_delivery_at = dt.datetime.now(dt.timezone.utc)
-        except requests.RequestException:
-            pass
+        except Exception:
+            # Webhook delivery is explicitly best-effort and must never turn
+            # a successful trade/key rotation into a 500 response.
+            continue
     db.commit()

@@ -125,9 +125,9 @@ def register(req: schemas.RegisterRequest, db: Session = Depends(get_db)):
     kem_pk, kem_sk, kem_ms = pqc.kem_keygen()
     dsa_pk, dsa_sk, dsa_ms = pqc.dsa_keygen()
     db.add(models.KeyPair(user_id=user.id, algorithm="ML-KEM-768",
-                           public_key=pqc.b64(kem_pk), private_key=pqc.b64(kem_sk)))
+                           public_key=pqc.b64(kem_pk), private_key=security_service.protect_private_key(pqc.b64(kem_sk))))
     db.add(models.KeyPair(user_id=user.id, algorithm="ML-DSA-65",
-                           public_key=pqc.b64(dsa_pk), private_key=pqc.b64(dsa_sk)))
+                           public_key=pqc.b64(dsa_pk), private_key=security_service.protect_private_key(pqc.b64(dsa_sk))))
     db.commit()
 
     security_service.write_audit_log(db, user.id, "USER_REGISTERED", "user", user.id,
@@ -256,7 +256,8 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     payload = f"{req.side}:{req.asset}:{req.quantity}:{req.order_type}:{req.limit_price}:{req.stop_price}:{req.time_in_force}".encode()
     signature = None
     if user_dsa_key and user_dsa_key.private_key:
-        sig_bytes, _ = pqc.dsa_sign(pqc.unb64(user_dsa_key.private_key), payload)
+        private_key = security_service.unprotect_private_key(user_dsa_key.private_key)
+        sig_bytes, _ = pqc.dsa_sign(pqc.unb64(private_key), payload)
         signature = pqc.b64(sig_bytes)
 
     trade = models.Trade(
@@ -289,6 +290,8 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
         fill = trading_service.simulate_fill(trade.asset, trade.side, trade.quantity,
                                               trade.order_type, trade.limit_price, trade.stop_price)
         trade.status = fill["status"]
+        if trade.status == "ACCEPTED" and trade.time_in_force == "ioc":
+            trade.status = "EXPIRED"
         if fill["status"] == "FILLED":
             trade.filled_price = fill["filled_price"]
             trade.filled_at = dt.datetime.now(dt.timezone.utc)
@@ -606,7 +609,7 @@ def rotate_keys(req: schemas.RotateKeysRequest, user: models.User = Depends(get_
 
     rotation_count = (old_keys[0].rotation_count + 1) if old_keys else 0
     new_key = models.KeyPair(user_id=user.id, algorithm=req.algorithm, public_key=pqc.b64(pk),
-                              private_key=pqc.b64(sk), rotation_count=rotation_count)
+                              private_key=security_service.protect_private_key(pqc.b64(sk)), rotation_count=rotation_count)
     db.add(new_key)
     for k in old_keys:
         k.is_active = False

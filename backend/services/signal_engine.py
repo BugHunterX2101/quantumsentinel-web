@@ -110,8 +110,10 @@ def run_sba(coupling_matrix: np.ndarray, local_fields: np.ndarray,
             n_steps: int = N_STEPS, dt: float = DT, coupling: float = COUPLING) -> np.ndarray:
     """Vectorized NumPy port of the Rust rayon-parallel bifurcation loop."""
     n = len(local_fields)
-    rng = np.random.default_rng()
-    x = rng.uniform(-0.05, 0.05, size=n)
+    # The reference algorithm must be reproducible for audit/backtest parity.
+    # Seed the initial state from the deterministic local fields instead of
+    # drawing process-random values on every refresh.
+    x = np.clip(np.asarray(local_fields, dtype=float) * 0.05, -0.05, 0.05)
     y = np.zeros(n)
     for step in range(n_steps):
         a = step / n_steps

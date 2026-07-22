@@ -89,9 +89,26 @@ def risk_metrics(db: Session, user_id: str) -> dict:
         ).order_by(models.Trade.filled_at)
     ).scalars().all()
 
+    def closed_trade_results() -> tuple[int, int]:
+        book: dict[str, tuple[float, float]] = {}
+        wins = closed = 0
+        for trade in trades:
+            qty, price = float(trade.quantity), float(trade.filled_price or 0)
+            current_qty, cost = book.get(trade.asset, (0.0, 0.0))
+            if trade.side == "buy":
+                book[trade.asset] = (current_qty + qty, cost + qty * price)
+            elif current_qty > 0:
+                avg = cost / current_qty
+                closed += 1
+                wins += int(price > avg)
+                remaining = max(0.0, current_qty - qty)
+                book[trade.asset] = (remaining, avg * remaining)
+        return wins, closed
+
+    wins, closed = closed_trade_results()
     if len(trades) < 2:
         return {
-            "sharpe_ratio": 0.0, "max_drawdown": 0.0, "win_rate": 0.0,
+            "sharpe_ratio": 0.0, "max_drawdown": 0.0, "win_rate": round(wins / closed, 3) if closed else 0.0,
             "total_trades": len(trades), "var_95": 0.0, "var_99": 0.0,
             "equity_curve": equity_curve_from_trades(db, user_id),
         }
@@ -113,16 +130,14 @@ def risk_metrics(db: Session, user_id: str) -> dict:
         dd = (peak - v) / peak if peak else 0.0
         max_dd = max(max_dd, dd)
 
-    positions = get_positions_with_pnl(db, user_id)
-    winners = sum(1 for p in positions if p["unrealized_pnl"] > 0)
     total_trades = len(trades)
-    win_rate = winners / len(positions) if positions else 0.0
+    win_rate = wins / closed if closed else 0.0
 
     sorted_returns = sorted(returns)
     var_idx = max(0, int(0.05 * len(sorted_returns)) - 1)
-    var_95 = sorted_returns[var_idx] if sorted_returns else 0.0
+    var_95 = max(0.0, -sorted_returns[var_idx]) if sorted_returns else 0.0
     var99_idx = max(0, int(0.01 * len(sorted_returns)) - 1)
-    var_99 = sorted_returns[var99_idx] if sorted_returns else 0.0
+    var_99 = max(0.0, -sorted_returns[var99_idx]) if sorted_returns else 0.0
 
     return {
         "sharpe_ratio": round(sharpe, 3),

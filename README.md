@@ -143,6 +143,20 @@ docker compose up --build
 
 The default container uses a persistent SQLite volume for portability. Set `DATABASE_URL` to PostgreSQL for a multi-instance deployment and add a shared Redis implementation for distributed rate limits, sessions, and event delivery.
 
+### Production profile
+
+The production profile provisions PostgreSQL, Redis with authentication/AOF, a Gunicorn worker pool, an Nginx TLS 1.3 reverse proxy, readiness checks, Prometheus metrics, and an optional rotating PostgreSQL dump service:
+
+```bash
+copy .env.production.example .env.production       # Windows
+# cp .env.production.example .env.production       # macOS/Linux
+# Put real certificates at deploy/tls/fullchain.pem and deploy/tls/privkey.pem.
+docker compose -f docker-compose.production.yml --env-file .env.production up -d --build
+docker compose -f docker-compose.production.yml --env-file .env.production --profile backup up -d backup
+```
+
+The production configuration deliberately refuses the bundled reference PQC backend. Set `PQC_PROVIDER` only after integrating a reviewed liboqs/HSM or managed PQC provider adapter; the app must not silently downgrade to the non-constant-time Python implementation.
+
 ### Alpaca paper trading
 
 ```bash
@@ -174,6 +188,7 @@ Important variables are documented in [.env.example](.env.example):
 - `ENVIRONMENT`, `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `CORS_ORIGINS`, and `ALLOWED_HOSTS`
 - `DATABASE_URL`
 - `WEBHOOK_ENCRYPTION_KEY`, `PRIVATE_KEY_ENCRYPTION_KEY`, and persisted server ML-DSA identity keys
+- `REDIS_URL`, `PQC_PROVIDER`, and production database credentials
 - `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `ALPACA_BASE_URL`
 
 Production mode refuses missing key material and wildcard CORS. Put TLS 1.3, a managed secret store, PostgreSQL, Redis, and a hardened liboqs/HSM-backed PQC service in front of this reference process before handling sensitive workloads.

@@ -10,6 +10,7 @@ import os
 import time
 import secrets
 import asyncio
+import hashlib
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -21,10 +22,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import select
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+import redis.asyncio as redis
 
 from . import models, schemas
 from .database import get_db, init_db, SessionLocal
-from .config import CORS_ORIGINS, ALLOWED_HOSTS
+from .config import CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service
 
@@ -41,6 +44,10 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
+HTTP_REQUESTS = Counter("quantumsentinel_http_requests_total", "HTTP requests", ["method", "path", "status"])
+HTTP_LATENCY = Histogram("quantumsentinel_http_request_duration_seconds", "HTTP request latency", ["method", "path"])
+_redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+
 # Bounded in-memory limiter for the single-process reference deployment. It
 # deliberately protects write paths even before a user has authenticated.
 _request_windows: dict[str, deque[float]] = defaultdict(deque)
@@ -49,18 +56,40 @@ _request_windows: dict[str, deque[float]] = defaultdict(deque)
 @app.middleware("http")
 async def security_headers_and_rate_limit(request, call_next):
     client = request.client.host if request.client else "unknown"
-    key = f"{client}:{request.url.path}"
+    principal = request.headers.get("x-qs-api-key") or request.headers.get("authorization", "")
+    principal_hash = hashlib.sha256(principal.encode()).hexdigest()[:16] if principal else client
+    key = f"{principal_hash}:{request.url.path}"
     now = time.monotonic()
-    window = _request_windows[key]
-    while window and now - window[0] > 60:
-        window.popleft()
     limit = 20 if request.url.path.startswith("/api/auth/") else 240
-    if len(window) >= limit:
+    current = 0
+    if _redis_client:
+        try:
+            redis_key = f"qs:rate:{key}"
+            current = int(await _redis_client.incr(redis_key))
+            if current == 1:
+                await _redis_client.expire(redis_key, 60)
+        except Exception:
+            if ENVIRONMENT == "production":
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail": "Rate-limit service unavailable"}, status_code=503)
+            current = 0
+    if not _redis_client or current == 0:
+        window = _request_windows[key]
+        while window and now - window[0] > 60:
+            window.popleft()
+        current = len(window) + 1
+        window.append(now)
+    if current > limit:
         from fastapi.responses import JSONResponse
         return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429,
                             headers={"Retry-After": "60"})
-    window.append(now)
+    started = time.perf_counter()
     response = await call_next(request)
+    metric_path = getattr(request.scope.get("route"), "path", request.url.path)
+    HTTP_REQUESTS.labels(request.method, metric_path, str(response.status_code)).inc()
+    HTTP_LATENCY.labels(request.method, metric_path).observe(time.perf_counter() - started)
+    response.headers["X-RateLimit-Limit"] = str(limit)
+    response.headers["X-RateLimit-Remaining"] = str(max(0, limit - current))
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -73,8 +102,33 @@ async def security_headers_and_rate_limit(request, call_next):
 
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     init_db()
+    if _redis_client:
+        try:
+            await _redis_client.ping()
+        except Exception as exc:
+            if ENVIRONMENT == "production":
+                raise RuntimeError("Redis is required and unavailable") from exc
+
+
+@app.get("/health/live", include_in_schema=False)
+def liveness():
+    return {"status": "ok"}
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def readiness(db: Session = Depends(get_db)):
+    db.execute(select(1))
+    if _redis_client:
+        await _redis_client.ping()
+    return {"status": "ready", "database": "ok", "redis": "ok" if _redis_client else "not_configured"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    from fastapi.responses import Response
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # --------------------------------------------------------------------------

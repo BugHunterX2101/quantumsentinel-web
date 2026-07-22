@@ -26,8 +26,19 @@ from cryptography.hazmat.primitives import hashes
 
 from kyber_py.ml_kem import ML_KEM_768
 from dilithium_py.ml_dsa import ML_DSA_65
+from ..config import ENVIRONMENT, PQC_PROVIDER, PQC_PROVIDER_URL
 
 HKDF_SALT_CONTEXT = b"QuantumSentinel-v1"
+
+
+def _assert_pqc_backend():
+    if ENVIRONMENT == "production":
+        # The bundled packages are reference implementations. An external
+        # provider adapter must be integrated before production crypto calls;
+        # never silently downgrade to Python reference code.
+        raise RuntimeError(
+            f"PQC provider '{PQC_PROVIDER}' at {PQC_PROVIDER_URL!r} requires the reviewed external adapter"
+        )
 
 
 def b64(data: bytes) -> str:
@@ -42,6 +53,7 @@ def unb64(data: str) -> bytes:
 # ML-KEM-768 (FIPS 203)
 # --------------------------------------------------------------------------
 def kem_keygen():
+    _assert_pqc_backend()
     t0 = time.perf_counter()
     pk, sk = ML_KEM_768.keygen()
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -49,6 +61,7 @@ def kem_keygen():
 
 
 def kem_encapsulate(pk: bytes):
+    _assert_pqc_backend()
     t0 = time.perf_counter()
     shared_secret, ciphertext = ML_KEM_768.encaps(pk)
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -56,6 +69,7 @@ def kem_encapsulate(pk: bytes):
 
 
 def kem_decapsulate(sk: bytes, ciphertext: bytes):
+    _assert_pqc_backend()
     t0 = time.perf_counter()
     shared_secret = ML_KEM_768.decaps(sk, ciphertext)
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -66,6 +80,7 @@ def kem_decapsulate(sk: bytes, ciphertext: bytes):
 # ML-DSA-65 (FIPS 204)
 # --------------------------------------------------------------------------
 def dsa_keygen():
+    _assert_pqc_backend()
     t0 = time.perf_counter()
     pk, sk = ML_DSA_65.keygen()
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -73,6 +88,7 @@ def dsa_keygen():
 
 
 def dsa_sign(sk: bytes, message: bytes):
+    _assert_pqc_backend()
     t0 = time.perf_counter()
     signature = ML_DSA_65.sign(sk, message)
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -80,6 +96,7 @@ def dsa_sign(sk: bytes, message: bytes):
 
 
 def dsa_verify(pk: bytes, message: bytes, signature: bytes) -> bool:
+    _assert_pqc_backend()
     return ML_DSA_65.verify(pk, message, signature)
 
 

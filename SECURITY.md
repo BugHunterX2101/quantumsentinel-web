@@ -43,6 +43,10 @@
 - Use PostgreSQL, Redis-backed rate limiting/replay protection, a managed
   secret store, and a hardened liboqs/HSM crypto service for production.
   This repository remains paper-trading only.
+- `docker-compose.production.yml` provides the operational baseline, but
+  certificate issuance/renewal, secret-manager integration, alert routing,
+  off-host backup replication, penetration testing, and formal compliance
+  evidence must be owned by the deploying organization.
 
 ## Reporting a vulnerability
 

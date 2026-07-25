@@ -113,6 +113,42 @@ async def on_startup():
                 raise RuntimeError("Redis is required and unavailable") from exc
 
 
+# --------------------------------------------------------------------------
+# Auth dependency — MUST be defined before any route that uses Depends(get_current_user)
+# --------------------------------------------------------------------------
+def get_current_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> models.User:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    payload = auth_service.decode_access_token(token)
+    if not payload:
+        raise HTTPException(401, "Invalid or expired token")
+    user = db.get(models.User, payload["sub"])
+    if not user or not user.is_active:
+        raise HTTPException(401, "User not found or inactive")
+    return user
+
+
+def require_api_scope(scope: str):
+    def dependency(
+        x_qs_api_key: str | None = Header(default=None),
+        db: Session = Depends(get_db),
+    ) -> models.ApiKey:
+        if not x_qs_api_key:
+            raise HTTPException(401, "Missing X-QS-API-KEY")
+        key = integration_service.verify_api_key(db, x_qs_api_key, scope)
+        if not key:
+            raise HTTPException(403, "Invalid API key or insufficient scope")
+        return key
+    return dependency
+
+
+# --------------------------------------------------------------------------
+# Health + metrics
+# --------------------------------------------------------------------------
 @app.get("/health/live", include_in_schema=False)
 def liveness():
     return {"status": "ok"}
@@ -123,7 +159,8 @@ async def readiness(db: Session = Depends(get_db)):
     db.execute(select(1))
     if _redis_client:
         await _redis_client.ping()
-    return {"status": "ready", "database": "ok", "redis": "ok" if _redis_client else "not_configured"}
+    return {"status": "ready", "database": "ok",
+            "redis": "ok" if _redis_client else "not_configured"}
 
 
 @app.get("/metrics", include_in_schema=False)
@@ -133,32 +170,6 @@ def metrics(user: models.User = Depends(get_current_user)):
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-# --------------------------------------------------------------------------
-# Auth dependency
-# --------------------------------------------------------------------------
-def get_current_user(authorization: str | None = Header(default=None),
-                      db: Session = Depends(get_db)) -> models.User:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing bearer token")
-    token = authorization.split(" ", 1)[1]
-    payload = auth_service.decode_access_token(token)
-    if not payload:
-        raise HTTPException(401, "Invalid or expired token")
-    user = db.get(models.User, payload["sub"])
-    if not user or not user.is_active:
-        raise HTTPException(401, "User not found")
-    return user
-
-
-def require_api_scope(scope: str):
-    def dependency(x_qs_api_key: str | None = Header(default=None), db: Session = Depends(get_db)) -> models.ApiKey:
-        if not x_qs_api_key:
-            raise HTTPException(401, "Missing X-QS-API-KEY")
-        key = integration_service.verify_api_key(db, x_qs_api_key, scope)
-        if not key:
-            raise HTTPException(403, "Invalid API key or insufficient scope")
-        return key
-    return dependency
 
 
 # --------------------------------------------------------------------------
@@ -203,10 +214,15 @@ def login(req: schemas.LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(401, "Invalid credentials")
     token = auth_service.create_access_token(user.id, user.tier)
     security_service.write_audit_log(db, user.id, "USER_LOGIN", "user", user.id, {})
+    # FIX: Return the ACTUAL JWT TTL from config, not a hardcoded 3600.
+    # The frontend token-expiry timer uses this value — wrong value caused
+    # tokens to appear valid 4x longer than they actually are.
+    from .config import JWT_EXPIRE_SECONDS
     return {
-        "access_token": token, "token_type": "bearer", "expires_in": 3600,
+        "access_token": token, "token_type": "bearer",
+        "expires_in": JWT_EXPIRE_SECONDS,
         "user": {"user_id": user.id, "email": user.email, "tier": user.tier,
-                  "beginner_mode": user.beginner_mode},
+                 "beginner_mode": user.beginner_mode},
     }
 
 
@@ -250,7 +266,10 @@ async def signal_stream(websocket: WebSocket):
     protocols = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
     token = protocols[1] if len(protocols) == 2 and protocols[0] == "qs" else None
     payload = auth_service.decode_access_token(token) if token else None
-    if origin not in CORS_ORIGINS or not payload:
+    # FIX: When CORS_ORIGINS contains "*" (dev mode), skip origin check.
+    # A literal `origin not in ["*"]` always fails for specific origin strings.
+    origin_ok = ("*" in CORS_ORIGINS) or (origin in CORS_ORIGINS)
+    if not origin_ok or not payload:
         await websocket.close(code=4401)
         return
     db = SessionLocal()
@@ -275,6 +294,9 @@ async def signal_stream(websocket: WebSocket):
 @app.post("/api/trading/orders", status_code=201)
 def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
+    # FIX: quantity must be strictly positive — zero/negative slipped through before
+    if req.quantity <= 0:
+        raise HTTPException(400, "quantity must be greater than zero")
     if req.side not in ("buy", "sell"):
         raise HTTPException(400, "side must be buy or sell")
     if req.order_type not in ("market", "limit", "stop", "stop_limit"):
@@ -293,20 +315,36 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     if req.side == "sell" and req.quantity > held:
         raise HTTPException(400, "sell quantity exceeds the available paper position")
     price_for_risk = req.limit_price or req.stop_price or trading_service.get_last_price(req.asset)
-    # Dynamic position size cap: 5% of starting paper capital ($100k = $5k max).
-    # Compute actual account equity (cash approximation from filled trades).
-    total_notional_held = sum(
-        p["market_value"] for p in existing_positions.values()
-    )
-    account_equity = max(5_000, 100_000 - total_notional_held)  # conservatively floor at 5k
+
+    # FIX: Compute real account cash from FILLED trades instead of using the
+    # static subtraction (100k - notional_held) which goes negative when
+    # holdings exceed $100k and floors position_cap at an unusable $250.
+    filled_trades = db.execute(
+        select(models.Trade).where(
+            models.Trade.user_id == user.id, models.Trade.status == "FILLED"
+        )
+    ).scalars().all()
+    cash = 100_000.0
+    for ft in filled_trades:
+        notional = float(ft.quantity) * float(ft.filled_price or 0)
+        cash -= notional if ft.side == "buy" else -notional
+    account_equity = max(5_000.0, cash)
     position_cap = account_equity * 0.05
     if req.side == "buy" and req.quantity * price_for_risk > position_cap:
-        raise HTTPException(400, f"order exceeds the 5% paper-account position limit (${position_cap:,.0f})")
-    duplicate_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=15)
+        raise HTTPException(
+            400,
+            f"order exceeds the 5% paper-account position limit "
+            f"(${position_cap:,.0f} based on current account equity)",
+        )
+
+    # FIX: 30-second duplicate window (was 15s) — Alpaca round-trips can take
+    # 5-10s and a 15s window caused legitimate retry orders to be blocked.
+    duplicate_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=30)
     duplicate = db.execute(select(models.Trade).where(
         models.Trade.user_id == user.id, models.Trade.asset == req.asset,
         models.Trade.side == req.side, models.Trade.quantity == req.quantity,
-        models.Trade.status.in_(("PENDING", "ACCEPTED")), models.Trade.submitted_at >= duplicate_cutoff,
+        models.Trade.status.in_(("PENDING", "ACCEPTED", "SUBMITTED")),
+        models.Trade.submitted_at >= duplicate_cutoff,
     )).scalars().first()
     if duplicate:
         raise HTTPException(409, "duplicate pending order blocked")
@@ -379,12 +417,21 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
 
 def _serialize_trade(t: models.Trade) -> dict:
     return {
-        "order_id": t.id, "asset": t.asset, "side": t.side, "quantity": float(t.quantity),
-        "order_type": t.order_type, "limit_price": float(t.limit_price) if t.limit_price else None,
+        "order_id": t.id,
+        "asset": t.asset,
+        "side": t.side,
+        "quantity": float(t.quantity),
+        "order_type": t.order_type,
+        # FIX: time_in_force was missing from the response — frontend showed blank
+        "time_in_force": t.time_in_force,
+        "limit_price": float(t.limit_price) if t.limit_price else None,
         "stop_price": float(t.stop_price) if t.stop_price else None,
-        "status": t.status, "alpaca_order_id": t.alpaca_order_id,
+        "status": t.status,
+        "alpaca_order_id": t.alpaca_order_id,
         "filled_price": float(t.filled_price) if t.filled_price else None,
-        "pqc_signature_preview": (t.pqc_signature or "")[:32] + "..." if t.pqc_signature else None,
+        "pqc_signature_preview": (
+            (t.pqc_signature or "")[:32] + "..." if t.pqc_signature else None
+        ),
         "submitted_at": t.submitted_at.isoformat() if t.submitted_at else None,
         "filled_at": t.filled_at.isoformat() if t.filled_at else None,
     }

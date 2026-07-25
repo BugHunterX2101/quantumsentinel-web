@@ -82,6 +82,8 @@ function handleTokenExpiry() {
   if (state.signalSocket) { state.signalSocket.close(); state.signalSocket = null; }
   localStorage.removeItem('qs_token');
   localStorage.removeItem('qs_user');
+  localStorage.removeItem('qs_login_at');
+  localStorage.removeItem('qs_expires_in');
   state.token = null;
   state.user = null;
   document.getElementById('app').classList.add('hidden');
@@ -284,7 +286,10 @@ async function afterLogin(data) {
   state.user = data.user;
   localStorage.setItem('qs_token', state.token);
   localStorage.setItem('qs_user', JSON.stringify(state.user));
-  // Schedule a warning before the JWT expires (default 900s = 15min)
+  // Store login timestamp and TTL so page-reload can compute actual remaining time
+  localStorage.setItem('qs_login_at', Date.now().toString());
+  localStorage.setItem('qs_expires_in', String(data.expires_in || 900));
+  // Schedule a warning before the JWT expires based on actual TTL from server
   scheduleTokenExpiry(data.expires_in || 900);
   document.getElementById('auth-screen').classList.add('hidden');
   await performHandshake({ showOverlay: true });
@@ -365,7 +370,7 @@ function renderHandshakeTrace() {
     ['Client ML-KEM keypair', h.simulated_client_kem_keypair ? 'server-generated demo keypair (browser has no ML-KEM)' : 'client-supplied'],
   ];
   el.innerHTML = rows.map(([label, val], i) =>
-    `<div class="handshake-step" style="animation-delay:${i * 70}ms"><span class="label">${label}:</span><br><span class="val">${val}</span></div>`
+    `<div class="handshake-step" style="animation-delay:${i * 70}ms"><span class="label">${escapeHtml(String(label))}:</span><br><span class="val">${escapeHtml(String(val))}</span></div>`
   ).join('');
 }
 
@@ -436,6 +441,8 @@ document.getElementById('logout-btn').addEventListener('click', () => {
   if (state.tokenExpireTimer) clearTimeout(state.tokenExpireTimer);
   localStorage.removeItem('qs_token');
   localStorage.removeItem('qs_user');
+  localStorage.removeItem('qs_login_at');
+  localStorage.removeItem('qs_expires_in');
   location.reload();
 });
 
@@ -443,7 +450,7 @@ async function bootstrapApp() {
   applyBeginnerMode();
   state.meta = await api('/api/meta');
   const sel = document.getElementById('order-asset');
-  sel.innerHTML = state.meta.tracked_assets.map((a) => `<option value="${a}">${a}</option>`).join('');
+  sel.innerHTML = state.meta.tracked_assets.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join('');
   document.getElementById('strategy-asset').innerHTML = sel.innerHTML;
   switchView('dashboard');
   connectSignalStream();
@@ -545,19 +552,26 @@ async function loadDashboard(isPoll, streamedSignals = null) {
     `${signals.n_assets} assets · generated ${new Date(signals.generated_at * 1000).toLocaleTimeString()}` +
     (signals.error ? ` · ⚠ ${signals.error}` : '');
 
-  grid.innerHTML = signals.signals.map((s, i) => `
-    <div class="signal-card" id="signal-${s.asset}" style="animation-delay:${i * 60}ms">
-      <div class="asset">${s.asset}</div>
-      <div class="price">$${s.last_price.toFixed(2)}</div>
-      <span class="badge ${s.signal_type}">${s.signal_type}</span>
-      <div class="confidence-bar"><div class="confidence-fill" data-target="${Math.round(s.confidence*100)}"></div></div>
+  grid.innerHTML = signals.signals.map((s, i) => {
+    const asset = escapeHtml(String(s.asset));
+    const sigType = escapeHtml(String(s.signal_type));
+    // Optional-chain feature access: signal engine may return partial data
+    const rsi = s.features?.rsi != null ? Number(s.features.rsi).toFixed(1) : 'N/A';
+    const mom = s.features?.momentum != null ? (Number(s.features.momentum) * 100).toFixed(1) : 'N/A';
+    const confPct = Math.round(Number(s.confidence) * 100);
+    return `
+    <div class="signal-card" id="signal-${asset}" style="animation-delay:${i * 60}ms">
+      <div class="asset">${asset}</div>
+      <div class="price">$${Number(s.last_price).toFixed(2)}</div>
+      <span class="badge ${sigType}">${sigType}</span>
+      <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
       <div class="features-row">
-        <span>RSI ${s.features.rsi.toFixed(1)}</span>
-        <span>Mom ${(s.features.momentum*100).toFixed(1)}%</span>
-        <span>Conf ${(s.confidence*100).toFixed(0)}%</span>
+        <span>RSI ${rsi}</span>
+        <span>Mom ${mom}%</span>
+        <span>Conf ${confPct}%</span>
       </div>
-    </div>
-  `).join('') || '<div class="empty-state">No signals yet.</div>';
+    </div>`;
+  }).join('') || '<div class="empty-state">No signals yet.</div>';
 
   // animate confidence bars in on next frame + flash cards whose signal changed
   requestAnimationFrame(() => {
@@ -642,12 +656,24 @@ async function refreshOrders(isPoll) {
   const list = document.getElementById('order-list');
   if (!isPoll && !list.children.length) skeletonGrid(list, 4, 'skeleton-row');
   const orders = await api('/api/trading/orders', {}, { silent: isPoll });
-  list.innerHTML = orders.map((o, i) => `
+  list.innerHTML = orders.map((o, i) => {
+    const side = escapeHtml(String(o.side || '')).toUpperCase();
+    const asset = escapeHtml(String(o.asset));
+    const status = escapeHtml(String(o.status));
+    const priceDetail = o.order_type === 'limit'
+      ? ` @ $${Number(o.limit_price).toFixed(2)}`
+      : o.order_type === 'stop'
+      ? ` stop $${Number(o.stop_price).toFixed(2)}`
+      : o.order_type === 'stop_limit'
+      ? ` stop $${Number(o.stop_price).toFixed(2)} / limit $${Number(o.limit_price).toFixed(2)}`
+      : '';
+    const fillDetail = o.filled_price ? ` @ $${Number(o.filled_price).toFixed(2)}` : '';
+    return `
     <div class="order-row" style="animation-delay:${i * 45}ms">
-      <span>${o.side.toUpperCase()} ${o.quantity} ${o.asset} ${o.order_type === 'limit' ? '@ $' + o.limit_price : o.order_type === 'stop' ? 'stop $' + o.stop_price : o.order_type === 'stop_limit' ? 'stop $' + o.stop_price + ' / limit $' + o.limit_price : ''}</span>
-      <span class="status status-${o.status}">${o.status}${o.filled_price ? ' @ $' + o.filled_price.toFixed(2) : ''}</span>
-    </div>
-  `).join('') || '<div class="empty-state">No orders yet — place your first paper trade.</div>';
+      <span>${side} ${Number(o.quantity)} ${asset}${priceDetail}</span>
+      <span class="status status-${status}">${status}${fillDetail}</span>
+    </div>`;
+  }).join('') || '<div class="empty-state">No orders yet — place your first paper trade.</div>';
 }
 
 // ===========================================================================
@@ -678,12 +704,15 @@ async function loadPortfolio(isPoll) {
   animateCounter(document.getElementById('m-var99'), metrics.var_99 * 100, { decimals: 2, suffix: '%' });
 
   const list = document.getElementById('positions-list');
-  list.innerHTML = positions.map((p, i) => `
+  list.innerHTML = positions.map((p, i) => {
+    const asset = escapeHtml(String(p.asset));
+    const pnlClass = Number(p.unrealized_pnl) >= 0 ? 'pnl-pos' : 'pnl-neg';
+    return `
     <div class="pos-row" style="animation-delay:${i * 50}ms">
-      <span>${p.asset} · ${p.quantity} sh @ $${p.avg_entry_price.toFixed(2)}</span>
-      <span class="${p.unrealized_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">$${p.unrealized_pnl.toFixed(2)}</span>
-    </div>
-  `).join('') || '<div class="empty-state">No open positions.</div>';
+      <span>${asset} &middot; ${Number(p.quantity)} sh @ $${Number(p.avg_entry_price).toFixed(2)}</span>
+      <span class="${pnlClass}">$${Number(p.unrealized_pnl).toFixed(2)}</span>
+    </div>`;
+  }).join('') || '<div class="empty-state">No open positions.</div>';
 
   animateEquityCurve(metrics.equity_curve || []);
 }
@@ -751,22 +780,31 @@ async function loadSecurity(isPoll) {
 
   const health = await api('/api/security/health', {}, { silent: isPoll });
   animateScoreRing(health.quantum_safety_score);
-  keyEl.innerHTML = health.keys.map((k, i) => `
+  keyEl.innerHTML = health.keys.map((k, i) => {
+    const status = escapeHtml(String(k.status));
+    const algo = escapeHtml(String(k.algorithm));
+    return `
     <div class="key-row" style="animation-delay:${i * 60}ms">
-      <span><span class="dot dot-${k.status}"></span>${k.algorithm} · rotation #${k.rotation_count}</span>
-      <span>${k.age_days}d old · due in ${k.rotation_due_in_days}d</span>
-    </div>
-  `).join('') || '<div class="empty-state">No keys issued yet.</div>';
+      <span><span class="dot dot-${status}"></span>${algo} &middot; rotation #${Number(k.rotation_count)}</span>
+      <span>${Number(k.age_days)}d old &middot; due in ${Number(k.rotation_due_in_days)}d</span>
+    </div>`;
+  }).join('') || '<div class="empty-state">No keys issued yet.</div>';
 
   renderHandshakeTrace();
 
   const logs = await api('/api/security/audit-log', {}, { silent: isPoll });
-  document.getElementById('audit-log').innerHTML = logs.map((l, i) => `
+  document.getElementById('audit-log').innerHTML = logs.map((l, i) => {
+    const action = escapeHtml(String(l.action));
+    const resType = l.resource_type ? ' &middot; ' + escapeHtml(String(l.resource_type)) : '';
+    const verifiedLabel = l.verified ? '&#10003; ML-DSA verified' : '&mdash;';
+    // Date constructor is safe with an ISO string from the API
+    const createdAt = l.created_at ? new Date(l.created_at).toLocaleString() : '';
+    return `
     <div class="audit-row" style="animation-delay:${i * 30}ms">
-      <span>${l.action} ${l.resource_type ? '· ' + l.resource_type : ''}</span>
-      <span>${l.verified ? '✓ ML-DSA verified' : '—'} · ${new Date(l.created_at).toLocaleString()}</span>
-    </div>
-  `).join('') || '<div class="empty-state">No audit entries yet.</div>';
+      <span>${action}${resType}</span>
+      <span>${verifiedLabel} &middot; ${createdAt}</span>
+    </div>`;
+  }).join('') || '<div class="empty-state">No audit entries yet.</div>';
 }
 
 async function rotateKeys(algorithm, btn) {
@@ -842,10 +880,16 @@ async function loadCommunity() {
   const releasesEl = document.getElementById('community-releases');
   try {
     const repo = 'BugHunterX2101/quantumsentinel-web';
+    // Centralised GitHub fetch with rate-limit detection (60 req/hr for anonymous)
+    const ghFetch = (url) => fetch(url).then((r) => {
+      if (r.status === 403 || r.status === 429) throw new Error('GitHub API rate limit reached — try again in 1 minute');
+      if (!r.ok) throw new Error(`GitHub API returned ${r.status}`);
+      return r.json();
+    });
     const [info, issues, releases] = await Promise.all([
-      fetch(`https://api.github.com/repos/${repo}`).then((r) => r.ok ? r.json() : Promise.reject()),
-      fetch(`https://api.github.com/repos/${repo}/issues?state=open&labels=good%20first%20issue&per_page=8`).then((r) => r.ok ? r.json() : []),
-      fetch(`https://api.github.com/repos/${repo}/releases?per_page=5`).then((r) => r.ok ? r.json() : []),
+      ghFetch(`https://api.github.com/repos/${repo}`),
+      fetch(`https://api.github.com/repos/${repo}/issues?state=open&labels=good%20first%20issue&per_page=8`).then((r) => r.ok ? r.json() : []).catch(() => []),
+      fetch(`https://api.github.com/repos/${repo}/releases?per_page=5`).then((r) => r.ok ? r.json() : []).catch(() => []),
     ]);
     stats.innerHTML = '';
     [['Stars', info.stargazers_count], ['Forks', info.forks_count], ['Open Issues', info.open_issues_count]].forEach(([label, value]) => {
@@ -879,8 +923,13 @@ async function loadCommunity() {
     try {
       await performHandshake({ showOverlay: false });
       await bootstrapApp();
-      // Re-schedule token expiry warning (conservative: 15 min remaining)
-      scheduleTokenExpiry(900);
+      // Compute actual remaining token lifetime from stored login timestamp
+      const loginAt = parseInt(localStorage.getItem('qs_login_at') || '0', 10);
+      const expiresIn = parseInt(localStorage.getItem('qs_expires_in') || '900', 10);
+      const elapsedSeconds = Math.floor((Date.now() - loginAt) / 1000);
+      // Minimum 30s remaining to avoid immediate expiry warning on fresh restores
+      const remainingSeconds = Math.max(30, expiresIn - elapsedSeconds);
+      scheduleTokenExpiry(remainingSeconds);
     } catch (e) {
       console.error('Session restore failed:', e);
       localStorage.removeItem('qs_token');

@@ -276,9 +276,9 @@ def generate_signals(assets: list[str] | None = None) -> dict:
     # h_i: cross-sectional z-score of momentum so each asset's own trend can
     # outweigh herd correlation effects.
     momentum_vals = np.array([row[2] for row in feature_rows], dtype=float)
-    sigma = momentum_vals.std() or 1e-9
+    sigma = momentum_vals.std(ddof=1) if len(momentum_vals) > 1 else 1e-9
     mu = momentum_vals.mean()
-    h = np.clip((momentum_vals - mu) / sigma, -3.0, 3.0) * 0.35
+    h = np.clip((momentum_vals - mu) / max(sigma, 1e-9), -3.0, 3.0) * 0.35
 
     sba_t0 = time.perf_counter()
     spins = run_sba(J, h)
@@ -341,7 +341,6 @@ def get_cached_signals(assets: list[str] | None = None) -> dict:
         log.exception("signal generation failed — returning stale cache")
         with _cache["lock"]:
             _cache["generating"] = False
-        with _cache["lock"]:
             return _cache["signals"] or {
                 "signals": [], "generated_at": time.time(),
                 "pipeline_ms": 0, "sba_ms": 0, "n_assets": 0,

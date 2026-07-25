@@ -6,7 +6,7 @@ import yfinance as yf
 
 def run_moving_average_backtest(asset: str, fast_window: int, slow_window: int,
                                 period: str, initial_capital: float = 100_000.0) -> dict:
-    data = yf.Ticker(asset).history(period=period, auto_adjust=True)
+    data = yf.Ticker(asset).history(period=period, auto_adjust=True, actions=False)
     if data.empty or len(data) <= slow_window + 2:
         raise ValueError("not enough historical data to run this backtest")
     close = data["Close"].astype(float)
@@ -35,7 +35,10 @@ def run_moving_average_backtest(asset: str, fast_window: int, slow_window: int,
     else:
         final_capital = capital
     returns = np.diff(curve) / np.maximum(np.asarray(curve[:-1]), 1e-9) if len(curve) > 1 else np.array([])
-    sharpe = float(returns.mean() / (returns.std() + 1e-9) * math.sqrt(252)) if len(returns) else 0.0
+    # Sample std (ddof=1) is the industry-standard unbiased estimator for Sharpe.
+    # Population std (ddof=0) systematically overstates Sharpe on short histories.
+    returns_std = returns.std(ddof=1) if len(returns) > 1 else 0.0
+    sharpe = float(returns.mean() / (returns_std + 1e-9) * math.sqrt(252)) if len(returns) > 1 else 0.0
     peak, max_drawdown = initial_capital, 0.0
     for value in curve:
         peak = max(peak, value)
@@ -49,4 +52,5 @@ def run_moving_average_backtest(asset: str, fast_window: int, slow_window: int,
         "total_trades": total_events,
         "win_rate": round(wins / max(1, closed_trades), 3),
         "equity_curve": [round(float(v), 2) for v in curve[::max(1, len(curve) // 100)]],
+        "slippage_note": "Results assume zero transaction costs and perfect fills at close price. Real performance will differ.",
     }

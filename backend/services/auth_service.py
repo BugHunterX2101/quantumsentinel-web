@@ -17,15 +17,25 @@ PBKDF2_ITERATIONS = 200_000
 SESSIONS: dict[str, dict] = {}
 NONCES: dict[str, float] = {}
 NONCE_TTL_SECONDS = 300  # 5 minutes
+MAX_SESSIONS = 10_000  # Prevent unbounded memory growth on long-running servers
 
 
 def _expire_nonces() -> None:
-    """Remove stale nonces to prevent unbounded memory growth."""
+    """Remove stale nonces and expired sessions to prevent unbounded memory growth."""
     cutoff = time.time() - NONCE_TTL_SECONDS
     expired = [k for k, v in NONCES.items() if v < cutoff]
     for k in expired:
         del NONCES[k]
-
+    # Clean up expired sessions
+    now = time.time()
+    expired_sessions = [k for k, v in SESSIONS.items() if v.get("expires_at", 0) < now]
+    for k in expired_sessions:
+        del SESSIONS[k]
+    # LRU-style eviction if session count exceeds cap
+    if len(SESSIONS) > MAX_SESSIONS:
+        by_created = sorted(SESSIONS.items(), key=lambda x: x[1].get("created_at", 0))
+        for k, _ in by_created[:len(SESSIONS) - MAX_SESSIONS]:
+            del SESSIONS[k]
 
 
 def hash_password(password: str) -> str:

@@ -32,8 +32,12 @@ def verify_api_key(db: Session, raw_key: str, scope: str) -> models.ApiKey | Non
                                          models.ApiKey.is_revoked.is_(False)).first()
     if not key or (scope not in (key.scopes or []) and "admin" not in (key.scopes or [])):
         return None
-    if key.expires_at and key.expires_at.replace(tzinfo=dt.timezone.utc) < dt.datetime.now(dt.timezone.utc):
-        return None
+    if key.expires_at:
+        # Make expires_at timezone-aware before comparison to avoid TypeError.
+        # DB may store as naive UTC or as tz-aware; handle both cases.
+        expires_aware = key.expires_at if key.expires_at.tzinfo else key.expires_at.replace(tzinfo=dt.timezone.utc)
+        if expires_aware < dt.datetime.now(dt.timezone.utc):
+            return None
     key.last_used_at = dt.datetime.now(dt.timezone.utc)
     db.commit()
     return key

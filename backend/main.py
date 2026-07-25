@@ -294,15 +294,11 @@ async def signal_stream(websocket: WebSocket):
 @app.post("/api/trading/orders", status_code=201)
 def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
-    # FIX: quantity must be strictly positive — zero/negative slipped through before
-    if req.quantity <= 0:
-        raise HTTPException(400, "quantity must be greater than zero")
-    if req.side not in ("buy", "sell"):
-        raise HTTPException(400, "side must be buy or sell")
-    if req.order_type not in ("market", "limit", "stop", "stop_limit"):
-        raise HTTPException(400, "unsupported order_type")
-    if req.time_in_force not in ("day", "gtc", "ioc"):
-        raise HTTPException(400, "time_in_force must be day, gtc, or ioc")
+    # Pydantic Literal types in schemas.py already enforce: quantity>0,
+    # side in (buy/sell), order_type in (market/limit/stop/stop_limit),
+    # time_in_force in (day/gtc/ioc) — these checks are now redundant.
+    # Cross-field semantic checks (price required for conditional order types)
+    # are not expressible in Literal and must stay here.
     if req.order_type in ("limit", "stop_limit") and not req.limit_price:
         raise HTTPException(400, "limit_price required for limit orders")
     if req.order_type in ("stop", "stop_limit") and not req.stop_price:

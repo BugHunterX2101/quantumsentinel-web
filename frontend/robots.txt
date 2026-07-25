@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+
+# Block API routes from indexing
+Disallow: /api/
+Disallow: /metrics
+Disallow: /health/

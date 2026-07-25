@@ -32,13 +32,18 @@ HKDF_SALT_CONTEXT = b"QuantumSentinel-v1"
 
 
 def _assert_pqc_backend():
-    if ENVIRONMENT == "production":
-        # The bundled packages are reference implementations. An external
-        # provider adapter must be integrated before production crypto calls;
-        # never silently downgrade to Python reference code.
+    """Guard: in development, the pure-Python reference packages are allowed.
+    In production, an external liboqs/HSM adapter must be configured;
+    otherwise we refuse to proceed rather than silently use slower,
+    unreviewed reference code in a live environment.
+    """
+    if ENVIRONMENT == "production" and (PQC_PROVIDER == "reference" or not PQC_PROVIDER_URL):
         raise RuntimeError(
-            f"PQC provider '{PQC_PROVIDER}' at {PQC_PROVIDER_URL!r} requires the reviewed external adapter"
+            f"Production PQC requires a configured external provider. "
+            f"Set PQC_PROVIDER and PQC_PROVIDER_URL; currently: "
+            f"provider={PQC_PROVIDER!r}, url={PQC_PROVIDER_URL!r}"
         )
+    # Development/staging: allow pure-Python reference implementations (kyber-py / dilithium-py).
 
 
 def b64(data: bytes) -> str:

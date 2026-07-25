@@ -145,7 +145,15 @@ def generate_signals(assets: list[str] | None = None) -> dict:
     assets = assets or TRACKED_ASSETS
     t0 = time.perf_counter()
 
-    data = yf.download(assets, period="3mo", interval="1d", progress=False, group_by="ticker")
+    try:
+        data = yf.download(assets, period="3mo", interval="1d", progress=False, group_by="ticker")
+    except Exception as exc:
+        # Yahoo Finance is unavailable — log and surface a structured error
+        # instead of propagating a 500 to the API layer.
+        import logging
+        logging.getLogger(__name__).warning("yfinance download failed: %s", exc)
+        return {"signals": [], "generated_at": time.time(), "pipeline_ms": 0,
+                "sba_ms": 0, "n_assets": 0, "error": "market data unavailable"}
 
     feature_rows, returns_rows, closes_last, rsis = [], [], {}, {}
     valid_assets = []
@@ -166,7 +174,8 @@ def generate_signals(assets: list[str] | None = None) -> dict:
         valid_assets.append(asset)
 
     if not valid_assets:
-        return {"signals": [], "generated_at": time.time(), "pipeline_ms": 0}
+        return {"signals": [], "generated_at": time.time(), "pipeline_ms": 0,
+                "sba_ms": 0, "n_assets": 0}
 
     returns_matrix = np.array(returns_rows)
     J = build_coupling_matrix(returns_matrix)
@@ -208,12 +217,34 @@ def generate_signals(assets: list[str] | None = None) -> dict:
 
 
 def get_cached_signals(assets: list[str] | None = None) -> dict:
+    """Return cached signals if fresh; otherwise re-generate.
+    On generation failure, returns the stale cache rather than propagating an error.
+    The cache lock is always held for both the staleness check AND the update so
+    no second thread can concurrently overwrite with different data.
+    """
     with _cache["lock"]:
         now = time.time()
         if now - _cache["generated_at"] < CACHE_TTL_SECONDS and _cache["signals"]:
             return _cache["signals"]
-    fresh = generate_signals(assets)
+
+    try:
+        fresh = generate_signals(assets)
+    except Exception:
+        # Return stale data on unexpected error — never surface a 500 from here.
+        import logging
+        logging.getLogger(__name__).exception("signal generation failed; returning stale cache")
+        with _cache["lock"]:
+            return _cache["signals"] or {"signals": [], "generated_at": time.time(),
+                                          "pipeline_ms": 0, "sba_ms": 0, "n_assets": 0,
+                                          "error": "signal generation failed"}
+
     with _cache["lock"]:
         _cache["signals"] = fresh
         _cache["generated_at"] = time.time()
     return fresh
+
+
+def invalidate_cache() -> None:
+    """Thread-safe cache invalidation used by the POST /api/signals/refresh endpoint."""
+    with _cache["lock"]:
+        _cache["generated_at"] = 0.0

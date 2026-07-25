@@ -30,8 +30,10 @@ def recompute_positions(db: Session, user_id: str):
             b["qty"] -= qty
             b["cost"] = avg_cost * b["qty"]
 
-    # replace existing rows
-    db.query(models.Position).filter(models.Position.user_id == user_id).delete()
+    # Replace existing position rows using SQLAlchemy 2.0-style execute
+    db.execute(
+        models.Position.__table__.delete().where(models.Position.user_id == user_id)
+    )
     for asset, b in book.items():
         avg_entry = (b["cost"] / b["qty"]) if b["qty"] else 0.0
         db.add(models.Position(
@@ -78,7 +80,13 @@ def equity_curve_from_trades(db: Session, user_id: str, starting_capital: float 
         else:
             equity += notional
             book[t.asset] = book.get(t.asset, 0) - qty
-        curve.append(equity)
+        # Mark open positions to market at each trade event for accurate equity tracking
+        open_value = sum(
+            held_qty * get_last_price(asset)
+            for asset, held_qty in book.items()
+            if held_qty > 0
+        )
+        curve.append(equity + open_value)
     return curve
 
 

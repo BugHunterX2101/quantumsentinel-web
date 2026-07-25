@@ -3,6 +3,7 @@ import json
 import datetime as dt
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from .. import models
 from ..crypto import pqc
@@ -91,6 +92,11 @@ def verify_audit_log(db: Session, log_id: str) -> bool:
     entry = db.get(models.AuditLog, log_id)
     if not entry or not entry.pqc_signature:
         return False
+    if server_identity.dsa_pk is None:
+        # Server keypair was ephemeral (no SERVER_DSA keys configured);
+        # signatures from a prior process cannot be verified — return None-like False
+        # but do not crash.
+        return False
     payload = json.dumps({
         "action": entry.action, "user_id": entry.user_id,
         "resource_type": entry.resource_type, "resource_id": entry.resource_id,
@@ -100,9 +106,12 @@ def verify_audit_log(db: Session, log_id: str) -> bool:
 
 
 def key_health(db: Session, user_id: str) -> dict:
-    keys = db.query(models.KeyPair).filter(
-        models.KeyPair.user_id == user_id, models.KeyPair.is_active.is_(True)
-    ).all()
+    # Use SQLAlchemy 2.0-style select() for consistency with the rest of the codebase
+    keys = db.execute(
+        select(models.KeyPair).where(
+            models.KeyPair.user_id == user_id, models.KeyPair.is_active.is_(True)
+        )
+    ).scalars().all()
     now = dt.datetime.now(dt.timezone.utc)
     report = []
     threat_level = "GREEN"
@@ -111,7 +120,10 @@ def key_health(db: Session, user_id: str) -> dict:
         if created.tzinfo is None:
             created = created.replace(tzinfo=dt.timezone.utc)
         age_days = (now - created).days
-        rotation_period = SERVER_KEY_ROTATION_DAYS if k.algorithm.startswith("ML-DSA") else 1
+        # Both KEM and DSA keys use the same 90-day rotation policy.
+        # (The previous code used 1 day for ML-KEM-768, which incorrectly
+        # flagged all KEM keys RED after 24 hours.)
+        rotation_period = SERVER_KEY_ROTATION_DAYS
         due_in = rotation_period - age_days
         status = "GREEN"
         if due_in <= 0:

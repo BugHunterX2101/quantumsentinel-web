@@ -16,6 +16,16 @@ PBKDF2_ITERATIONS = 200_000
 # in-memory PQC session store (mirrors the Redis session:{user_id} pattern)
 SESSIONS: dict[str, dict] = {}
 NONCES: dict[str, float] = {}
+NONCE_TTL_SECONDS = 300  # 5 minutes
+
+
+def _expire_nonces() -> None:
+    """Remove stale nonces to prevent unbounded memory growth."""
+    cutoff = time.time() - NONCE_TTL_SECONDS
+    expired = [k for k, v in NONCES.items() if v < cutoff]
+    for k in expired:
+        del NONCES[k]
+
 
 
 def hash_password(password: str) -> str:
@@ -52,6 +62,9 @@ def perform_handshake(db: Session, user_id: str, client_x25519_pub_b64: str,
     demonstration client-analog keypair so the FULL real protocol still
     executes end-to-end — this is flagged clearly to the caller."""
     from ..services import security_service
+
+    # Purge expired nonces (TTL = 5 min) to prevent unbounded memory growth.
+    _expire_nonces()
 
     client_x25519_pub = pqc.unb64(client_x25519_pub_b64)
     client_nonce = pqc.unb64(client_nonce_b64)

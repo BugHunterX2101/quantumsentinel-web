@@ -4,11 +4,12 @@ const state = {
   user: JSON.parse(localStorage.getItem('qs_user') || 'null'),
   beginner: localStorage.getItem('qs_beginner') !== 'false',
   meta: null,
-  lastSignals: {},   // asset -> last confidence, for diff-highlighting
+  lastSignals: {},   // asset -> last signal_type, for diff-highlighting
   pollTimer: null,
   signalSocket: null,
   signalReconnectMs: 1000,
   activeView: 'dashboard',
+  tokenExpireTimer: null,
 };
 
 // ===========================================================================
@@ -63,12 +64,40 @@ function api(path, opts = {}, opts2 = {}) {
   loadingBar.start();
   return fetch(path, Object.assign({}, opts, { headers })).then(async (r) => {
     const body = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      // Token expired or invalid — force logout
+      handleTokenExpiry();
+      throw new Error('Session expired. Please log in again.');
+    }
     if (!r.ok) throw new Error(body.detail || r.statusText);
     return body;
   }).catch((err) => {
     if (!opts2.silent) toast('Request failed', err.message, 'error');
     throw err;
   }).finally(() => loadingBar.done());
+}
+
+function handleTokenExpiry() {
+  if (state.tokenExpireTimer) { clearTimeout(state.tokenExpireTimer); state.tokenExpireTimer = null; }
+  if (state.signalSocket) { state.signalSocket.close(); state.signalSocket = null; }
+  localStorage.removeItem('qs_token');
+  localStorage.removeItem('qs_user');
+  state.token = null;
+  state.user = null;
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('auth-screen').classList.remove('hidden');
+  toast('Session expired', 'Please log in again.', 'error', 5000);
+}
+
+function scheduleTokenExpiry(expiresInSeconds) {
+  if (state.tokenExpireTimer) clearTimeout(state.tokenExpireTimer);
+  // Refresh warning 60 seconds before expiry (or immediately if < 60s left)
+  const warnIn = Math.max(0, (expiresInSeconds - 60) * 1000);
+  state.tokenExpireTimer = setTimeout(() => {
+    toast('Session expiring soon', 'Your session will expire in 60 seconds. Please log out and log back in.', 'info', 8000);
+    // Force logout at actual expiry
+    setTimeout(handleTokenExpiry, 60000);
+  }, warnIn);
 }
 
 const b64encode = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
@@ -209,12 +238,14 @@ document.querySelectorAll('.auth-tab').forEach((btn) => {
 });
 
 function setButtonLoading(btn, loading, loadingText) {
+  const labelEl = btn.querySelector('.btn-label');
+  if (!labelEl) return; // guard: no label span, skip
   if (loading) {
-    btn.dataset.originalLabel = btn.querySelector('.btn-label').textContent;
-    btn.querySelector('.btn-label').innerHTML = `<span class="spinner"></span>${loadingText}`;
+    btn.dataset.originalLabel = labelEl.textContent;
+    labelEl.innerHTML = `<span class="spinner"></span>${loadingText}`;
     btn.disabled = true;
   } else {
-    btn.querySelector('.btn-label').textContent = btn.dataset.originalLabel || '';
+    labelEl.textContent = btn.dataset.originalLabel || '';
     btn.disabled = false;
   }
 }
@@ -253,6 +284,8 @@ async function afterLogin(data) {
   state.user = data.user;
   localStorage.setItem('qs_token', state.token);
   localStorage.setItem('qs_user', JSON.stringify(state.user));
+  // Schedule a warning before the JWT expires (default 900s = 15min)
+  scheduleTokenExpiry(data.expires_in || 900);
   document.getElementById('auth-screen').classList.add('hidden');
   await performHandshake({ showOverlay: true });
   document.getElementById('app').classList.remove('hidden');
@@ -400,6 +433,7 @@ document.getElementById('beginner-toggle').addEventListener('click', () => {
 
 document.getElementById('logout-btn').addEventListener('click', () => {
   if (state.signalSocket) state.signalSocket.close();
+  if (state.tokenExpireTimer) clearTimeout(state.tokenExpireTimer);
   localStorage.removeItem('qs_token');
   localStorage.removeItem('qs_user');
   location.reload();
@@ -423,10 +457,18 @@ function connectSignalStream() {
   state.signalSocket = socket;
   socket.onopen = () => { state.signalReconnectMs = 1000; };
   socket.onmessage = (event) => {
-    try { if (state.activeView === 'dashboard') loadDashboard(true, JSON.parse(event.data)); } catch (_) {}
+    try {
+      if (state.activeView === 'dashboard') loadDashboard(true, JSON.parse(event.data));
+    } catch (err) {
+      console.error('WebSocket message handling error:', err);
+    }
+  };
+  socket.onerror = (err) => {
+    // onerror is followed by onclose; log it but let onclose handle reconnection.
+    console.warn('WebSocket error:', err);
   };
   socket.onclose = () => {
-    if (state.signalSocket !== socket) return;
+    if (state.signalSocket !== socket) return; // superseded socket, ignore
     state.signalSocket = null;
     const delay = state.signalReconnectMs;
     state.signalReconnectMs = Math.min(30000, delay * 2);
@@ -492,15 +534,16 @@ async function loadDashboard(isPoll, streamedSignals = null) {
   const grid = document.getElementById('signal-grid');
   if (!isPoll && !grid.children.length) skeletonGrid(grid, 8, 'skeleton-card');
 
-  const [signals, health] = await Promise.all([
-    streamedSignals || api('/api/signals/latest', {}, { silent: isPoll }),
-    api('/api/security/health', {}, { silent: true }).catch(() => null),
-  ]);
-  if (health) animateScoreRing(health.quantum_safety_score);
+  // Fetch signals (from WebSocket push or REST); security health is fetched
+  // independently only when on the dashboard and not as part of a poll to
+  // avoid coupling two endpoints unnecessarily.
+  const signals = streamedSignals || await api('/api/signals/latest', {}, { silent: isPoll }).catch(() => null);
+  if (!signals) return;
 
   document.getElementById('signal-meta').textContent =
     `Engine pipeline: ${signals.pipeline_ms} ms total (SBA bifurcation: ${signals.sba_ms} ms) · ` +
-    `${signals.n_assets} assets · generated ${new Date(signals.generated_at * 1000).toLocaleTimeString()}`;
+    `${signals.n_assets} assets · generated ${new Date(signals.generated_at * 1000).toLocaleTimeString()}` +
+    (signals.error ? ` · ⚠ ${signals.error}` : '');
 
   grid.innerHTML = signals.signals.map((s, i) => `
     <div class="signal-card" id="signal-${s.asset}" style="animation-delay:${i * 60}ms">
@@ -528,15 +571,31 @@ async function loadDashboard(isPoll, streamedSignals = null) {
     }
     state.lastSignals[s.asset] = s.signal_type;
   });
+
+  // Update the safety score ring on first load or if not already populated
+  if (!isPoll) {
+    api('/api/security/health', {}, { silent: true }).then((health) => {
+      if (health) animateScoreRing(health.quantum_safety_score);
+    }).catch(() => {});
+  }
 }
 
 document.getElementById('refresh-signals').addEventListener('click', async (e) => {
-  const icon = e.currentTarget.querySelector('.refresh-icon');
-  icon.classList.add('spinning');
-  await api('/api/signals/refresh');
-  await loadDashboard();
-  toast('Signals refreshed', 'SBA engine re-ran over live market data', 'success', 2200);
-  setTimeout(() => icon.classList.remove('spinning'), 600);
+  const btn = e.currentTarget;
+  const icon = btn.querySelector('.refresh-icon');
+  if (icon) icon.classList.add('spinning');
+  setButtonLoading(btn, true, ' Refreshing…');
+  try {
+    // POST to /api/signals/refresh (state-mutating endpoint)
+    await api('/api/signals/refresh', { method: 'POST' });
+    await loadDashboard();
+    toast('Signals refreshed', 'SBA engine re-ran over live market data', 'success', 2200);
+  } catch (err) {
+    toast('Refresh failed', err.message, 'error');
+  } finally {
+    setButtonLoading(btn, false);
+    if (icon) icon.classList.remove('spinning');
+  }
 });
 
 // ===========================================================================
@@ -555,15 +614,16 @@ document.getElementById('order-form').addEventListener('submit', async (e) => {
   const errEl = document.getElementById('order-error');
   const btn = document.getElementById('order-submit-btn');
   errEl.textContent = '';
+  const orderType = document.getElementById('order-type').value;
   const body = {
     asset: document.getElementById('order-asset').value,
     side: document.getElementById('order-side').value,
     quantity: parseFloat(document.getElementById('order-qty').value),
-    order_type: document.getElementById('order-type').value,
-    limit_price: document.getElementById('order-type').value === 'limit'
-      || document.getElementById('order-type').value === 'stop_limit'
+    order_type: orderType,
+    time_in_force: document.getElementById('order-tif').value,
+    limit_price: ['limit', 'stop_limit'].includes(orderType)
       ? parseFloat(document.getElementById('order-limit-price').value) : null,
-    stop_price: ['stop', 'stop_limit'].includes(document.getElementById('order-type').value)
+    stop_price: ['stop', 'stop_limit'].includes(orderType)
       ? parseFloat(document.getElementById('order-stop-price').value) : null,
   };
   setButtonLoading(btn, true, 'Signing with ML-DSA-65…');
@@ -629,6 +689,8 @@ async function loadPortfolio(isPoll) {
 }
 
 document.getElementById('portfolio-export').addEventListener('click', async () => {
+  const btn = document.getElementById('portfolio-export');
+  setButtonLoading(btn, true, 'Generating…');
   try {
     const response = await fetch('/api/portfolio/export', {
       headers: { Authorization: 'Bearer ' + state.token },
@@ -638,7 +700,7 @@ document.getElementById('portfolio-export').addEventListener('click', async () =
     const link = document.createElement('a');
     link.href = url; link.download = 'quantumsentinel-portfolio.csv'; link.click();
     URL.revokeObjectURL(url);
-  } catch (err) { toast('Export failed', err.message, 'error'); }
+  } catch (err) { toast('Export failed', err.message, 'error'); } finally { setButtonLoading(btn, false); }
 });
 
 let equityAnimFrame = null;
@@ -715,26 +777,17 @@ async function rotateKeys(algorithm, btn) {
     toast('Key rotated', `${algorithm} · rotation #${res.rotation_count} · keygen ${res.keygen_ms} ms`, 'success');
   } finally { setButtonLoading(btn, false); }
 }
-document.getElementById('rotate-dsa').addEventListener('click', (e) => {
-  const btn = e.currentTarget;
-  rotateDsaWrap(btn);
-});
-function rotateDsaWrap(btn) {
-  if (!btn.querySelector('.btn-label')) { btn.innerHTML = `<span class="btn-label">${btn.textContent}</span>`; }
-  rotateKeys('ML-DSA-65', btn);
-}
-document.getElementById('rotate-kem').addEventListener('click', (e) => {
-  const btn = e.currentTarget;
-  if (!btn.querySelector('.btn-label')) { btn.innerHTML = `<span class="btn-label">${btn.textContent}</span>`; }
-  rotateKeys('ML-KEM-768', btn);
-});
+document.getElementById('rotate-dsa').addEventListener('click', (e) => rotateKeys('ML-DSA-65', e.currentTarget));
+document.getElementById('rotate-kem').addEventListener('click', (e) => rotateKeys('ML-KEM-768', e.currentTarget));
 document.getElementById('compliance-export').addEventListener('click', async () => {
+  const btn = document.getElementById('compliance-export');
+  setButtonLoading(btn, true, 'Generating…');
   try {
     const report = await api('/api/security/compliance-report');
     const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a'); link.href = url; link.download = 'quantumsentinel-compliance-evidence.json'; link.click();
     URL.revokeObjectURL(url); toast('Evidence downloaded', 'Signed audit-verification and key-health report generated.', 'success');
-  } catch (err) { toast('Report failed', err.message, 'error'); }
+  } catch (err) { toast('Report failed', err.message, 'error'); } finally { setButtonLoading(btn, false); }
 });
 
 // ===========================================================================
@@ -759,20 +812,28 @@ async function loadIntegrations() {
 
 document.getElementById('api-key-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const result = await api('/api/integrations/api-keys', { method: 'POST', body: JSON.stringify({
-    name: document.getElementById('api-key-name').value, scopes: selectedValues('api-key-scopes'),
-  }) });
-  document.getElementById('api-key-secret').textContent = `Copy this API key now; it will not be shown again: ${result.api_key}`;
-  await loadIntegrations();
+  const btn = event.currentTarget.querySelector('button[type=submit]');
+  setButtonLoading(btn, true, 'Creating…');
+  try {
+    const result = await api('/api/integrations/api-keys', { method: 'POST', body: JSON.stringify({
+      name: document.getElementById('api-key-name').value, scopes: selectedValues('api-key-scopes'),
+    }) });
+    document.getElementById('api-key-secret').textContent = `Copy this API key now; it will not be shown again: ${result.api_key}`;
+    await loadIntegrations();
+  } finally { setButtonLoading(btn, false); }
 });
 
 document.getElementById('webhook-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const result = await api('/api/integrations/webhooks', { method: 'POST', body: JSON.stringify({
-    url: document.getElementById('webhook-url').value, event_types: selectedValues('webhook-events'),
-  }) });
-  document.getElementById('webhook-secret').textContent = `Copy this signing secret now: ${result.signing_secret}`;
-  await loadIntegrations();
+  const btn = event.currentTarget.querySelector('button[type=submit]');
+  setButtonLoading(btn, true, 'Adding…');
+  try {
+    const result = await api('/api/integrations/webhooks', { method: 'POST', body: JSON.stringify({
+      url: document.getElementById('webhook-url').value, event_types: selectedValues('webhook-events'),
+    }) });
+    document.getElementById('webhook-secret').textContent = `Copy this signing secret now: ${result.signing_secret}`;
+    await loadIntegrations();
+  } finally { setButtonLoading(btn, false); }
 });
 
 async function loadCommunity() {
@@ -811,13 +872,19 @@ async function loadCommunity() {
 // ===========================================================================
 (async function init() {
   if (state.token && state.user) {
+    // Hide the auth screen immediately — show app shell while handshake runs
+    document.getElementById('auth-screen').classList.add('hidden');
     document.getElementById('app').classList.remove('hidden');
     document.getElementById('user-email').textContent = state.user.email;
     try {
       await performHandshake({ showOverlay: false });
       await bootstrapApp();
+      // Re-schedule token expiry warning (conservative: 15 min remaining)
+      scheduleTokenExpiry(900);
     } catch (e) {
+      console.error('Session restore failed:', e);
       localStorage.removeItem('qs_token');
+      localStorage.removeItem('qs_user');
       location.reload();
     }
   }

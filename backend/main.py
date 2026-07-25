@@ -96,7 +96,8 @@ async def security_headers_and_rate_limit(request, call_next):
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self' https://api.github.com; frame-ancestors 'none'; base-uri 'self'"
+        "img-src 'self' data:; connect-src 'self' wss: ws: https://api.github.com; "
+        "frame-ancestors 'none'; base-uri 'self'"
     )
     return response
 
@@ -126,7 +127,8 @@ async def readiness(db: Session = Depends(get_db)):
 
 
 @app.get("/metrics", include_in_schema=False)
-def metrics():
+def metrics(user: models.User = Depends(get_current_user)):
+    """Prometheus metrics — requires a valid bearer token to prevent public exposure."""
     from fastapi.responses import Response
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
@@ -228,10 +230,12 @@ def latest_signals(user: models.User = Depends(get_current_user)):
     return data
 
 
-@app.get("/api/signals/refresh")
+@app.post("/api/signals/refresh")
 def refresh_signals(user: models.User = Depends(get_current_user)):
-    """Force-refresh (bypasses cache) — used by the dashboard's manual refresh button."""
-    signal_engine._cache["generated_at"] = 0
+    """Force-refresh (bypasses cache) — used by the dashboard's manual refresh button.
+    Changed from GET to POST because this endpoint mutates server state (cache invalidation).
+    """
+    signal_engine.invalidate_cache()
     return signal_engine.get_cached_signals()
 
 
@@ -289,8 +293,15 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     if req.side == "sell" and req.quantity > held:
         raise HTTPException(400, "sell quantity exceeds the available paper position")
     price_for_risk = req.limit_price or req.stop_price or trading_service.get_last_price(req.asset)
-    if req.side == "buy" and req.quantity * price_for_risk > 5_000:
-        raise HTTPException(400, "order exceeds the 5% paper-account position limit ($5,000)")
+    # Dynamic position size cap: 5% of starting paper capital ($100k = $5k max).
+    # Compute actual account equity (cash approximation from filled trades).
+    total_notional_held = sum(
+        p["market_value"] for p in existing_positions.values()
+    )
+    account_equity = max(5_000, 100_000 - total_notional_held)  # conservatively floor at 5k
+    position_cap = account_equity * 0.05
+    if req.side == "buy" and req.quantity * price_for_risk > position_cap:
+        raise HTTPException(400, f"order exceeds the 5% paper-account position limit (${position_cap:,.0f})")
     duplicate_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=15)
     duplicate = db.execute(select(models.Trade).where(
         models.Trade.user_id == user.id, models.Trade.asset == req.asset,
@@ -682,6 +693,8 @@ def rotate_keys(req: schemas.RotateKeysRequest, user: models.User = Depends(get_
             "rotation_count": rotation_count, "keygen_ms": round(ms, 3)}
 
 
+
+
 # --------------------------------------------------------------------------
 # Enterprise SDK / algorithm registry
 # --------------------------------------------------------------------------
@@ -701,11 +714,38 @@ def meta():
 
 
 # --------------------------------------------------------------------------
-# Frontend static hosting
+# Frontend static hosting + SPA catch-all
 # --------------------------------------------------------------------------
 if FRONTEND_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR)), name="assets")
 
     @app.get("/")
     def index():
+        return FileResponse(str(FRONTEND_DIR / "index.html"))
+
+    @app.get("/robots.txt", include_in_schema=False)
+    def robots():
+        robots_path = FRONTEND_DIR / "robots.txt"
+        if robots_path.exists():
+            return FileResponse(str(robots_path), media_type="text/plain")
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("User-agent: *\nAllow: /\nDisallow: /api/\n")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon():
+        ico_path = FRONTEND_DIR / "favicon.ico"
+        if ico_path.exists():
+            return FileResponse(str(ico_path), media_type="image/x-icon")
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(404, "Not found")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def spa_fallback(path: str):
+        """SPA catch-all: any unknown route serves index.html so the frontend
+        router handles navigation rather than returning a JSON 404.
+        Excludes /api, /assets, /health, /metrics paths which are handled above."""
+        excluded = ("api/", "assets/", "health/", "metrics")
+        if any(path.startswith(prefix) for prefix in excluded):
+            from fastapi import HTTPException as _HTTPException
+            raise _HTTPException(404, "Not found")
         return FileResponse(str(FRONTEND_DIR / "index.html"))

@@ -27,7 +27,7 @@ import redis.asyncio as redis
 
 from . import models, schemas
 from .database import get_db, init_db, SessionLocal
-from .config import CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL
+from .config import CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service
 
@@ -214,10 +214,6 @@ def login(req: schemas.LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(401, "Invalid credentials")
     token = auth_service.create_access_token(user.id, user.tier)
     security_service.write_audit_log(db, user.id, "USER_LOGIN", "user", user.id, {})
-    # FIX: Return the ACTUAL JWT TTL from config, not a hardcoded 3600.
-    # The frontend token-expiry timer uses this value — wrong value caused
-    # tokens to appear valid 4x longer than they actually are.
-    from .config import JWT_EXPIRE_SECONDS
     return {
         "access_token": token, "token_type": "bearer",
         "expires_in": JWT_EXPIRE_SECONDS,
@@ -280,9 +276,16 @@ async def signal_stream(websocket: WebSocket):
             return
         await websocket.accept(subprotocol="qs")
         while True:
-            await websocket.send_json(signal_engine.get_cached_signals())
+            try:
+                await websocket.send_json(signal_engine.get_cached_signals())
+            except Exception:
+                # Connection closed mid-send or serialisation error — exit cleanly
+                break
             await asyncio.sleep(30)
     except WebSocketDisconnect:
+        pass
+    except Exception:
+        # Catch-all for unexpected errors (e.g. DB failure during user lookup)
         pass
     finally:
         db.close()
@@ -350,17 +353,22 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
         raise HTTPException(409, "duplicate pending order blocked")
 
     # ML-DSA-65 signs the order payload before it is accepted — persisted for audit.
+    # NOTE: renamed from 'payload' to 'order_payload' to avoid shadowing the JWT
+    # payload dict used earlier in the WebSocket handler and auth dependency.
     user_dsa_key = db.execute(
         select(models.KeyPair).where(
             models.KeyPair.user_id == user.id, models.KeyPair.algorithm == "ML-DSA-65",
             models.KeyPair.is_active.is_(True),
         )
     ).scalars().first()
-    payload = f"{req.side}:{req.asset}:{req.quantity}:{req.order_type}:{req.limit_price}:{req.stop_price}:{req.time_in_force}".encode()
+    order_payload = (
+        f"{req.side}:{req.asset}:{req.quantity}:{req.order_type}"
+        f":{req.limit_price}:{req.stop_price}:{req.time_in_force}"
+    ).encode()
     signature = None
     if user_dsa_key and user_dsa_key.private_key:
         private_key = security_service.unprotect_private_key(user_dsa_key.private_key)
-        sig_bytes, _ = pqc.dsa_sign(pqc.unb64(private_key), payload)
+        sig_bytes, _ = pqc.dsa_sign(pqc.unb64(private_key), order_payload)
         signature = pqc.b64(sig_bytes)
 
     trade = models.Trade(
@@ -449,15 +457,24 @@ def list_orders(user: models.User = Depends(get_current_user), db: Session = Dep
     ).scalars().all()
     changed = False
     for t in pending:
-        if t.order_type == "limit":
-            fill_price = trading_service.check_pending_limit_fill(t.asset, t.side, float(t.limit_price))
-        else:
+        fill_price = None
+        if t.order_type == "limit" and t.limit_price is not None:
+            # Use the lightweight price-check helper — no full simulate_fill overhead
+            fill_price = trading_service.check_pending_limit_fill(
+                t.asset, t.side, float(t.limit_price)
+            )
+        elif t.order_type in ("stop", "stop_limit") and t.stop_price is not None:
+            # Stop/stop_limit: check if market price has crossed the stop trigger
             fill = trading_service.simulate_fill(
                 t.asset, t.side, float(t.quantity), t.order_type,
                 float(t.limit_price) if t.limit_price else None,
-                float(t.stop_price) if t.stop_price else None,
+                float(t.stop_price),
             )
             fill_price = fill["filled_price"] if fill["status"] == "FILLED" else None
+        # market orders in ACCEPTED state are filled immediately on placement;
+        # they should not appear in pending — but guard against stale rows
+        elif t.order_type == "market":
+            fill_price = trading_service.get_last_price(t.asset)
         if fill_price is not None:
             t.status = "FILLED"
             t.filled_price = fill_price
@@ -659,13 +676,19 @@ def security_health(user: models.User = Depends(get_current_user), db: Session =
     n_keys = len(health["keys"])
     n_green = sum(1 for k in health["keys"] if k["status"] == "GREEN")
     quantum_safety_score = round(100 * (n_green / n_keys), 0) if n_keys else 100
+    # Make created_at timezone-aware if it was stored as a naive datetime
+    # to prevent TypeError when subtracting from an aware datetime.
+    created_at = security_service.server_identity.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=dt.timezone.utc)
+    key_age_days = (dt.datetime.now(dt.timezone.utc) - created_at).days
     return {
         **health,
         "quantum_safety_score": quantum_safety_score,
         "fips_203_compliant": True,
         "fips_204_compliant": True,
         "alpaca_live": trading_service.alpaca_enabled(),
-        "server_dsa_key_age_days": (dt.datetime.now(dt.timezone.utc) - security_service.server_identity.created_at).days,
+        "server_dsa_key_age_days": key_age_days,
     }
 
 
@@ -738,8 +761,6 @@ def rotate_keys(req: schemas.RotateKeysRequest, user: models.User = Depends(get_
 
     return {"new_key_pair_id": new_key.id, "algorithm": req.algorithm,
             "rotation_count": rotation_count, "keygen_ms": round(ms, 3)}
-
-
 
 
 # --------------------------------------------------------------------------

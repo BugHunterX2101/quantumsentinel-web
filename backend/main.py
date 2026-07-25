@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -70,7 +70,6 @@ async def security_headers_and_rate_limit(request, call_next):
                 await _redis_client.expire(redis_key, 60)
         except Exception:
             if ENVIRONMENT == "production":
-                from fastapi.responses import JSONResponse
                 return JSONResponse({"detail": "Rate-limit service unavailable"}, status_code=503)
             current = 0
     if not _redis_client or current == 0:
@@ -80,7 +79,6 @@ async def security_headers_and_rate_limit(request, call_next):
         current = len(window) + 1
         window.append(now)
     if current > limit:
-        from fastapi.responses import JSONResponse
         return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429,
                             headers={"Retry-After": "60"})
     started = time.perf_counter()
@@ -166,7 +164,6 @@ async def readiness(db: Session = Depends(get_db)):
 @app.get("/metrics", include_in_schema=False)
 def metrics(user: models.User = Depends(get_current_user)):
     """Prometheus metrics — requires a valid bearer token to prevent public exposure."""
-    from fastapi.responses import Response
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
@@ -388,18 +385,27 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
                 trade.limit_price, trade.stop_price, trade.time_in_force,
             )
             trade.alpaca_order_id = resp.get("id")
-            trade.status = "ACCEPTED"
-            if resp.get("status") == "filled":
-                trade.status = "FILLED"
-                trade.filled_price = float(resp.get("filled_avg_price") or 0) or None
+            trade.status = resp.get("status", "ACCEPTED").upper()
+            if trade.status == "FILLED":
+                # FIX: float(x or 0) or None is wrong — if filled_avg_price is "0"
+                # the result is None (discards a valid zero fill). Use explicit None check.
+                raw_price = resp.get("filled_avg_price")
+                trade.filled_price = float(raw_price) if raw_price else None
                 trade.filled_at = dt.datetime.now(dt.timezone.utc)
         except Exception as e:
             trade.status = "REJECTED"
             db.commit()
-            raise HTTPException(502, f"Alpaca order failed: {e}")
+            raise HTTPException(502, f"Alpaca order failed: {e}") from e
     else:
-        fill = trading_service.simulate_fill(trade.asset, trade.side, trade.quantity,
-                                              trade.order_type, trade.limit_price, trade.stop_price)
+        # Cast SQLAlchemy Numeric columns to float before passing to simulate_fill.
+        # Passing Decimal objects causes TypeError in comparison operators inside
+        # simulate_fill (e.g. last_price <= limit_price where limit_price is Decimal).
+        fill = trading_service.simulate_fill(
+            trade.asset, trade.side, float(trade.quantity),
+            trade.order_type,
+            float(trade.limit_price) if trade.limit_price is not None else None,
+            float(trade.stop_price) if trade.stop_price is not None else None,
+        )
         trade.status = fill["status"]
         if trade.status == "ACCEPTED" and trade.time_in_force == "ioc":
             trade.status = "EXPIRED"
@@ -655,16 +661,30 @@ def list_backtests(user: models.User = Depends(get_current_user), db: Session = 
 
 @app.get("/api/portfolio/export")
 def export_portfolio(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """CSV-friendly compliance export for positions, metrics and audit evidence."""
-    from fastapi.responses import Response
+    """CSV export for positions, metrics and audit evidence.
+
+    Values are quoted with double-quotes to prevent CSV injection from asset
+    names or float representations containing commas.
+    """
+    def _csv_row(*values) -> str:
+        return ",".join(f'"{str(v)}"' for v in values)
+
     positions_data = portfolio_service.get_positions_with_pnl(db, user.id)
     metrics = portfolio_service.risk_metrics(db, user.id)
-    rows = ["section,asset,quantity,avg_entry_price,current_price,market_value,unrealized_pnl"]
-    rows.extend("position,{asset},{quantity},{avg_entry_price},{current_price},{market_value},{unrealized_pnl}".format(**p)
-                for p in positions_data)
-    rows.extend(f"metric,{name},{value}" for name, value in metrics.items() if name != "equity_curve")
-    return Response("\n".join(rows) + "\n", media_type="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=quantumsentinel-portfolio.csv"})
+    rows = [_csv_row("section", "asset", "quantity", "avg_entry_price",
+                     "current_price", "market_value", "unrealized_pnl")]
+    for p in positions_data:
+        rows.append(_csv_row(
+            "position", p["asset"], p["quantity"], p["avg_entry_price"],
+            p["current_price"], p["market_value"], p["unrealized_pnl"],
+        ))
+    for name, value in metrics.items():
+        if name != "equity_curve":
+            rows.append(_csv_row("metric", name, value))
+    return Response(
+        "\n".join(rows) + "\n", media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=quantumsentinel-portfolio.csv"},
+    )
 
 
 # --------------------------------------------------------------------------
@@ -796,7 +816,6 @@ if FRONTEND_DIR.exists():
         robots_path = FRONTEND_DIR / "robots.txt"
         if robots_path.exists():
             return FileResponse(str(robots_path), media_type="text/plain")
-        from fastapi.responses import PlainTextResponse
         return PlainTextResponse("User-agent: *\nAllow: /\nDisallow: /api/\n")
 
     @app.get("/favicon.ico", include_in_schema=False)
@@ -804,8 +823,8 @@ if FRONTEND_DIR.exists():
         ico_path = FRONTEND_DIR / "favicon.ico"
         if ico_path.exists():
             return FileResponse(str(ico_path), media_type="image/x-icon")
-        from fastapi import HTTPException as _HTTPException
-        raise _HTTPException(404, "Not found")
+        # HTTPException is already imported at the top of the module
+        raise HTTPException(404, "Not found")
 
     @app.get("/{path:path}", include_in_schema=False)
     def spa_fallback(path: str):
@@ -814,6 +833,5 @@ if FRONTEND_DIR.exists():
         Excludes /api, /assets, /health, /metrics paths which are handled above."""
         excluded = ("api/", "assets/", "health/", "metrics")
         if any(path.startswith(prefix) for prefix in excluded):
-            from fastapi import HTTPException as _HTTPException
-            raise _HTTPException(404, "Not found")
+            raise HTTPException(404, "Not found")
         return FileResponse(str(FRONTEND_DIR / "index.html"))

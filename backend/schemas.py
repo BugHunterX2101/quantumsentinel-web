@@ -1,3 +1,4 @@
+from typing import Literal
 from pydantic import BaseModel, EmailStr, Field, field_validator
 import re
 
@@ -28,12 +29,12 @@ class HandshakeRequest(BaseModel):
 
 class OrderRequest(BaseModel):
     asset: str = Field(min_length=1, max_length=12)
-    side: str  # buy | sell
+    side: Literal["buy", "sell"]
     quantity: float = Field(gt=0, le=1_000_000)
-    order_type: str = "market"  # market | limit
+    order_type: Literal["market", "limit", "stop", "stop_limit"] = "market"
     limit_price: float | None = Field(default=None, gt=0)
     stop_price: float | None = Field(default=None, gt=0)
-    time_in_force: str = "day"
+    time_in_force: Literal["day", "gtc", "ioc"] = "day"
 
     @field_validator("asset")
     @classmethod

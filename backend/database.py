@@ -32,3 +32,6 @@ def init_db():
         if "stop_price" not in columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE trades ADD COLUMN stop_price NUMERIC"))
+        if "time_in_force" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE trades ADD COLUMN time_in_force VARCHAR DEFAULT 'day'"))

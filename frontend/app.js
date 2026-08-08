@@ -80,6 +80,7 @@ function api(path, opts = {}, opts2 = {}) {
 function handleTokenExpiry() {
   if (state.tokenExpireTimer) { clearTimeout(state.tokenExpireTimer); state.tokenExpireTimer = null; }
   if (state.signalSocket) { state.signalSocket.close(); state.signalSocket = null; }
+  setLiveIndicator('disconnected');
   localStorage.removeItem('qs_token');
   localStorage.removeItem('qs_user');
   localStorage.removeItem('qs_login_at');
@@ -131,18 +132,19 @@ document.addEventListener('click', (e) => {
   const canvas = document.getElementById('bg-canvas');
   const ctx = canvas.getContext('2d');
   let w, h, particles;
-  const COLORS = ['#4fd8ff', '#b892ff', '#3ddc97'];
+  // Light-theme particle palette: subtle slate + soft blue dots
+  const COLORS = ['#94a3b8', '#cbd5e1', '#3b82f6', '#8b5cf6', '#64748b'];
 
   function resize() {
     w = canvas.width = window.innerWidth;
     h = canvas.height = window.innerHeight;
   }
   function makeParticles() {
-    const count = Math.min(70, Math.floor((w * h) / 22000));
+    const count = Math.min(55, Math.floor((w * h) / 26000));
     particles = Array.from({ length: count }, () => ({
       x: Math.random() * w, y: Math.random() * h,
-      vx: (Math.random() - 0.5) * 0.25, vy: (Math.random() - 0.5) * 0.25,
-      r: Math.random() * 1.6 + 0.6, color: COLORS[Math.floor(Math.random() * COLORS.length)],
+      vx: (Math.random() - 0.5) * 0.18, vy: (Math.random() - 0.5) * 0.18,
+      r: Math.random() * 1.4 + 0.5, color: COLORS[Math.floor(Math.random() * COLORS.length)],
     }));
   }
   function step() {
@@ -157,9 +159,10 @@ document.addEventListener('click', (e) => {
         const a = particles[i], b = particles[j];
         const dx = a.x - b.x, dy = a.y - b.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < 120) {
-          ctx.strokeStyle = `rgba(79,216,255,${(1 - dist / 120) * 0.12})`;
-          ctx.lineWidth = 0.6;
+        if (dist < 100) {
+          // Very subtle slate connection lines
+          ctx.strokeStyle = `rgba(100,116,139,${(1 - dist / 100) * 0.08})`;
+          ctx.lineWidth = 0.5;
           ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
         }
       }
@@ -167,7 +170,7 @@ document.addEventListener('click', (e) => {
     for (const p of particles) {
       ctx.beginPath();
       ctx.fillStyle = p.color;
-      ctx.globalAlpha = 0.75;
+      ctx.globalAlpha = 0.45;
       ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
       ctx.fill();
       ctx.globalAlpha = 1;
@@ -381,44 +384,82 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
   btn.addEventListener('click', () => switchView(btn.dataset.view));
 });
 
+// ── Keyboard shortcuts 1-7 ──────────────────────────────────────
+const VIEW_KEYS = ['dashboard','trading','strategies','portfolio','security','integrations','community'];
+document.addEventListener('keydown', (e) => {
+  // Only when not typing in an input/textarea
+  if (e.target.matches('input,textarea,select')) return;
+  const idx = parseInt(e.key, 10) - 1;
+  if (idx >= 0 && idx < VIEW_KEYS.length) switchView(VIEW_KEYS[idx]);
+});
+
+// ── Confirmation modal helper ───────────────────────────────────
+function confirmAction(title, body) {
+  return new Promise((resolve) => {
+    const modal  = document.getElementById('confirm-modal');
+    const titleEl = document.getElementById('confirm-title');
+    const bodyEl  = document.getElementById('confirm-body');
+    const okBtn   = document.getElementById('confirm-ok');
+    const cancelBtn = document.getElementById('confirm-cancel');
+    titleEl.textContent = title;
+    bodyEl.textContent  = body;
+    modal.classList.remove('hidden');
+    const cleanup = (result) => {
+      modal.classList.add('hidden');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      resolve(result);
+    };
+    const onOk     = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    okBtn.addEventListener('click', onOk, { once: true });
+    cancelBtn.addEventListener('click', onCancel, { once: true });
+  });
+}
+
+const PAGE_TITLES = { dashboard:'Dashboard', trading:'Trading', strategies:'Strategies',
+  portfolio:'Portfolio', security:'Security', integrations:'Integrations', community:'Community' };
+
 function switchView(view) {
   state.activeView = view;
+  // Update tab active state
   document.querySelectorAll('.tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
+  // Update views with enter animation
   document.querySelectorAll('.view').forEach((v) => {
     const isTarget = v.id === 'view-' + view;
     v.classList.toggle('active', isTarget);
-    if (isTarget) {
-      v.classList.remove('entering');
-      requestAnimationFrame(() => v.classList.add('entering'));
-    }
+    if (isTarget) { v.classList.remove('entering'); requestAnimationFrame(() => v.classList.add('entering')); }
   });
+  // Breadcrumb
+  const titleEl = document.getElementById('page-title');
+  if (titleEl) titleEl.textContent = PAGE_TITLES[view] || view;
+  // URL hash (back-button support)
+  history.replaceState(null, '', '#' + view);
+  // Beginner banner
   const banners = {
-    dashboard: 'Beginner tip: green BUY badges and higher confidence bars mean the signal engine found stronger multi-asset agreement — it is not a guarantee.',
-    trading: 'Beginner tip: every order you submit here is cryptographically signed with ML-DSA-65 before it is sent, and settles as a paper (simulated) trade.',
-    portfolio: 'Beginner tip: Sharpe ratio > 1 is generally considered good risk-adjusted performance; max drawdown shows your worst peak-to-trough loss.',
-    strategies: 'Beginner tip: validate a strategy on historical data first. A positive backtest is not a prediction of future returns.',
-    security: 'Beginner tip: the Quantum Safety Score reflects how fresh your cryptographic keys are — green means fully rotated and compliant.',
+    dashboard: 'Tip: BUY signals with higher confidence bars indicate stronger multi-asset agreement. Use keys 1–7 to navigate.',
+    trading: 'Tip: every order is cryptographically signed with ML-DSA-65 before submission and settles as a paper (simulated) trade.',
+    portfolio: 'Tip: Sharpe ratio > 1 is generally considered good risk-adjusted performance. Max drawdown shows worst peak-to-trough loss.',
+    strategies: 'Tip: validate a strategy on historical data first. A positive backtest is not a prediction of future returns.',
+    security: 'Tip: the Quantum Safety Score reflects how fresh your cryptographic keys are — green means fully rotated and FIPS-compliant.',
   };
   const banner = document.getElementById('beginner-banner');
-  if (state.beginner && banners[view]) {
-    banner.textContent = banners[view];
-    banner.classList.remove('hidden');
-  } else {
-    banner.classList.add('hidden');
-  }
-  if (view === 'dashboard') loadDashboard();
-  if (view === 'trading') loadTrading();
-  if (view === 'strategies') loadStrategies();
-  if (view === 'portfolio') loadPortfolio();
-  if (view === 'security') loadSecurity();
+  if (state.beginner && banners[view]) { banner.textContent = banners[view]; banner.classList.remove('hidden'); }
+  else banner.classList.add('hidden');
+  if (view === 'dashboard')   loadDashboard();
+  if (view === 'trading')     loadTrading();
+  if (view === 'strategies')  loadStrategies();
+  if (view === 'portfolio')   loadPortfolio();
+  if (view === 'security')    loadSecurity();
   if (view === 'integrations') loadIntegrations();
-  if (view === 'community') loadCommunity();
+  if (view === 'community')   loadCommunity();
   restartPolling();
 }
 
 function restartPolling() {
   if (state.pollTimer) clearInterval(state.pollTimer);
-  const loaders = { dashboard: loadDashboard, trading: refreshOrders, strategies: loadStrategies, portfolio: loadPortfolio, security: loadSecurity, integrations: loadIntegrations, community: loadCommunity };
+  // community tab fetches from GitHub API — exclude from polling to avoid rate-limits
+  const loaders = { dashboard: loadDashboard, trading: refreshOrders, strategies: loadStrategies, portfolio: loadPortfolio, security: loadSecurity, integrations: loadIntegrations };
   const fn = loaders[state.activeView];
   if (!fn) return;
   state.pollTimer = setInterval(() => fn(true), 20000);
@@ -439,6 +480,7 @@ document.getElementById('beginner-toggle').addEventListener('click', () => {
 document.getElementById('logout-btn').addEventListener('click', () => {
   if (state.signalSocket) state.signalSocket.close();
   if (state.tokenExpireTimer) clearTimeout(state.tokenExpireTimer);
+  setLiveIndicator('disconnected');
   localStorage.removeItem('qs_token');
   localStorage.removeItem('qs_user');
   localStorage.removeItem('qs_login_at');
@@ -452,9 +494,28 @@ async function bootstrapApp() {
   const sel = document.getElementById('order-asset');
   sel.innerHTML = state.meta.tracked_assets.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join('');
   document.getElementById('strategy-asset').innerHTML = sel.innerHTML;
-  switchView('dashboard');
+  // Restore view from URL hash
+  const hashView = location.hash.replace('#', '');
+  switchView(VIEW_KEYS.includes(hashView) ? hashView : 'dashboard');
   connectSignalStream();
   startOnboardingIfNeeded();
+  // Wire live price preview on asset change
+  sel.addEventListener('change', updateOrderPricePreview);
+  updateOrderPricePreview();
+  // Wire order search
+  const searchEl = document.getElementById('order-search');
+  if (searchEl) searchEl.addEventListener('input', filterOrderList);
+}
+
+function setLiveIndicator(status) {
+  // status: 'connected' | 'reconnecting' | 'disconnected'
+  const dot = document.getElementById('live-indicator');
+  if (!dot) return;
+  dot.classList.remove('disconnected', 'reconnecting');
+  const titles = { connected: 'Live — WebSocket connected', reconnecting: 'Reconnecting…', disconnected: 'Disconnected — will retry' };
+  if (status === 'disconnected') dot.classList.add('disconnected');
+  if (status === 'reconnecting') dot.classList.add('reconnecting');
+  dot.title = titles[status] || '';
 }
 
 function connectSignalStream() {
@@ -462,7 +523,8 @@ function connectSignalStream() {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${scheme}//${location.host}/api/signals/stream`, ['qs', state.token]);
   state.signalSocket = socket;
-  socket.onopen = () => { state.signalReconnectMs = 1000; };
+  setLiveIndicator('reconnecting');
+  socket.onopen = () => { state.signalReconnectMs = 1000; setLiveIndicator('connected'); };
   socket.onmessage = (event) => {
     try {
       if (state.activeView === 'dashboard') loadDashboard(true, JSON.parse(event.data));
@@ -479,7 +541,12 @@ function connectSignalStream() {
     state.signalSocket = null;
     const delay = state.signalReconnectMs;
     state.signalReconnectMs = Math.min(30000, delay * 2);
-    if (state.token) setTimeout(connectSignalStream, delay);
+    if (state.token) {
+      setLiveIndicator('reconnecting');
+      setTimeout(connectSignalStream, delay);
+    } else {
+      setLiveIndicator('disconnected');
+    }
   };
 }
 
@@ -537,6 +604,21 @@ function skeletonGrid(container, count, cardClass) {
 // ===========================================================================
 // Dashboard
 // ===========================================================================
+// Live signal-age clock — updates every second without re-fetching data
+let _signalAgeTimer = null;
+function _startSignalAgeClock(generatedAt) {
+  if (_signalAgeTimer) clearInterval(_signalAgeTimer);
+  const ageEl = document.getElementById('signal-age-live');
+  if (!ageEl) return;
+  function update() {
+    const secs = Math.round((Date.now() / 1000) - generatedAt);
+    if (secs < 60) ageEl.textContent = `(${secs}s ago)`;
+    else ageEl.textContent = `(${Math.floor(secs / 60)}m ${secs % 60}s ago)`;
+  }
+  update();
+  _signalAgeTimer = setInterval(update, 1000);
+}
+
 async function loadDashboard(isPoll, streamedSignals = null) {
   const grid = document.getElementById('signal-grid');
   if (!isPoll && !grid.children.length) skeletonGrid(grid, 8, 'skeleton-card');
@@ -547,31 +629,42 @@ async function loadDashboard(isPoll, streamedSignals = null) {
   const signals = streamedSignals || await api('/api/signals/latest', {}, { silent: isPoll }).catch(() => null);
   if (!signals) return;
 
-  document.getElementById('signal-meta').textContent =
-    `Engine pipeline: ${signals.pipeline_ms} ms total (SBA bifurcation: ${signals.sba_ms} ms) · ` +
-    `${signals.n_assets} assets · generated ${new Date(signals.generated_at * 1000).toLocaleTimeString()}` +
-    (signals.error ? ` · ⚠ ${signals.error}` : '');
+  const genTime = new Date(signals.generated_at * 1000).toLocaleTimeString();
+  document.getElementById('signal-meta').innerHTML =
+    `Engine pipeline: ${signals.pipeline_ms} ms total (SBA bifurcation: ${signals.sba_ms} ms) &middot; ` +
+    `${signals.n_assets} assets &middot; generated ${escapeHtml(genTime)} <span class="signal-age" id="signal-age-live"></span>` +
+    (signals.error ? ` &middot; <span style="color:var(--red)">&#9888; ${escapeHtml(signals.error)}</span>` : '');
+  _startSignalAgeClock(signals.generated_at);
+  // Cache prices for the order form live preview
+  cacheSignalPrices(signals);
+  if (state.activeView === 'trading') updateOrderPricePreview();
 
   grid.innerHTML = signals.signals.map((s, i) => {
     const asset = escapeHtml(String(s.asset));
     const sigType = escapeHtml(String(s.signal_type));
-    // Optional-chain feature access: signal engine may return partial data
     const rsi = s.features?.rsi != null ? Number(s.features.rsi).toFixed(1) : 'N/A';
     const mom = s.features?.momentum != null ? (Number(s.features.momentum) * 100).toFixed(1) : 'N/A';
+    const macd = s.features?.macd != null ? Number(s.features.macd).toFixed(3) : 'N/A';
     const confPct = Math.round(Number(s.confidence) * 100);
+    const price = Number(s.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
     return `
-    <div class="signal-card" id="signal-${asset}" style="animation-delay:${i * 60}ms">
-      <div class="asset">${asset}</div>
-      <div class="price">$${Number(s.last_price).toFixed(2)}</div>
-      <span class="badge ${sigType}">${sigType}</span>
+    <div class="signal-card sig-${sigType}" id="signal-${asset}" style="animation-delay:${i * 55}ms">
+      <div class="sig-header">
+        <div>
+          <div class="asset">${asset}</div>
+          <div class="price">${price}</div>
+        </div>
+        <span class="badge ${sigType}">${sigType}</span>
+      </div>
       <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
+      <div class="confidence-label"><span>Confidence</span><span><b>${confPct}%</b></span></div>
       <div class="features-row">
         <span>RSI ${rsi}</span>
         <span>Mom ${mom}%</span>
-        <span>Conf ${confPct}%</span>
+        <span>MACD ${macd}</span>
       </div>
     </div>`;
-  }).join('') || '<div class="empty-state">No signals yet.</div>';
+  }).join('') || '<div class="empty-state">No signals yet — the engine is warming up.</div>';
 
   // animate confidence bars in on next frame + flash cards whose signal changed
   requestAnimationFrame(() => {
@@ -615,7 +708,45 @@ document.getElementById('refresh-signals').addEventListener('click', async (e) =
 // ===========================================================================
 // Trading
 // ===========================================================================
-function loadTrading() { refreshOrders(); }
+function loadTrading() { refreshOrders(); updateOrderPricePreview(); }
+
+// Live price preview — pulls from cached signal data
+function updateOrderPricePreview() {
+  const asset = document.getElementById('order-asset')?.value;
+  const preview = document.getElementById('order-price-preview');
+  const valEl = document.getElementById('order-price-val');
+  const labelEl = document.getElementById('order-price-label');
+  if (!preview || !valEl || !asset) return;
+  // Try to find the price in the last known signals
+  const sigData = state.lastSignalPrices || {};
+  if (sigData[asset]) {
+    const price = Number(sigData[asset]).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+    valEl.textContent = price;
+    labelEl.textContent = 'Last market price';
+    preview.classList.remove('hidden');
+  } else {
+    // Fetch from latest signals quietly
+    api('/api/signals/latest', {}, { silent: true }).then((signals) => {
+      if (!signals?.signals) return;
+      signals.signals.forEach((s) => {
+        if (!state.lastSignalPrices) state.lastSignalPrices = {};
+        state.lastSignalPrices[s.asset] = s.last_price;
+      });
+      const p = state.lastSignalPrices[asset];
+      if (p) {
+        valEl.textContent = Number(p).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+        labelEl.textContent = 'Last market price';
+        preview.classList.remove('hidden');
+      }
+    }).catch(() => {});
+  }
+}
+
+// Store prices when signals load
+function cacheSignalPrices(signals) {
+  if (!state.lastSignalPrices) state.lastSignalPrices = {};
+  (signals?.signals || []).forEach((s) => { state.lastSignalPrices[s.asset] = s.last_price; });
+}
 
 document.getElementById('order-type').addEventListener('change', (e) => {
   const type = e.target.value;
@@ -652,28 +783,68 @@ document.getElementById('order-form').addEventListener('submit', async (e) => {
   } catch (err) { errEl.textContent = err.message; } finally { setButtonLoading(btn, false); }
 });
 
+async function cancelOrder(orderId, btn) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    await api(`/api/trading/orders/${orderId}`, { method: 'DELETE' }, { silent: true });
+    await refreshOrders();
+    toast('Order cancelled', 'The pending order has been cancelled.', 'info');
+  } catch (err) {
+    toast('Cancel failed', err.message, 'error');
+    btn.disabled = false;
+    btn.textContent = 'Cancel';
+  }
+}
+
+// Raw order store for filtering
+let _allOrders = [];
+
 async function refreshOrders(isPoll) {
   const list = document.getElementById('order-list');
   if (!isPoll && !list.children.length) skeletonGrid(list, 4, 'skeleton-row');
   const orders = await api('/api/trading/orders', {}, { silent: isPoll });
+  _allOrders = orders;
+  renderOrderList(orders);
+}
+
+function filterOrderList() {
+  const q = (document.getElementById('order-search')?.value || '').toLowerCase().trim();
+  if (!q) { renderOrderList(_allOrders); return; }
+  renderOrderList(_allOrders.filter((o) =>
+    String(o.asset).toLowerCase().includes(q) ||
+    String(o.status).toLowerCase().includes(q) ||
+    String(o.side).toLowerCase().includes(q)
+  ));
+}
+
+function renderOrderList(orders) {
+  const list = document.getElementById('order-list');
+  const cancellable = new Set(['PENDING', 'ACCEPTED', 'SUBMITTED']);
   list.innerHTML = orders.map((o, i) => {
-    const side = escapeHtml(String(o.side || '')).toUpperCase();
-    const asset = escapeHtml(String(o.asset));
+    const side   = escapeHtml(String(o.side || '')).toUpperCase();
+    const asset  = escapeHtml(String(o.asset));
     const status = escapeHtml(String(o.status));
-    const priceDetail = o.order_type === 'limit'
-      ? ` @ $${Number(o.limit_price).toFixed(2)}`
-      : o.order_type === 'stop'
-      ? ` stop $${Number(o.stop_price).toFixed(2)}`
-      : o.order_type === 'stop_limit'
-      ? ` stop $${Number(o.stop_price).toFixed(2)} / limit $${Number(o.limit_price).toFixed(2)}`
-      : '';
-    const fillDetail = o.filled_price ? ` @ $${Number(o.filled_price).toFixed(2)}` : '';
+    const orderId = escapeHtml(String(o.order_id));
+    const qty    = Number(o.quantity);
+    const type   = escapeHtml(String(o.order_type || 'market'));
+    const fillPrice = o.filled_price ? Number(o.filled_price).toLocaleString('en-US',{style:'currency',currency:'USD'}) : '—';
+    const cancelBtn = cancellable.has(o.status)
+      ? `<button class="cancel-btn" data-order-id="${orderId}">✕</button>` : '';
     return `
-    <div class="order-row" style="animation-delay:${i * 45}ms">
-      <span>${side} ${Number(o.quantity)} ${asset}${priceDetail}</span>
-      <span class="status status-${status}">${status}${fillDetail}</span>
+    <div class="order-row" style="animation-delay:${i * 40}ms" data-order-id="${orderId}">
+      <span class="asset-col">${asset}</span>
+      <span class="side-col ${o.side?.toLowerCase()}">${side}</span>
+      <span class="qty-col">${qty}</span>
+      <span class="price-col">${fillPrice}</span>
+      <span class="status status-${status}">${status}</span>
+      ${cancelBtn}
     </div>`;
   }).join('') || '<div class="empty-state">No orders yet — place your first paper trade.</div>';
+
+  list.querySelectorAll('.cancel-btn').forEach((btn) => {
+    btn.addEventListener('click', () => cancelOrder(btn.dataset.orderId, btn));
+  });
 }
 
 // ===========================================================================
@@ -703,14 +874,35 @@ async function loadPortfolio(isPoll) {
   animateCounter(document.getElementById('m-var'), metrics.var_95 * 100, { decimals: 2, suffix: '%' });
   animateCounter(document.getElementById('m-var99'), metrics.var_99 * 100, { decimals: 2, suffix: '%' });
 
+  // Total portfolio value
+  const totalPnl = positions.reduce((sum, p) => sum + Number(p.unrealized_pnl), 0);
+  const totalEl = document.getElementById('portfolio-total');
+  if (totalEl) {
+    totalEl.textContent = totalPnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });
+    totalEl.style.color = totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
+  }
+  // Update topbar PnL chip
+  const pnlChip = document.getElementById('topbar-pnl');
+  if (pnlChip) {
+    pnlChip.textContent = totalPnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });
+    pnlChip.className = totalPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    pnlChip.classList.remove('hidden');
+  }
+
   const list = document.getElementById('positions-list');
   list.innerHTML = positions.map((p, i) => {
-    const asset = escapeHtml(String(p.asset));
-    const pnlClass = Number(p.unrealized_pnl) >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const asset   = escapeHtml(String(p.asset));
+    const qty     = Number(p.quantity);
+    const entry   = Number(p.avg_entry_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+    const pnl     = Number(p.unrealized_pnl);
+    const pnlFmt  = pnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });
+    const pnlClass = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
     return `
     <div class="pos-row" style="animation-delay:${i * 50}ms">
-      <span>${asset} &middot; ${Number(p.quantity)} sh @ $${Number(p.avg_entry_price).toFixed(2)}</span>
-      <span class="${pnlClass}">$${Number(p.unrealized_pnl).toFixed(2)}</span>
+      <span style="font-weight:600">${asset}</span>
+      <span>${qty} sh</span>
+      <span>${entry} avg</span>
+      <span class="${pnlClass}">${pnlFmt}</span>
     </div>`;
   }).join('') || '<div class="empty-state">No open positions.</div>';
 
@@ -739,12 +931,12 @@ function animateEquityCurve(curve) {
   if (equityAnimFrame) cancelAnimationFrame(equityAnimFrame);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!curve.length) {
-    ctx.fillStyle = '#8393ac'; ctx.font = '12px sans-serif';
+    ctx.fillStyle = '#7b8fb0'; ctx.font = '12px JetBrains Mono, monospace';
     ctx.fillText('No equity history yet — place a trade to begin tracking.', 20, 130);
     return;
   }
   const min = Math.min(...curve), max = Math.max(...curve);
-  const pad = 20;
+  const pad = 24;
   const w = canvas.width - pad * 2, h = canvas.height - pad * 2;
   const points = curve.map((v, i) => ({
     x: pad + (i / (curve.length - 1 || 1)) * w,
@@ -757,15 +949,41 @@ function animateEquityCurve(curve) {
     const t = Math.min(1, (now - start) / duration);
     const revealCount = Math.max(1, Math.floor(points.length * t));
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = '#4fd8ff'; ctx.lineWidth = 2.2; ctx.shadowColor = 'rgba(79,216,255,0.5)'; ctx.shadowBlur = 6;
+
+    const visible = points.slice(0, revealCount);
+    const last = visible[visible.length - 1];
+
+    // Gradient fill — ice-blue for the HFT dark theme
+    const gradient = ctx.createLinearGradient(0, pad, 0, pad + h);
+    gradient.addColorStop(0, 'rgba(79,172,222,0.20)');
+    gradient.addColorStop(1, 'rgba(79,172,222,0.0)');
     ctx.beginPath();
-    points.slice(0, revealCount).forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    visible.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    ctx.lineTo(last.x, pad + h);
+    ctx.lineTo(visible[0].x, pad + h);
+    ctx.closePath();
+    ctx.fillStyle = gradient;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    ctx.strokeStyle = '#4facde';
+    ctx.lineWidth = 1.8;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    visible.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
     ctx.stroke();
-    ctx.shadowBlur = 0;
-    if (revealCount > 0) {
-      const last = points[revealCount - 1];
-      ctx.beginPath(); ctx.fillStyle = '#4fd8ff'; ctx.arc(last.x, last.y, 3.5, 0, Math.PI * 2); ctx.fill();
-    }
+
+    // Endpoint dot
+    ctx.beginPath();
+    ctx.fillStyle = '#4facde';
+    ctx.arc(last.x, last.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.fillStyle = '#0f1825';
+    ctx.arc(last.x, last.y, 2, 0, Math.PI * 2);
+    ctx.fill();
+
     if (t < 1) equityAnimFrame = requestAnimationFrame(frame);
   }
   equityAnimFrame = requestAnimationFrame(frame);
@@ -780,12 +998,19 @@ async function loadSecurity(isPoll) {
 
   const health = await api('/api/security/health', {}, { silent: isPoll });
   animateScoreRing(health.quantum_safety_score);
+
+  // Security tab badge — count keys with status RED or YELLOW (aging)
+  const agingKeys = (health.keys || []).filter((k) => k.status === 'RED' || k.rotation_due_in_days < 15);
+  const badge = document.getElementById('security-badge');
+  if (badge) badge.textContent = agingKeys.length > 0 ? String(agingKeys.length) : '';
+
   keyEl.innerHTML = health.keys.map((k, i) => {
     const status = escapeHtml(String(k.status));
-    const algo = escapeHtml(String(k.algorithm));
+    const algo   = escapeHtml(String(k.algorithm));
+    const urgent = k.rotation_due_in_days < 15 ? ` <span style="color:var(--amber);font-size:10px;font-weight:700">[ROTATE SOON]</span>` : '';
     return `
     <div class="key-row" style="animation-delay:${i * 60}ms">
-      <span><span class="dot dot-${status}"></span>${algo} &middot; rotation #${Number(k.rotation_count)}</span>
+      <span><span class="dot dot-${status}"></span>${algo} &middot; rotation #${Number(k.rotation_count)}${urgent}</span>
       <span>${Number(k.age_days)}d old &middot; due in ${Number(k.rotation_due_in_days)}d</span>
     </div>`;
   }).join('') || '<div class="empty-state">No keys issued yet.</div>';
@@ -794,25 +1019,34 @@ async function loadSecurity(isPoll) {
 
   const logs = await api('/api/security/audit-log', {}, { silent: isPoll });
   document.getElementById('audit-log').innerHTML = logs.map((l, i) => {
-    const action = escapeHtml(String(l.action));
-    const resType = l.resource_type ? ' &middot; ' + escapeHtml(String(l.resource_type)) : '';
-    const verifiedLabel = l.verified ? '&#10003; ML-DSA verified' : '&mdash;';
-    // Date constructor is safe with an ISO string from the API
-    const createdAt = l.created_at ? new Date(l.created_at).toLocaleString() : '';
+    const action   = escapeHtml(String(l.action));
+    const resType  = l.resource_type ? ' &middot; ' + escapeHtml(String(l.resource_type)) : '';
+    const verified = l.verified
+      ? `<span class="verified-badge">✓ ML-DSA</span>`
+      : `<span style="color:var(--text-muted);font-size:10px">&mdash;</span>`;
+    const ts = l.created_at ? new Date(l.created_at).toLocaleString() : '';
     return `
     <div class="audit-row" style="animation-delay:${i * 30}ms">
-      <span>${action}${resType}</span>
-      <span>${verifiedLabel} &middot; ${createdAt}</span>
+      <div class="audit-meta"><span>${escapeHtml(String(l.user_email || ''))}</span><span>${ts}</span></div>
+      <div class="audit-action">${action}${resType}</div>
+      ${l.signature ? `<div class="audit-sig">${verified} ${escapeHtml(String(l.signature).slice(0,80))}…</div>` : ''}
     </div>`;
-  }).join('') || '<div class="empty-state">No audit entries yet.</div>';
+  }).join('') || '';
 }
 
 async function rotateKeys(algorithm, btn) {
+  const confirmed = await confirmAction(
+    `Rotate ${algorithm} Keys`,
+    `This will immediately invalidate your current ${algorithm} keys and generate a new key pair. All active sessions using the old keys will need to re-authenticate. This cannot be undone.`
+  );
+  if (!confirmed) return;
   setButtonLoading(btn, true, 'Rotating…');
   try {
     const res = await api('/api/security/rotate-keys', { method: 'POST', body: JSON.stringify({ algorithm, reason: 'manual_rotation' }) });
     await loadSecurity();
     toast('Key rotated', `${algorithm} · rotation #${res.rotation_count} · keygen ${res.keygen_ms} ms`, 'success');
+  } catch (err) {
+    toast('Rotation failed', err.message, 'error');
   } finally { setButtonLoading(btn, false); }
 }
 document.getElementById('rotate-dsa').addEventListener('click', (e) => rotateKeys('ML-DSA-65', e.currentTarget));

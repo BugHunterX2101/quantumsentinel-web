@@ -278,7 +278,7 @@ async def signal_stream(websocket: WebSocket):
             except Exception:
                 # Connection closed mid-send or serialisation error — exit cleanly
                 break
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)  # aligned with CACHE_TTL_SECONDS=60 to avoid duplicate stale pushes
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -827,7 +827,7 @@ if FRONTEND_DIR.exists():
         """SPA catch-all: any unknown route serves index.html so the frontend
         router handles navigation rather than returning a JSON 404.
         Excludes /api, /assets, /health, /metrics paths which are handled above."""
-        excluded = ("api/", "assets/", "health/", "metrics")
+        excluded = ("api/", "assets/", "health/", "health", "metrics")
         if any(path.startswith(prefix) for prefix in excluded):
             raise HTTPException(404, "Not found")
         return FileResponse(str(FRONTEND_DIR / "index.html"))

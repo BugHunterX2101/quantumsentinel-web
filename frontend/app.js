@@ -133,7 +133,8 @@ document.addEventListener('click', (e) => {
   const ctx = canvas.getContext('2d');
   let w, h, particles;
   // Light-theme particle palette: subtle slate + soft blue dots
-  const COLORS = ['#94a3b8', '#cbd5e1', '#3b82f6', '#8b5cf6', '#64748b'];
+  // Dark-navy palette — subtle depth layers matching the institutional HFT theme
+  const COLORS = ['#1e3050', '#2d72b8', '#162338', '#4a8fd1', '#0e1d35'];
 
   function resize() {
     w = canvas.width = window.innerWidth;
@@ -644,7 +645,7 @@ async function loadDashboard(isPoll, streamedSignals = null) {
     const sigType = escapeHtml(String(s.signal_type));
     const rsi = s.features?.rsi != null ? Number(s.features.rsi).toFixed(1) : 'N/A';
     const mom = s.features?.momentum != null ? (Number(s.features.momentum) * 100).toFixed(1) : 'N/A';
-    const macd = s.features?.macd != null ? Number(s.features.macd).toFixed(3) : 'N/A';
+    const macd = s.features?.macd_histogram != null ? Number(s.features.macd_histogram).toFixed(3) : 'N/A';
     const confPct = Math.round(Number(s.confidence) * 100);
     const price = Number(s.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
     return `
@@ -830,7 +831,7 @@ function renderOrderList(orders) {
     const type   = escapeHtml(String(o.order_type || 'market'));
     const fillPrice = o.filled_price ? Number(o.filled_price).toLocaleString('en-US',{style:'currency',currency:'USD'}) : '—';
     const cancelBtn = cancellable.has(o.status)
-      ? `<button class="cancel-btn" data-order-id="${orderId}">✕</button>` : '';
+      ? `<button class="cancel-btn ripple-btn" data-order-id="${orderId}">Cancel</button>` : '';
     return `
     <div class="order-row" style="animation-delay:${i * 40}ms" data-order-id="${orderId}">
       <span class="asset-col">${asset}</span>
@@ -854,10 +855,15 @@ async function loadPortfolio(isPoll) {
   const metricsEl = document.getElementById('risk-metrics');
   if (!isPoll && !metricsEl.children.length) skeletonGrid(metricsEl, 5, 'skeleton-card');
 
-  const [positions, metrics] = await Promise.all([
+  // Use allSettled so one failing endpoint doesn't crash the entire portfolio view.
+  const [posResult, metResult] = await Promise.allSettled([
     api('/api/portfolio/positions', {}, { silent: isPoll }),
     api('/api/portfolio/risk-metrics', {}, { silent: isPoll }),
   ]);
+  const positions = posResult.status === 'fulfilled' ? posResult.value : [];
+  const metrics   = metResult.status === 'fulfilled' ? metResult.value :
+    { sharpe_ratio: 0, max_drawdown: 0, win_rate: 0, total_trades: 0, var_95: 0, var_99: 0, equity_curve: [] };
+  if (posResult.status === 'rejected' && !isPoll) toast('Portfolio unavailable', 'Could not load positions — try again.', 'error', 4000);
 
   metricsEl.innerHTML = `
     <div class="metric-box"><div class="val" id="m-sharpe" data-raw-value="0">0</div><div class="lbl">Sharpe Ratio</div></div>
@@ -875,7 +881,8 @@ async function loadPortfolio(isPoll) {
   animateCounter(document.getElementById('m-var99'), metrics.var_99 * 100, { decimals: 2, suffix: '%' });
 
   // Total portfolio value
-  const totalPnl = positions.reduce((sum, p) => sum + Number(p.unrealized_pnl), 0);
+  // Include realized_pnl so sold gains are not erased from the display total.
+  const totalPnl = positions.reduce((sum, p) => sum + Number(p.unrealized_pnl) + Number(p.realized_pnl || 0), 0);
   const totalEl = document.getElementById('portfolio-total');
   if (totalEl) {
     totalEl.textContent = totalPnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });

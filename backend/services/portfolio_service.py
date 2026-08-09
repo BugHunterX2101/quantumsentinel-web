@@ -28,8 +28,11 @@ def recompute_positions(db: Session, user_id: str) -> None:
             b["qty"] += qty
         else:
             avg_cost = (b["cost"] / b["qty"]) if b["qty"] else 0.0
-            b["realized"] += (price - avg_cost) * min(qty, b["qty"])
-            b["qty"] -= qty
+            # Clamp sell qty to available holding — prevents negative book on any
+            # stale or concurrent fill that bypassed the HTTP-layer oversell guard.
+            sell_qty = min(qty, b["qty"])
+            b["realized"] += (price - avg_cost) * sell_qty
+            b["qty"] -= sell_qty
             b["cost"] = avg_cost * max(0.0, b["qty"])
 
     # Replace existing position rows — SQLAlchemy 2.0 execute style

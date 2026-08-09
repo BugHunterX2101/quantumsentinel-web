@@ -714,9 +714,16 @@ def audit_log(limit: int = 50, user: models.User = Depends(get_current_user), db
         select(models.AuditLog).where(models.AuditLog.user_id == user.id)
         .order_by(models.AuditLog.created_at.desc()).limit(limit)
     ).scalars().all()
+    def _user_email(user_id: str | None) -> str | None:
+        if not user_id:
+            return None
+        u = db.get(models.User, user_id)
+        return u.email if u else None
+
     return [{
         "id": l.id, "action": l.action, "resource_type": l.resource_type,
         "resource_id": l.resource_id, "metadata": l.metadata_json,
+        "user_email": _user_email(l.user_id),
         "signature_preview": (l.pqc_signature or "")[:24] + "...",
         "verified": security_service.verify_audit_log(db, l.id),
         "created_at": l.created_at.isoformat(),

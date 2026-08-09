@@ -128,7 +128,7 @@ def key_health(db: Session, user_id: str) -> dict:
         status = "GREEN"
         if due_in <= 0:
             status = "RED"
-        elif due_in <= 7:
+        elif due_in <= 14:  # aligned with frontend badge threshold (< 15 days)
             status = "YELLOW"
         if status == "RED":
             threat_level = "RED"

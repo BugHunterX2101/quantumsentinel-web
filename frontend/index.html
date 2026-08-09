@@ -3,15 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#050a12">
 <meta name="description" content="QuantumSentinel — The world's first open-source, post-quantum secure trading terminal. FIPS 203/204 compliant ML-KEM-768 and ML-DSA-65 cryptography with real market signals.">
 <meta property="og:title" content="QuantumSentinel — Post-Quantum Trading Terminal">
 <meta property="og:description" content="Trade with quantum-safe cryptography. ML-KEM-768 + ML-DSA-65 FIPS compliant session security.">
 <meta property="og:type" content="website">
 <title>QuantumSentinel — Post-Quantum Trading Terminal</title>
-<!-- Preconnect for fast font load -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="icon" href="/favicon.ico" type="image/x-icon">
 <link rel="stylesheet" href="/assets/styles.css">
 </head>
@@ -36,24 +37,27 @@
 <!-- ── Auth screen ── -->
 <div id="auth-screen" class="auth-screen">
   <div class="auth-brand-panel">
-    <div class="brand-logo">◈</div>
-    <h1>QuantumSentinel</h1>
-    <p class="auth-tagline">The world's first post-quantum secure trading terminal. Every session is protected by FIPS 203/204 hybrid cryptography — quantum-safe by default.</p>
-    <div class="auth-brand-pill">
-      <span>ML-KEM-768</span>
-      <span>ML-DSA-65</span>
-      <span>X25519 Hybrid</span>
-    </div>
+    <div class="brand-logo">QuantumSentinel</div>
+    <h1>Post-Quantum<br>Trading Terminal</h1>
+    <p class="auth-tagline">The world's first open-source trading terminal protected by post-quantum cryptography. Every session begins with a FIPS 203 / FIPS 204 hybrid handshake — quantum-safe by default, always.</p>
+    <ul class="auth-spec-list">
+      <li class="auth-spec-item"><strong>ML-KEM-768</strong> &nbsp;FIPS 203 key encapsulation</li>
+      <li class="auth-spec-item"><strong>ML-DSA-65</strong> &nbsp;&nbsp;FIPS 204 signed audit trail</li>
+      <li class="auth-spec-item"><strong>X25519 Hybrid</strong> &nbsp;Classical + post-quantum mix</li>
+      <li class="auth-spec-item"><strong>Real Market Data</strong> &nbsp;Live Yahoo Finance prices</li>
+      <li class="auth-spec-item"><strong>SBA Signals</strong> &nbsp;Quantum-inspired optimizer</li>
+    </ul>
     <div class="auth-brand-pill">
       <span>FIPS 203</span>
       <span>FIPS 204</span>
-      <span>Real Market Data</span>
+      <span>X25519 Hybrid</span>
+      <span>Open Source</span>
     </div>
   </div>
   <div class="auth-form-panel">
     <div class="auth-card fade-in-up">
       <div class="brand">
-        <span class="brand-mark">◈</span>
+        <span class="brand-mark"></span>
         <h1>QuantumSentinel</h1>
       </div>
       <p class="tagline" id="tagline"></p>
@@ -95,7 +99,7 @@
 <!-- ── Main application ── -->
 <div id="app" class="app hidden">
   <header class="topbar">
-    <div class="brand-small"><span class="brand-mark">◈</span> QuantumSentinel</div>
+    <div class="brand-small"><span class="brand-mark"></span> QuantumSentinel</div>
     <span id="page-title">Dashboard</span>
     <nav class="tabs">
       <button class="tab-btn active" data-view="dashboard">Dashboard</button>

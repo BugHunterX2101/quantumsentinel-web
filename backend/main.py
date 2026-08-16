@@ -14,7 +14,7 @@ import hashlib
 from collections import defaultdict, deque
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -173,7 +173,7 @@ def metrics(user: models.User = Depends(get_current_user)):
 # Auth endpoints
 # --------------------------------------------------------------------------
 @app.post("/api/auth/register")
-def register(req: schemas.RegisterRequest, db: Session = Depends(get_db)):
+def register(req: schemas.RegisterRequest, request: Request, db: Session = Depends(get_db)):
     existing = db.execute(select(models.User).where(models.User.email == req.email)).scalar_one_or_none()
     if existing:
         raise HTTPException(409, "Email already registered")
@@ -183,9 +183,7 @@ def register(req: schemas.RegisterRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    # Generate the user's PQC identity keys (demo: server-side; a real
-    # mobile client would generate these on-device and only upload the
-    # public keys).
+    # Generate the user's PQC identity keys
     kem_pk, kem_sk, kem_ms = pqc.kem_keygen()
     dsa_pk, dsa_sk, dsa_ms = pqc.dsa_keygen()
     db.add(models.KeyPair(user_id=user.id, algorithm="ML-KEM-768",
@@ -197,25 +195,70 @@ def register(req: schemas.RegisterRequest, db: Session = Depends(get_db)):
     security_service.write_audit_log(db, user.id, "USER_REGISTERED", "user", user.id,
                                       {"email": user.email})
 
+    # HIBP k-anonymity breach check (non-blocking warning only)
+    hibp_count = auth_service.check_hibp(req.password)
+    breach_warning = None
+    if hibp_count > 0:
+        breach_warning = (
+            f"Your password has appeared {hibp_count:,} time(s) in known data breaches "
+            "(HaveIBeenPwned). We strongly recommend choosing a different password before "
+            "your first login."
+        )
+
     return {
         "user_id": user.id, "email": user.email, "tier": user.tier,
         "created_at": user.created_at.isoformat(),
         "keygen_ms": {"ml_kem_768": round(kem_ms, 3), "ml_dsa_65": round(dsa_ms, 3)},
+        "breach_warning": breach_warning,
     }
 
 
 @app.post("/api/auth/login")
-def login(req: schemas.LoginRequest, db: Session = Depends(get_db)):
+def login(req: schemas.LoginRequest, request: Request, db: Session = Depends(get_db)):
+    client_ip = request.client.host if request.client else None
+
+    # Rate limit check — must happen BEFORE password verification
+    is_locked, retry_after = auth_service.check_rate_limit(req.email, client_ip)
+    if is_locked:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     user = db.execute(select(models.User).where(models.User.email == req.email)).scalar_one_or_none()
-    if not user or not auth_service.verify_password(req.password, user.password_hash):
+
+    # Constant-time: always call verify_password even if user not found
+    dummy_hash = "$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    stored = user.password_hash if user else dummy_hash
+    is_valid, needs_rehash = auth_service.verify_password(req.password, stored)
+
+    if not user or not is_valid:
+        lockout = auth_service.record_failed_attempt(req.email, client_ip)
+        if lockout:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Account temporarily locked after repeated failures. Try again in {lockout} seconds.",
+                headers={"Retry-After": str(lockout)},
+            )
         raise HTTPException(401, "Invalid credentials")
+
+    # Successful login — clear failure counter
+    auth_service.clear_failed_attempts(req.email, client_ip)
+
+    # Transparent hash upgrade: PBKDF2 → Argon2id
+    if needs_rehash:
+        user.password_hash = auth_service.hash_password(req.password)
+        db.commit()
+
     token = auth_service.create_access_token(user.id, user.tier)
-    security_service.write_audit_log(db, user.id, "USER_LOGIN", "user", user.id, {})
+    security_service.write_audit_log(db, user.id, "USER_LOGIN", "user", user.id,
+                                      {"ip": client_ip, "hash_upgraded": needs_rehash})
     return {
         "access_token": token, "token_type": "bearer",
         "expires_in": JWT_EXPIRE_SECONDS,
         "user": {"user_id": user.id, "email": user.email, "tier": user.tier,
-                 "beginner_mode": user.beginner_mode},
+                 "beginner_mode": user.beginner_mode}
     }
 
 
@@ -228,6 +271,8 @@ def pqc_handshake(req: schemas.HandshakeRequest, user: models.User = Depends(get
     security_service.write_audit_log(db, user.id, "PQC_HANDSHAKE", "session",
                                       result["session_id"], {"kem_ms": result["kem_encapsulate_ms"]})
     return result
+
+
 
 
 # --------------------------------------------------------------------------

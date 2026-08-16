@@ -73,11 +73,33 @@
           <div class="auth-error" id="login-error"></div>
         </form>
         <form id="register-form" class="auth-form hidden">
-          <label>Email<input type="email" id="register-email" required placeholder="trader@example.com" autocomplete="email"></label>
-          <label>Password<input type="password" id="register-password" required minlength="12" placeholder="12+ characters, upper/lower &amp; number" autocomplete="new-password"></label>
-          <button type="submit" class="btn-primary ripple-btn"><span class="btn-label">Create Quantum-Safe Account</span></button>
+          <label>Email<input type="email" id="register-email" required placeholder="your@company.com" autocomplete="email"></label>
+          <label>Password
+            <input type="password" id="register-password" required minlength="14" maxlength="128"
+                   placeholder="14+ chars, upper/lower/digit/symbol" autocomplete="new-password">
+          </label>
+          <!-- Password strength meter -->
+          <div class="pw-strength-wrap">
+            <div class="pw-strength-bar"><div class="pw-strength-fill" id="pw-strength-fill"></div></div>
+            <span class="pw-strength-label" id="pw-strength-label"></span>
+          </div>
+          <!-- Requirements checklist -->
+          <ul class="pw-req-list" id="pw-req-list">
+            <li class="pw-req" id="req-len"  data-rule="len">14+ characters</li>
+            <li class="pw-req" id="req-upper" data-rule="upper">Uppercase letter (A-Z)</li>
+            <li class="pw-req" id="req-lower" data-rule="lower">Lowercase letter (a-z)</li>
+            <li class="pw-req" id="req-digit" data-rule="digit">Number (0-9)</li>
+            <li class="pw-req" id="req-sym"   data-rule="sym">Special character (!@#$%^&amp;*…)</li>
+            <li class="pw-req" id="req-rep"   data-rule="rep">No 4+ repeating chars (aaaa…)</li>
+          </ul>
+          <!-- HIBP breach warning (filled by JS after register) -->
+          <div class="auth-breach-warning hidden" id="register-breach-warning"></div>
+          <button type="submit" class="btn-primary ripple-btn" id="register-submit" disabled>
+            <span class="btn-label">Create Quantum-Safe Account</span>
+          </button>
           <div class="auth-error" id="register-error"></div>
         </form>
+
       </div>
       <div class="auth-footnote">
         Every session begins with a hybrid <b>X25519 + ML-KEM-768</b> handshake and

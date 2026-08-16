@@ -228,20 +228,66 @@ function animateScoreRing(score) {
 // ===========================================================================
 // Auth screen wiring
 // ===========================================================================
-document.querySelectorAll('.auth-tab').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.auth-tab').forEach((b) => b.classList.remove('active'));
-    btn.classList.add('active');
-    const showLogin = btn.dataset.tab === 'login';
-    const loginForm = document.getElementById('login-form');
-    const registerForm = document.getElementById('register-form');
-    (showLogin ? registerForm : loginForm).classList.add('hidden');
-    const target = showLogin ? loginForm : registerForm;
-    target.classList.remove('hidden');
-    target.style.animation = 'none';
-    requestAnimationFrame(() => { target.style.animation = ''; });
   });
 });
+
+// ===========================================================================
+// Password strength meter (register form)
+// ===========================================================================
+(function initPasswordStrength() {
+  const input   = document.getElementById('register-password');
+  const wrap    = document.querySelector('.pw-strength-wrap');
+  const label   = document.getElementById('pw-strength-label');
+  const fill    = document.getElementById('pw-strength-fill');
+  const submitBtn = document.getElementById('register-submit');
+  if (!input || !wrap) return;
+
+  const RULES = [
+    { id: 'req-len',   test: v => v.length >= 14 },
+    { id: 'req-upper', test: v => /[A-Z]/.test(v) },
+    { id: 'req-lower', test: v => /[a-z]/.test(v) },
+    { id: 'req-digit', test: v => /\d/.test(v) },
+    { id: 'req-sym',   test: v => /[!@#$%^&*()\-_=+\[\]{};:'",.<>?/\\|`~]/.test(v) },
+    { id: 'req-rep',   test: v => !/(.)\1{3,}/.test(v) },
+  ];
+
+  const LEVELS = [
+    { cls: '',   text: '' },
+    { cls: 's1', text: 'WEAK' },
+    { cls: 's2', text: 'FAIR' },
+    { cls: 's3', text: 'STRONG' },
+    { cls: 's4', text: 'VERY STRONG' },
+  ];
+
+  input.addEventListener('input', () => {
+    const v = input.value;
+    let passed = 0;
+    RULES.forEach(rule => {
+      const el = document.getElementById(rule.id);
+      const ok = rule.test(v);
+      if (ok) { passed++; el.className = 'pw-req met'; }
+      else         { el.className = v.length > 0 ? 'pw-req fail' : 'pw-req'; }
+    });
+
+    // Map 0-6 passed rules → 4 strength levels
+    let level = 0;
+    if (v.length > 0) {
+      if (passed <= 2) level = 1;
+      else if (passed <= 4) level = 2;
+      else if (passed === 5) level = 3;
+      else level = 4;
+    }
+
+    // Update bar class
+    wrap.classList.remove('s1', 's2', 's3', 's4');
+    if (level > 0) wrap.classList.add(LEVELS[level].cls);
+    label.textContent = LEVELS[level].text;
+
+    // Gate submit button — all 6 rules must pass
+    submitBtn.disabled = (passed < RULES.length);
+  });
+}());
+
 
 function setButtonLoading(btn, loading, loadingText) {
   const labelEl = btn.querySelector('.btn-label');
@@ -272,18 +318,29 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
 document.getElementById('register-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const email = document.getElementById('register-email').value;
+  const email    = document.getElementById('register-email').value;
   const password = document.getElementById('register-password').value;
-  const errEl = document.getElementById('register-error');
-  const btn = e.target.querySelector('button[type=submit]');
+  const errEl    = document.getElementById('register-error');
+  const btn      = document.getElementById('register-submit');
+  const breachEl = document.getElementById('register-breach-warning');
   errEl.textContent = '';
-  setButtonLoading(btn, true, 'Generating ML-KEM-768/ML-DSA-65 keys…');
+  breachEl.classList.add('hidden');
+  breachEl.textContent = '';
+  setButtonLoading(btn, true, 'Generating ML-KEM-768 / ML-DSA-65 keys…');
   try {
-    await api('/api/auth/register', { method: 'POST', body: JSON.stringify({ email, password }) }, { silent: true });
-    const data = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }, { silent: true });
-    await afterLogin(data);
+    const regData = await api('/api/auth/register', { method: 'POST', body: JSON.stringify({ email, password }) }, { silent: true });
+    // Show HIBP breach warning if server flagged it
+    if (regData && regData.breach_warning) {
+      breachEl.textContent = regData.breach_warning;
+      breachEl.classList.remove('hidden');
+      // Give user 4 seconds to read the warning before proceeding
+      await new Promise(r => setTimeout(r, 4000));
+    }
+    const loginData = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }, { silent: true });
+    await afterLogin(loginData);
   } catch (err) { errEl.textContent = err.message; } finally { setButtonLoading(btn, false); }
 });
+
 
 async function afterLogin(data) {
   state.token = data.access_token;

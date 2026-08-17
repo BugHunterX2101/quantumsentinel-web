@@ -71,8 +71,9 @@ function toast(title, body, type = 'info', duration = 3800) {
 function api(path, opts = {}, opts2 = {}) {
   const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
   if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
-  // ETag optimization: send If-None-Match for GET signal requests
-  if (!opts.method && path.startsWith('/api/signals/') && state._lastEtag) {
+  // ETag optimization: send If-None-Match only on GET signal requests (never on POST/refresh)
+  const isGet = !opts.method || opts.method.toUpperCase() === 'GET';
+  if (isGet && path === '/api/signals/latest' && state._lastEtag) {
     headers['If-None-Match'] = state._lastEtag;
   }
   loadingBar.start();
@@ -143,61 +144,9 @@ document.addEventListener('click', (e) => {
   setTimeout(() => ripple.remove(), 650);
 });
 
-// ===========================================================================
-// Animated quantum-particle background (canvas)
-// ===========================================================================
-(function initParticles() {
-  const canvas = document.getElementById('bg-canvas');
-  const ctx = canvas.getContext('2d');
-  let w, h, particles;
-  // Light-theme particle palette: subtle slate + soft blue dots on white canvas
-  const COLORS = ['#D8DCE6', '#B0B8CC', '#1842A8', '#E5E8EF', '#3D4A5C'];
-
-  function resize() {
-    w = canvas.width = window.innerWidth;
-    h = canvas.height = window.innerHeight;
-  }
-  function makeParticles() {
-    const count = Math.min(55, Math.floor((w * h) / 26000));
-    particles = Array.from({ length: count }, () => ({
-      x: Math.random() * w, y: Math.random() * h,
-      vx: (Math.random() - 0.5) * 0.18, vy: (Math.random() - 0.5) * 0.18,
-      r: Math.random() * 1.4 + 0.5, color: COLORS[Math.floor(Math.random() * COLORS.length)],
-    }));
-  }
-  function step() {
-    ctx.clearRect(0, 0, w, h);
-    for (const p of particles) {
-      p.x += p.vx; p.y += p.vy;
-      if (p.x < 0 || p.x > w) p.vx *= -1;
-      if (p.y < 0 || p.y > h) p.vy *= -1;
-    }
-    for (let i = 0; i < particles.length; i++) {
-      for (let j = i + 1; j < particles.length; j++) {
-        const a = particles[i], b = particles[j];
-        const dx = a.x - b.x, dy = a.y - b.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < 100) {
-          // Very subtle slate connection lines
-          ctx.strokeStyle = `rgba(100,116,139,${(1 - dist / 100) * 0.08})`;
-          ctx.lineWidth = 0.5;
-          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-        }
-      }
-    }
-    for (const p of particles) {
-      ctx.beginPath();
-      ctx.fillStyle = p.color;
-      ctx.globalAlpha = 0.45;
-      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-    requestAnimationFrame(step);
-  }
-  window.addEventListener('resize', () => { resize(); makeParticles(); });
-  resize(); makeParticles(); step();
-})();
+// 2D canvas particle system removed — replaced by Three.js QS3D engine (bg3d.js).
+// The QS3D engine renders to #auth-bg-canvas and #app-bg-canvas,
+// initialised from the window 'load' handler below.
 
 // ===========================================================================
 // Typewriter tagline on auth screen
@@ -582,24 +531,34 @@ document.getElementById('logout-btn').addEventListener('click', () => {
   location.reload();
 });
 
-// Asset categories for grouped dropdown
+// Asset categories for grouped dropdown.
+// IMPORTANT: keep in sync with signal_engine.TRACKED_ASSETS — stale tickers
+// produce empty optgroups in the watchlist modal.
 const ASSET_GROUPS = [
-  { label: 'Technology', prefix: ['AAPL','MSFT','NVDA','GOOGL','GOOG','META','TSLA','AVGO','ORCL','ADBE','CRM','INTC','AMD','QCOM','TXN','MU','AMAT','KLAC','LRCX','SNPS','CDNS','MRVL','PANW','CRWD','ZS','NET','FTNT','OKTA','DDOG','SNOW','PLTR','UBER','LYFT','ABNB','BKNG','EXPE','SHOP','SQ','PYPL','AFRM'] },
+  { label: 'Technology', prefix: ['AAPL','MSFT','NVDA','GOOGL','GOOG','META','TSLA','AVGO','ORCL','ADBE','CRM','INTC','AMD','QCOM','TXN','MU','AMAT','KLAC','LRCX','SNPS','CDNS','MRVL','PANW','CRWD','ZS','NET','FTNT','OKTA','DDOG','SNOW','PLTR','UBER','LYFT','ABNB','BKNG','EXPE','SHOP','PYPL','AFRM'] },
   { label: 'Communication & Media', prefix: ['NFLX','DIS','CMCSA','T','VZ','TMUS','CHTR','WBD','PARA','FOXA'] },
-  { label: 'Consumer Discretionary', prefix: ['AMZN','TSCO','HD','LOW','TGT','WMT','COST','SBUX','MCD','YUM','NKE','LULU','DECK','TPR','RL','PVH','HBI','VFC','GPS','ANF'] },
-  { label: 'Consumer Staples', prefix: ['PG','KO','PEP','PM','MO','MDLZ','GIS','K','CPB','CAG'] },
-  { label: 'Financials', prefix: ['JPM','BAC','WFC','GS','MS','C','BLK','SCHW','AXP','V','MA','COF','DFS','SYF','USB','PNC','TFC','FRC','KEY'] },
+  { label: 'Consumer Discretionary', prefix: ['AMZN','HD','LOW','TGT','WMT','COST','SBUX','MCD','YUM','NKE','LULU','DECK','TPR','RL','PVH','ANF'] },
+  { label: 'Consumer Staples', prefix: ['PG','KO','PEP','PM','MO','MDLZ','GIS','KHC','CPB','CAG'] },
+  { label: 'Financials', prefix: ['JPM','BAC','WFC','GS','MS','C','BLK','SCHW','AXP','V','MA','COF','ALLY','SYF','USB','PNC','TFC','RF','KEY'] },
   { label: 'Healthcare & Pharma', prefix: ['JNJ','UNH','LLY','PFE','ABBV','MRK','TMO','ABT','DHR','BMY','AMGN','GILD','BIIB','REGN','VRTX','MRNA','BNTX','IQV','SYK','EW'] },
-  { label: 'Energy', prefix: ['XOM','CVX','COP','SLB','EOG','PXD','MPC','PSX','VLO','HAL'] },
-  { label: 'Industrials', prefix: ['BA','CAT','GE','HON','LMT','RTX','NOC','GD','MMM','UPS','FDX','DE','EMR','ETN','PH','ROK','IR','XYL','CARR','OTIS'] },
-  { label: 'Materials', prefix: ['LIN','APD','SHW','FCX','NEM','AA','ALB','MP','VALE','RIO'] },
+  { label: 'Energy', prefix: ['XOM','CVX','COP','SLB','EOG','DVN','MPC','PSX','VLO','HAL'] },
+  { label: 'Industrials', prefix: ['BA','CAT','GE','HON','LMT','RTX','NOC','GD','MMM','UPS','FDX','DE','EMR','ETN','PH','ROK','IR','CARR','OTIS'] },
+  { label: 'Materials', prefix: ['LIN','APD','SHW','FCX','NEM','AA','ALB','MP','VALE'] },
   { label: 'Real Estate (REITs)', prefix: ['AMT','PLD','CCI','EQIX','PSA','SPG','O','VICI','AVB','EQR'] },
   { label: 'Utilities', prefix: ['NEE','DUK','SO','D','AEP','XEL','PCG','EXC','ED','FE'] },
   { label: 'ETFs — Broad Market', prefix: ['SPY','QQQ','IWM','DIA','VTI','VOO','VEA','VWO','EFA','EEM'] },
   { label: 'ETFs — Sector', prefix: ['XLK','XLF','XLV','XLE','XLI','XLY','XLP','XLB','XLRE','XLU'] },
   { label: 'ETFs — Fixed Income & Commodities', prefix: ['GLD','SLV','USO','TLT','IEF','HYG','LQD','BND','AGG','TIPS'] },
-  { label: 'International ADRs', prefix: ['TSM','ASML','SAP','NVO','BABA','JD','PDD','BIDU','SE','GRAB','SONY','TM','HMC','NTT'] },
-  { label: 'Crypto & Bitcoin-Adjacent', prefix: ['COIN','MSTR','MARA','RIOT','CLSK','HUT','BTBT','CIFR','CORZ','WULF'] },
+  { label: 'International ADRs', prefix: ['TSM','ASML','SAP','NVO','BABA','JD','PDD','BIDU','SE','GRAB','SONY','TM','HMC','NTDOY','LI','NIO'] },
+  { label: 'Crypto-Equity Proxies', prefix: ['COIN','MSTR','MARA','RIOT','CLSK','HUT','WULF'] },
+  { label: 'Indian Equities (NSE)', prefix: ['RELIANCE.NS','TCS.NS','INFY.NS','HDFCBANK.NS','HINDUNILVR.NS','ICICIBANK.NS','BHARTIARTL.NS','ITC.NS','KOTAKBANK.NS','LT.NS','WIPRO.NS','BAJFINANCE.NS','HCLTECH.NS','SBIN.NS','AXISBANK.NS','MARUTI.NS','SUNPHARMA.NS','TATAMOTORS.NS','ONGC.NS','NTPC.NS'] },
+  { label: 'UK Equities (LSE)', prefix: ['HSBA.L','BP.L','SHEL.L','AZN.L','GSK.L','RIO.L','VOD.L','ULVR.L','LLOY.L','BARC.L'] },
+  { label: 'German Equities (Xetra)', prefix: ['SAP.DE','SIE.DE','BAYER.DE','ALV.DE','BMW.DE','MBG.DE','VOW3.DE','MUV2.DE','BAS.DE','ADS.DE'] },
+  { label: 'Japanese Equities (TSE)', prefix: ['7203.T','6758.T','9984.T','8306.T','6861.T','7974.T','4063.T','8035.T','4502.T','9432.T'] },
+  { label: 'Hong Kong Equities (HKEX)', prefix: ['9988.HK','0700.HK','9999.HK','1810.HK','3690.HK','2318.HK','0941.HK','1299.HK','0005.HK','0939.HK'] },
+  { label: 'Australian Equities (ASX)', prefix: ['CBA.AX','BHP.AX','NAB.AX','WBC.AX','ANZ.AX','CSL.AX','WES.AX','MQG.AX','TLS.AX','FMG.AX'] },
+  { label: 'Canadian Equities (TSX)', prefix: ['RY.TO','TD.TO','BNS.TO','BMO.TO','CNR.TO','CP.TO','SU.TO','ENB.TO','CNQ.TO','SHOP.TO'] },
+  { label: 'Crypto Spot', prefix: ['BTC-USD','ETH-USD','SOL-USD','BNB-USD','ADA-USD','XRP-USD','DOGE-USD','AVAX-USD','DOT-USD','MATIC-USD'] },
 ];
 
 function buildAssetOptions(trackedAssets) {
@@ -930,7 +889,7 @@ function _renderDropdownItems(items, liveSignal) {
     html += `<div class="asd-group-label">Live result — fetched from Yahoo Finance</div>
       <div class="asd-item" data-ticker="${escapeHtml(sig.asset)}" data-live="1">
         <span class="asd-ticker">${escapeHtml(sig.asset)}</span>
-        <span class="asd-exch">${eschFlags[ex] || ''} ${escapeHtml(ex)}</span>
+        <span class="asd-exch">${exchFlags[ex] || ''} ${escapeHtml(ex)}</span>
         <span class="asd-price">${price}</span>
         <span class="asd-signal ${escapeHtml(sig.signal_type)}">${escapeHtml(sig.signal_type)}</span>
       </div>`;
@@ -985,23 +944,25 @@ async function _selectTicker(ticker, isLive) {
 function _injectOnDemandCard(sig) {
   const grid = document.getElementById('signal-grid');
   if (!grid) return;
-  const asset = escapeHtml(String(sig.asset));
+  // Use raw ticker for DOM id (escapeHtml would break getElementById lookups)
+  const rawAsset = String(sig.asset);
+  const asset = escapeHtml(rawAsset);
   const sigType = escapeHtml(String(sig.signal_type));
   const rsi  = sig.features?.rsi != null ? Number(sig.features.rsi).toFixed(1) : 'N/A';
   const mom  = sig.features?.momentum != null ? (Number(sig.features.momentum) * 100).toFixed(1) : 'N/A';
   const macd = sig.features?.macd_histogram != null ? Number(sig.features.macd_histogram).toFixed(3) : 'N/A';
-  const confPct = Math.round(Number(sig.confidence) * 100);
+  const confPct = Math.min(100, Math.max(0, Math.round(Number(sig.confidence) * 100)));
   const price = Number(sig.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
   const exchFlags = { US:'🇺🇸',NSE:'🇮🇳',LSE:'🇬🇧',XETRA:'🇩🇪',TSE:'🇯🇵',HKEX:'🇭🇰',ASX:'🇦🇺',TSX:'🇨🇦',CRYPTO:'₿' };
   const flag = exchFlags[sig.exchange || 'US'] || '🌐';
 
-  // Remove existing card if any
-  const old = document.getElementById(`signal-${asset}`);
+  // Remove existing card if any (use raw asset for id lookup)
+  const old = document.getElementById(`signal-${rawAsset}`);
   if (old) old.remove();
 
   const div = document.createElement('div');
   div.className = `signal-card sig-${sigType} on-demand-card flash-update`;
-  div.id = `signal-${asset}`;
+  div.id = `signal-${rawAsset}`;  // raw id for getElementById compatibility
   div.style.border = '2px solid var(--accent-light)';
   div.innerHTML = `
     <div class="sig-header">
@@ -1069,11 +1030,13 @@ _searchInput.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { _closeDropdown(); _searchInput.blur(); return; }
   if (e.key === 'ArrowDown') {
     e.preventDefault();
+    // Clamp to last item; start from -1 so first Down selects item 0
     _dropdownFocusIdx = Math.min(_dropdownFocusIdx + 1, items.length - 1);
     items.forEach((el, i) => el.classList.toggle('focused', i === _dropdownFocusIdx));
   } else if (e.key === 'ArrowUp') {
     e.preventDefault();
-    _dropdownFocusIdx = Math.max(_dropdownFocusIdx - 1, 0);
+    // Allow going back to -1 (nothing focused = back to free-text input)
+    _dropdownFocusIdx = Math.max(_dropdownFocusIdx - 1, -1);
     items.forEach((el, i) => el.classList.toggle('focused', i === _dropdownFocusIdx));
   } else if (e.key === 'Enter') {
     e.preventDefault();
@@ -1385,16 +1348,20 @@ function startRefreshCountdown() {
   const countdownEl = document.getElementById('refresh-countdown');
   function tick() {
     if (!countdownEl) return;
-    countdownEl.textContent = remaining > 0 ? `Next refresh in ${remaining}s` : 'Refreshing…';
+    // Decrement first so display is always accurate (avoids showing 0 twice)
+    remaining--;
     if (remaining <= 0) {
       remaining = SIGNAL_REFRESH_INTERVAL;
+      countdownEl.textContent = 'Refreshing…';
       if (state.activeView === 'dashboard' && state.token) {
         loadDashboard(true);
       }
+    } else {
+      countdownEl.textContent = `Next refresh in ${remaining}s`;
     }
-    remaining--;
   }
-  tick();
+  // Show initial state immediately before first interval fires
+  if (countdownEl) countdownEl.textContent = `Next refresh in ${remaining}s`;
   _refreshCountdown = setInterval(tick, 1000);
 }
 

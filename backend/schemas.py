@@ -340,7 +340,7 @@ class HandshakeRequest(BaseModel):
 
 
 class OrderRequest(BaseModel):
-    asset: str = Field(min_length=1, max_length=12)
+    asset: str = Field(min_length=1, max_length=20)  # raised to 20 to accommodate e.g. RELIANCE.NS
     side: Literal["buy", "sell"]
     quantity: float = Field(gt=0, le=1_000_000)
     order_type: Literal["market", "limit", "stop", "stop_limit"] = "market"
@@ -352,8 +352,9 @@ class OrderRequest(BaseModel):
     @classmethod
     def normalized_asset(cls, value: str) -> str:
         value = value.strip().upper()
-        if not re.fullmatch(r"[A-Z.]{1,12}", value):
-            raise ValueError("asset must be a valid ticker symbol")
+        # Allow A-Z, digits, dots (e.g. RELIANCE.NS, 7203.T), hyphens (BTC-USD)
+        if not re.fullmatch(r"[A-Z0-9.\-]{1,20}", value):
+            raise ValueError("asset must be a valid ticker symbol (letters, digits, '.', '-')")
         return value
 
 
@@ -364,7 +365,7 @@ class RotateKeysRequest(BaseModel):
 
 class StrategyRequest(BaseModel):
     name: str = Field(min_length=3, max_length=80)
-    asset: str = Field(min_length=1, max_length=12)
+    asset: str = Field(min_length=1, max_length=20)
     fast_window: int = Field(default=20, ge=2, le=100)
     slow_window: int = Field(default=50, ge=5, le=250)
 
@@ -382,7 +383,7 @@ class StrategyRequest(BaseModel):
 
 
 class BacktestRequest(BaseModel):
-    asset: str = Field(min_length=1, max_length=12)
+    asset: str = Field(min_length=1, max_length=20)
     fast_window: int = Field(default=20, ge=2, le=100)
     slow_window: int = Field(default=50, ge=5, le=250)
     period: str = "1y"

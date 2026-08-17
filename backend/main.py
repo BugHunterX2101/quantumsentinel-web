@@ -177,7 +177,8 @@ async def security_headers_and_rate_limit(request, call_next):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self'; "
+        "default-src 'self'; "
+        "script-src 'self' https://cdn.jsdelivr.net; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data:; "
@@ -375,7 +376,9 @@ def latest_signals(
     Supports ETag / 304 Not Modified to minimise bandwidth at scale.
     """
     data = signal_engine.get_cached_signals()
-    tag = _etag(str(data.get("generated_at", "")))
+    # ETag includes both timestamp AND n_assets to correctly invalidate when
+    # signal count changes within the same second (e.g. after watchlist edit).
+    tag = _etag(str(data.get("generated_at", "")) + str(data.get("n_assets", "")))
     if request.headers.get("if-none-match") == tag:
         return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
 
@@ -478,12 +481,12 @@ async def signal_stream(websocket: WebSocket):
                 data = signal_engine.get_cached_signals()
                 wanted = set(_user_watchlist(user))
                 filtered = [s for s in data.get("signals", []) if s.get("asset") in wanted]
-                payload = dict(data)
-                payload["signals"] = filtered
-                payload["n_assets"] = len(filtered)
-                payload["total_assets"] = data.get("n_assets", len(data.get("signals", [])))
-                payload["watchlist"] = sorted(wanted)
-                await websocket.send_json(payload)
+                ws_payload = dict(data)
+                ws_payload["signals"] = filtered
+                ws_payload["n_assets"] = len(filtered)
+                ws_payload["total_assets"] = data.get("n_assets", len(data.get("signals", [])))
+                ws_payload["watchlist"] = sorted(wanted)
+                await websocket.send_json(ws_payload)
             except Exception:
                 # Connection closed mid-send or serialisation error — exit cleanly
                 break
@@ -973,7 +976,9 @@ def security_health(user: models.User = Depends(get_current_user), db: Session =
     health = security_service.key_health(db, user.id)
     n_keys = len(health["keys"])
     n_green = sum(1 for k in health["keys"] if k["status"] == "GREEN")
-    quantum_safety_score = round(100 * (n_green / n_keys), 0) if n_keys else 100
+    # Cast to int: Python's round(x, 0) returns float (e.g. 75.0), which would
+    # render as "75.0%" in the frontend animateCounter display.
+    quantum_safety_score = int(round(100 * (n_green / n_keys))) if n_keys else 100
     # Make created_at timezone-aware if it was stored as a naive datetime
     # to prevent TypeError when subtracting from an aware datetime.
     created_at = security_service.server_identity.created_at

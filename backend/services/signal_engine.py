@@ -139,7 +139,7 @@ N_STEPS = 200     # More iterations → better convergence
 DT = 0.05         # Smaller step → more stable dynamics
 COUPLING = 0.5    # coupling constant c
 
-_cache: dict = {"signals": {}, "generated_at": 0.0, "generating": False,
+_cache: dict = {"signals": None, "generated_at": 0.0, "generating": False,
                 "lock": threading.Lock()}
 CACHE_TTL_SECONDS = 30  # 1-min live data freshness window
 
@@ -368,7 +368,14 @@ def generate_signals(assets: list[str] | None = None) -> dict:
             feats["momentum"], feats["bb_width"],
         ])
         # 20-bar daily-return series for coupling matrix
-        rets = np.diff(close[-21:]) / np.where(close[-21:-1] != 0, close[-21:-1], 1.0)
+        # Safe division: use np.where to avoid fake 100% returns when a price bar is 0.
+        # np.nan_to_num converts any remaining NaN/Inf (e.g. consecutive 0-price bars) to 0.
+        raw_close = close[-21:]
+        prev_close = raw_close[:-1]
+        rets = np.nan_to_num(
+            np.diff(raw_close) / np.where(prev_close != 0, prev_close, np.nan),
+            nan=0.0, posinf=0.0, neginf=0.0,
+        )
         returns_rows.append(rets)
         closes_last[asset] = float(close[-1])
         rsis[asset] = feats["rsi"]
@@ -438,12 +445,13 @@ def get_cached_signals(assets: list[str] | None = None) -> dict:
     """
     with _cache["lock"]:
         now = time.time()
-        if (now - _cache["generated_at"] < CACHE_TTL_SECONDS
-                and _cache["signals"]):
+        # Check both TTL and that we actually have signal data (not just an empty dict)
+        has_data = bool(_cache.get("signals") and _cache["signals"].get("signals"))
+        if has_data and (now - _cache["generated_at"] < CACHE_TTL_SECONDS):
             return _cache["signals"]
         if _cache["generating"]:
             # Another thread is generating — return stale data to avoid pile-up
-            if _cache["signals"]:
+            if _cache.get("signals"):
                 return _cache["signals"]
         _cache["generating"] = True
 
@@ -497,8 +505,9 @@ def compute_single_asset(ticker: str) -> dict | None:
 
     # Also check the main preloaded cache
     with _cache["lock"]:
-        main = _cache.get("signals") or {}
-    for s in (main.get("signals") or []):
+        main_snapshot = _cache.get("signals") or {}
+    # _cache["signals"] stores the full signals response dict (not the list)
+    for s in (main_snapshot.get("signals") or []):
         if s["asset"] == ticker:
             _ondemand_cache[ticker] = {"signal": s, "fetched_at": now}
             return s

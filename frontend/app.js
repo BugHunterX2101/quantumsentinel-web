@@ -4,12 +4,22 @@ const state = {
   user: JSON.parse(localStorage.getItem('qs_user') || 'null'),
   beginner: localStorage.getItem('qs_beginner') !== 'false',
   meta: null,
-  lastSignals: {},   // asset -> last signal_type, for diff-highlighting
+  exchanges: {},           // key -> exchange info+status from /api/exchanges
+  preferredExchanges: new Set(JSON.parse(localStorage.getItem('qs_exchanges') || 'null') || ['US']),
+  activeExchangeFilter: null, // null = all watchlist, string = exchange key filter
+  dashSearchQuery: '',
+  lastSignals: {},
+  lastSignalPrices: {},
+  watchlist: new Set(JSON.parse(localStorage.getItem('qs_watchlist') || 'null') || []),
   pollTimer: null,
   signalSocket: null,
   signalReconnectMs: 1000,
   activeView: 'dashboard',
   tokenExpireTimer: null,
+  _signalCache: (() => {
+    try { return JSON.parse(localStorage.getItem('qs_signal_cache') || 'null'); } catch { return null; }
+  })(),
+  _lastEtag: null,         // ETag from last /api/signals/latest response
 };
 
 // ===========================================================================
@@ -61,14 +71,22 @@ function toast(title, body, type = 'info', duration = 3800) {
 function api(path, opts = {}, opts2 = {}) {
   const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
   if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  // ETag optimization: send If-None-Match for GET signal requests
+  if (!opts.method && path.startsWith('/api/signals/') && state._lastEtag) {
+    headers['If-None-Match'] = state._lastEtag;
+  }
   loadingBar.start();
   return fetch(path, Object.assign({}, opts, { headers })).then(async (r) => {
-    const body = await r.json().catch(() => ({}));
-    if (r.status === 401) {
-      // Token expired or invalid — force logout
-      handleTokenExpiry();
-      throw new Error('Session expired. Please log in again.');
+    // 304 Not Modified — return cached data immediately (zero payload)
+    if (r.status === 304 && state._signalCache) {
+      loadingBar.done();
+      return state._signalCache;
     }
+    // Store ETag for next request
+    const etag = r.headers.get('ETag');
+    if (etag) state._lastEtag = etag;
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 401) { handleTokenExpiry(); throw new Error('Session expired. Please log in again.'); }
     if (!r.ok) throw new Error(body.detail || r.statusText);
     return body;
   }).catch((err) => {
@@ -132,9 +150,8 @@ document.addEventListener('click', (e) => {
   const canvas = document.getElementById('bg-canvas');
   const ctx = canvas.getContext('2d');
   let w, h, particles;
-  // Light-theme particle palette: subtle slate + soft blue dots
-  // Dark-navy palette — subtle depth layers matching the institutional HFT theme
-  const COLORS = ['#1e3050', '#2d72b8', '#162338', '#4a8fd1', '#0e1d35'];
+  // Light-theme particle palette: subtle slate + soft blue dots on white canvas
+  const COLORS = ['#D8DCE6', '#B0B8CC', '#1842A8', '#E5E8EF', '#3D4A5C'];
 
   function resize() {
     w = canvas.width = window.innerWidth;
@@ -187,12 +204,12 @@ document.addEventListener('click', (e) => {
 // ===========================================================================
 (function typewriter() {
   const el = document.getElementById('tagline');
-  const text = "The world's first open-source, mobile-first, post-quantum secure trading terminal.";
+  const text = 'Open-source institutional terminal. FIPS 203/204 post-quantum session security.';
   let i = 0;
   function tick() {
     el.textContent = text.slice(0, i);
     i++;
-    if (i <= text.length) setTimeout(tick, 18);
+    if (i <= text.length) setTimeout(tick, 22);
   }
   tick();
 })();
@@ -228,6 +245,18 @@ function animateScoreRing(score) {
 // ===========================================================================
 // Auth screen wiring
 // ===========================================================================
+document.querySelectorAll('.auth-tab').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.auth-tab').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    const showLogin = btn.dataset.tab === 'login';
+    const loginForm = document.getElementById('login-form');
+    const registerForm = document.getElementById('register-form');
+    (showLogin ? registerForm : loginForm).classList.add('hidden');
+    const target = showLogin ? loginForm : registerForm;
+    target.classList.remove('hidden');
+    target.style.animation = 'none';
+    requestAnimationFrame(() => { target.style.animation = ''; });
   });
 });
 
@@ -353,6 +382,11 @@ async function afterLogin(data) {
   // Schedule a warning before the JWT expires based on actual TTL from server
   scheduleTokenExpiry(data.expires_in || 900);
   document.getElementById('auth-screen').classList.add('hidden');
+  // Switch 3D background: auth canvas out, app canvas in
+  const authCanvas = document.getElementById('auth-bg-canvas');
+  const appCanvas  = document.getElementById('app-bg-canvas');
+  if (authCanvas) { authCanvas.style.opacity = '0'; setTimeout(() => { authCanvas.style.display = 'none'; }, 600); }
+  if (appCanvas)  { appCanvas.style.display = ''; setTimeout(() => QS3D?.init('app-bg-canvas', 'dashboard'), 100); }
   await performHandshake({ showOverlay: true });
   document.getElementById('app').classList.remove('hidden');
   document.getElementById('user-email').textContent = state.user.email;
@@ -520,7 +554,9 @@ function restartPolling() {
   const loaders = { dashboard: loadDashboard, trading: refreshOrders, strategies: loadStrategies, portfolio: loadPortfolio, security: loadSecurity, integrations: loadIntegrations };
   const fn = loaders[state.activeView];
   if (!fn) return;
-  state.pollTimer = setInterval(() => fn(true), 20000);
+  // Poll every 30s on dashboard (aligns with backend CACHE_TTL_SECONDS=30), 20s elsewhere
+  const interval = state.activeView === 'dashboard' ? 30000 : 20000;
+  state.pollTimer = setInterval(() => fn(true), interval);
 }
 
 function applyBeginnerMode() {
@@ -546,27 +582,84 @@ document.getElementById('logout-btn').addEventListener('click', () => {
   location.reload();
 });
 
+// Asset categories for grouped dropdown
+const ASSET_GROUPS = [
+  { label: 'Technology', prefix: ['AAPL','MSFT','NVDA','GOOGL','GOOG','META','TSLA','AVGO','ORCL','ADBE','CRM','INTC','AMD','QCOM','TXN','MU','AMAT','KLAC','LRCX','SNPS','CDNS','MRVL','PANW','CRWD','ZS','NET','FTNT','OKTA','DDOG','SNOW','PLTR','UBER','LYFT','ABNB','BKNG','EXPE','SHOP','SQ','PYPL','AFRM'] },
+  { label: 'Communication & Media', prefix: ['NFLX','DIS','CMCSA','T','VZ','TMUS','CHTR','WBD','PARA','FOXA'] },
+  { label: 'Consumer Discretionary', prefix: ['AMZN','TSCO','HD','LOW','TGT','WMT','COST','SBUX','MCD','YUM','NKE','LULU','DECK','TPR','RL','PVH','HBI','VFC','GPS','ANF'] },
+  { label: 'Consumer Staples', prefix: ['PG','KO','PEP','PM','MO','MDLZ','GIS','K','CPB','CAG'] },
+  { label: 'Financials', prefix: ['JPM','BAC','WFC','GS','MS','C','BLK','SCHW','AXP','V','MA','COF','DFS','SYF','USB','PNC','TFC','FRC','KEY'] },
+  { label: 'Healthcare & Pharma', prefix: ['JNJ','UNH','LLY','PFE','ABBV','MRK','TMO','ABT','DHR','BMY','AMGN','GILD','BIIB','REGN','VRTX','MRNA','BNTX','IQV','SYK','EW'] },
+  { label: 'Energy', prefix: ['XOM','CVX','COP','SLB','EOG','PXD','MPC','PSX','VLO','HAL'] },
+  { label: 'Industrials', prefix: ['BA','CAT','GE','HON','LMT','RTX','NOC','GD','MMM','UPS','FDX','DE','EMR','ETN','PH','ROK','IR','XYL','CARR','OTIS'] },
+  { label: 'Materials', prefix: ['LIN','APD','SHW','FCX','NEM','AA','ALB','MP','VALE','RIO'] },
+  { label: 'Real Estate (REITs)', prefix: ['AMT','PLD','CCI','EQIX','PSA','SPG','O','VICI','AVB','EQR'] },
+  { label: 'Utilities', prefix: ['NEE','DUK','SO','D','AEP','XEL','PCG','EXC','ED','FE'] },
+  { label: 'ETFs — Broad Market', prefix: ['SPY','QQQ','IWM','DIA','VTI','VOO','VEA','VWO','EFA','EEM'] },
+  { label: 'ETFs — Sector', prefix: ['XLK','XLF','XLV','XLE','XLI','XLY','XLP','XLB','XLRE','XLU'] },
+  { label: 'ETFs — Fixed Income & Commodities', prefix: ['GLD','SLV','USO','TLT','IEF','HYG','LQD','BND','AGG','TIPS'] },
+  { label: 'International ADRs', prefix: ['TSM','ASML','SAP','NVO','BABA','JD','PDD','BIDU','SE','GRAB','SONY','TM','HMC','NTT'] },
+  { label: 'Crypto & Bitcoin-Adjacent', prefix: ['COIN','MSTR','MARA','RIOT','CLSK','HUT','BTBT','CIFR','CORZ','WULF'] },
+];
+
+function buildAssetOptions(trackedAssets) {
+  const set = new Set(trackedAssets);
+  let html = '';
+  for (const grp of ASSET_GROUPS) {
+    const opts = grp.prefix.filter(t => set.has(t));
+    if (!opts.length) continue;
+    html += `<optgroup label="${escapeHtml(grp.label)}">`;
+    html += opts.map(a => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join('');
+    html += '</optgroup>';
+    opts.forEach(t => set.delete(t));
+  }
+  // Any remaining not in groups
+  if (set.size) {
+    html += '<optgroup label="Other">';
+    html += [...set].sort().map(a => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join('');
+    html += '</optgroup>';
+  }
+  return html;
+}
+
 async function bootstrapApp() {
   applyBeginnerMode();
   state.meta = await api('/api/meta');
+  // Populate exchange map from meta (avoids extra round-trip)
+  if (state.meta.exchanges) {
+    _exchangeData = state.meta.exchanges;
+    state.exchanges = state.meta.exchanges;
+  }
+  const assetHtml = buildAssetOptions(state.meta.tracked_assets);
   const sel = document.getElementById('order-asset');
-  sel.innerHTML = state.meta.tracked_assets.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`).join('');
-  document.getElementById('strategy-asset').innerHTML = sel.innerHTML;
+  sel.innerHTML = assetHtml;
+  document.getElementById('strategy-asset').innerHTML = assetHtml;
   // Restore view from URL hash
   const hashView = location.hash.replace('#', '');
   switchView(VIEW_KEYS.includes(hashView) ? hashView : 'dashboard');
   connectSignalStream();
   startOnboardingIfNeeded();
-  // Wire live price preview on asset change
   sel.addEventListener('change', updateOrderPricePreview);
   updateOrderPricePreview();
-  // Wire order search
   const searchEl = document.getElementById('order-search');
   if (searchEl) searchEl.addEventListener('input', filterOrderList);
+  startRefreshCountdown();
+  // Load user preferences (watchlist + exchanges) in parallel
+  api('/api/preferences', {}, { silent: true }).then(r => {
+    if (r?.watchlist?.length) _saveWatchlistToStorage(r.watchlist);
+    if (r?.preferred_exchanges?.length) {
+      _saveExchangesToStorage(r.preferred_exchanges);
+    }
+    renderMarketStatusStrip();
+    renderExchangeFilterPills();
+  }).catch(() => {});
+  // Initial market status strip render from meta data
+  renderMarketStatusStrip();
+  renderExchangeFilterPills();
 }
 
+
 function setLiveIndicator(status) {
-  // status: 'connected' | 'reconnecting' | 'disconnected'
   const dot = document.getElementById('live-indicator');
   if (!dot) return;
   dot.classList.remove('disconnected', 'reconnecting');
@@ -576,7 +669,612 @@ function setLiveIndicator(status) {
   dot.title = titles[status] || '';
 }
 
+// ===========================================================================
+// Exchange Manager — Global Market Selection + Market Hours
+// ===========================================================================
+const EXCHANGE_FLAGS = {
+  US: '🇺🇸', NSE: '🇮🇳', LSE: '🇬🇧', XETRA: '🇩🇪',
+  TSE: '🇯🇵', HKEX: '🇭🇰', ASX: '🇦🇺', TSX: '🇨🇦', CRYPTO: '₿',
+};
+
+let _exchangeData = {};     // fetched from /api/exchanges
+let _pendingExchanges = null; // working set in modal
+
+function _saveExchangesToStorage(list) {
+  localStorage.setItem('qs_exchanges', JSON.stringify(list));
+  state.preferredExchanges = new Set(list);
+}
+
+async function loadExchanges() {
+  try {
+    const data = await api('/api/exchanges', {}, { silent: true });
+    _exchangeData = data;
+    state.exchanges = data;
+    renderMarketStatusStrip();
+    renderExchangeFilterPills();
+  } catch (_) {}
+}
+
+function renderMarketStatusStrip() {
+  const strip = document.getElementById('market-status-strip');
+  if (!strip) return;
+  const preferred = [...state.preferredExchanges];
+  if (!preferred.length || !Object.keys(_exchangeData).length) { strip.innerHTML = ''; return; }
+  strip.innerHTML = preferred.map(key => {
+    const ex = _exchangeData[key];
+    if (!ex) return '';
+    const st = ex.market_status?.status || 'closed';
+    const label = ex.market_status?.label || 'CLOSED';
+    const localTime = ex.market_status?.local_time || '';
+    const flag = EXCHANGE_FLAGS[key] || '🌐';
+    const isActive = state.activeExchangeFilter === key ? 'active-exch' : '';
+    return `<div class="market-strip-item ${isActive}" data-exch="${escapeHtml(key)}" title="${escapeHtml(ex.name)} — ${escapeHtml(ex.tz)}">
+      <span class="strip-dot ${st}"></span>
+      <span>${flag} ${escapeHtml(key)}</span>
+      <span style="color:var(--text-4);">${localTime}</span>
+      <span style="font-weight:600;color:${st==='open'?'var(--green)':st==='pre'?'var(--amber)':'var(--text-4)'};">${label}</span>
+    </div>`;
+  }).join('');
+  strip.querySelectorAll('.market-strip-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const key = el.dataset.exch;
+      if (state.activeExchangeFilter === key) {
+        state.activeExchangeFilter = null;
+      } else {
+        state.activeExchangeFilter = key;
+      }
+      renderMarketStatusStrip();
+      renderExchangeFilterPills();
+      _applyDashboardFilter();
+    });
+  });
+}
+
+function renderExchangeFilterPills() {
+  const container = document.getElementById('exchange-filter-pills');
+  if (!container || !Object.keys(_exchangeData).length) return;
+  const preferred = [...state.preferredExchanges];
+  if (!preferred.length) { container.innerHTML = ''; return; }
+  // "All" pill + one per preferred exchange
+  const allActive = !state.activeExchangeFilter ? 'active' : '';
+  let html = `<button class="exch-pill ${allActive}" data-exch="">ALL</button>`;
+  for (const key of preferred) {
+    const ex = _exchangeData[key];
+    if (!ex) continue;
+    const active = state.activeExchangeFilter === key ? 'active' : '';
+    const flag = EXCHANGE_FLAGS[key] || '';
+    html += `<button class="exch-pill ${active}" data-exch="${escapeHtml(key)}">${flag} ${escapeHtml(key)}</button>`;
+  }
+  container.innerHTML = html;
+  container.querySelectorAll('.exch-pill').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.activeExchangeFilter = btn.dataset.exch || null;
+      renderExchangeFilterPills();
+      renderMarketStatusStrip();
+      _applyDashboardFilter();
+    });
+  });
+}
+
+// Instant in-page filter (no API call — O(n) DOM traversal)
+function _applyDashboardFilter() {
+  const query = (state.dashSearchQuery || '').toLowerCase().trim();
+  const exchFilter = state.activeExchangeFilter;
+  const assetExchMap = state.meta?.asset_exchange_map || {};
+  const cards = document.querySelectorAll('#signal-grid .signal-card');
+  let visible = 0;
+  cards.forEach(card => {
+    const ticker = card.id.replace('signal-', '');
+    const matchesSearch = !query || ticker.toLowerCase().includes(query);
+    const matchesExch = !exchFilter || (assetExchMap[ticker] || 'US') === exchFilter;
+    if (matchesSearch && matchesExch) {
+      card.style.display = '';
+      visible++;
+    } else {
+      card.style.display = 'none';
+    }
+  });
+  // Update count in meta strip
+  const metaEl = document.getElementById('signal-meta');
+  if (metaEl && (query || exchFilter)) {
+    const existing = metaEl.querySelector('.filter-result-badge');
+    if (existing) existing.remove();
+    const badge = document.createElement('span');
+    badge.className = 'filter-result-badge signal-count-chip';
+    badge.style.marginLeft = '10px';
+    badge.textContent = `${visible} result${visible !== 1 ? 's' : ''}`;
+    metaEl.appendChild(badge);
+  } else if (metaEl) {
+    const existing = metaEl.querySelector('.filter-result-badge');
+    if (existing) existing.remove();
+  }
+}
+
+// Exchange modal
+function openExchangeModal() {
+  _pendingExchanges = new Set(state.preferredExchanges);
+  _renderExchangeGrid();
+  document.getElementById('exchange-modal').classList.remove('hidden');
+}
+
+function _renderExchangeGrid() {
+  const grid = document.getElementById('exchange-grid');
+  if (!grid || !Object.keys(_exchangeData).length) {
+    if (grid) grid.innerHTML = '<div class="empty-state" style="padding:48px 24px;">Loading exchange data…</div>';
+    return;
+  }
+  const infoEl = document.getElementById('exchange-selected-info');
+  if (infoEl) infoEl.textContent = `${_pendingExchanges.size} exchange${_pendingExchanges.size !== 1 ? 's' : ''} selected`;
+
+  grid.innerHTML = Object.entries(_exchangeData).map(([key, ex]) => {
+    const selected = _pendingExchanges.has(key) ? 'selected' : '';
+    const st = ex.market_status?.status || 'closed';
+    const stLabel = ex.market_status?.label || 'CLOSED';
+    const localTime = ex.market_status?.local_time || '';
+    const assetCount = ex.asset_count || 0;
+    const flag = EXCHANGE_FLAGS[key] || '🌐';
+    const opensIn = ex.market_status?.opens_in_mins;
+    const closesIn = ex.market_status?.closes_in_mins;
+    const timeHint = st === 'open' && closesIn != null ? `Closes in ${closesIn}m` :
+                     st === 'pre' && opensIn != null ? `Opens in ${opensIn}m` :
+                     st === 'crypto' ? 'Always open' : '';
+    return `<div class="exchange-card ${selected}" data-key="${escapeHtml(key)}">
+      <div class="exchange-flag">${flag}</div>
+      <div class="exchange-name">${escapeHtml(ex.name)}</div>
+      <div class="exchange-country">${escapeHtml(ex.country)} &middot; ${escapeHtml(ex.currency)}</div>
+      <div class="exchange-desc">${escapeHtml(ex.description)}</div>
+      <span class="market-status-badge ${key === 'CRYPTO' ? 'crypto' : st}">${stLabel}${localTime ? ' · ' + localTime : ''}</span>
+      ${timeHint ? `<div class="exchange-hours">${escapeHtml(timeHint)}</div>` : ''}
+      <div class="exchange-hours">Hours: ${escapeHtml(ex.open || '')} – ${escapeHtml(ex.close || '')} local</div>
+      <div class="exchange-asset-count">${assetCount} assets tracked</div>
+    </div>`;
+  }).join('');
+
+  grid.querySelectorAll('.exchange-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const key = card.dataset.key;
+      if (_pendingExchanges.has(key)) {
+        if (_pendingExchanges.size <= 1) { toast('Required', 'At least one exchange must be selected.', 'info', 2000); return; }
+        _pendingExchanges.delete(key);
+        card.classList.remove('selected');
+      } else {
+        _pendingExchanges.add(key);
+        card.classList.add('selected');
+      }
+      const infoEl2 = document.getElementById('exchange-selected-info');
+      if (infoEl2) infoEl2.textContent = `${_pendingExchanges.size} exchange${_pendingExchanges.size !== 1 ? 's' : ''} selected`;
+    });
+  });
+}
+
+async function saveExchanges() {
+  const list = [...(_pendingExchanges || new Set(['US']))];
+  const btn = document.getElementById('exchange-save');
+  setButtonLoading(btn, true, 'Applying…');
+  try {
+    await api('/api/preferences', { method: 'PUT', body: JSON.stringify({ preferred_exchanges: list }) });
+    _saveExchangesToStorage(list);
+    document.getElementById('exchange-modal').classList.add('hidden');
+    _pendingExchanges = null;
+    state.activeExchangeFilter = null;
+    renderMarketStatusStrip();
+    renderExchangeFilterPills();
+    toast('Markets updated', `Tracking ${list.length} exchange${list.length !== 1 ? 's' : ''}. Refreshing signals…`, 'success');
+    loadDashboard();
+  } catch (err) {
+    toast('Failed', err.message, 'error');
+  } finally { setButtonLoading(btn, false); }
+}
+
+function closeExchangeModal() {
+  document.getElementById('exchange-modal').classList.add('hidden');
+  _pendingExchanges = null;
+}
+
+document.getElementById('exchange-modal-close').addEventListener('click', closeExchangeModal);
+document.getElementById('exchange-save').addEventListener('click', saveExchanges);
+document.getElementById('exchange-select-all').addEventListener('click', () => {
+  Object.keys(_exchangeData).forEach(k => _pendingExchanges.add(k));
+  _renderExchangeGrid();
+});
+document.getElementById('exchange-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('exchange-modal')) closeExchangeModal();
+});
+document.getElementById('manage-exchanges-btn').addEventListener('click', () => {
+  if (!Object.keys(_exchangeData).length) {
+    loadExchanges().then(openExchangeModal);
+  } else {
+    openExchangeModal();
+  }
+});
+
+// ─── Smart Dashboard Search ─────────────────────────────────────────────────
+// Tier 1: instant DOM filter (already-rendered cards) — zero latency
+// Tier 2: autocomplete from catalogue (/api/signals/search) — pure in-memory
+// Tier 3: on-demand live fetch (/api/signals/asset/{ticker}) — Yahoo Finance
+// ─────────────────────────────────────────────────────────────────────────────
+const _searchInput    = document.getElementById('dashboard-asset-search');
+const _searchDropdown = document.getElementById('asset-search-dropdown');
+const _searchDot      = document.getElementById('search-loading-dot');
+let _searchDebounce   = null;
+let _searchFetchTimer = null;
+let _dropdownFocusIdx = -1;
+let _dropdownItems    = [];
+
+function _closeDropdown() {
+  _searchDropdown.classList.add('hidden');
+  _dropdownFocusIdx = -1;
+  _dropdownItems = [];
+}
+
+function _positionDropdown() {
+  const rect = _searchInput.getBoundingClientRect();
+  _searchDropdown.style.top  = (rect.bottom + 6) + 'px';
+  _searchDropdown.style.left = rect.left + 'px';
+  _searchDropdown.style.width = rect.width + 'px';
+}
+
+function _renderDropdownItems(items, liveSignal) {
+  if (!items.length && !liveSignal) { _closeDropdown(); return; }
+  _positionDropdown();
+  _searchDropdown.classList.remove('hidden');
+  _dropdownItems = items;
+
+  const exchFlags = { US:'🇺🇸',NSE:'🇮🇳',LSE:'🇬🇧',XETRA:'🇩🇪',TSE:'🇯🇵',HKEX:'🇭🇰',ASX:'🇦🇺',TSX:'🇨🇦',CRYPTO:'₿' };
+  let html = '';
+
+  if (liveSignal) {
+    const sig = liveSignal;
+    const price = Number(sig.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
+    const ex = sig.exchange || 'US';
+    html += `<div class="asd-group-label">Live result — fetched from Yahoo Finance</div>
+      <div class="asd-item" data-ticker="${escapeHtml(sig.asset)}" data-live="1">
+        <span class="asd-ticker">${escapeHtml(sig.asset)}</span>
+        <span class="asd-exch">${eschFlags[ex] || ''} ${escapeHtml(ex)}</span>
+        <span class="asd-price">${price}</span>
+        <span class="asd-signal ${escapeHtml(sig.signal_type)}">${escapeHtml(sig.signal_type)}</span>
+      </div>`;
+  }
+
+  if (items.length) {
+    html += `<div class="asd-group-label">Universe catalogue — ${items.length} match${items.length !== 1 ? 'es' : ''}</div>`;
+    items.forEach((item) => {
+      const flag = exchFlags[item.exchange] || '🌐';
+      html += `<div class="asd-item" data-ticker="${escapeHtml(item.ticker)}" role="option">
+        <span class="asd-ticker">${escapeHtml(item.ticker)}</span>
+        <span class="asd-exch">${flag} ${escapeHtml(item.exchange)}</span>
+      </div>`;
+    });
+  }
+  _searchDropdown.innerHTML = html;
+  _searchDropdown.querySelectorAll('.asd-item').forEach(el => {
+    el.addEventListener('mousedown', (e) => { e.preventDefault(); _selectTicker(el.dataset.ticker, el.dataset.live === '1'); });
+  });
+}
+
+async function _selectTicker(ticker, isLive) {
+  _searchInput.value = ticker;
+  state.dashSearchQuery = ticker;
+  _closeDropdown();
+  if (_searchDot) _searchDot.style.display = 'none';
+
+  // Instantly filter existing cards
+  _applyDashboardFilter();
+
+  // Check if it's already in the grid
+  const existing = document.getElementById('signal-' + ticker);
+  if (existing) {
+    existing.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    existing.classList.add('flash-update');
+    setTimeout(() => existing.classList.remove('flash-update'), 1200);
+    return;
+  }
+
+  // Fetch live signal and inject a card at top of grid
+  if (_searchDot) _searchDot.style.display = '';
+  try {
+    const sig = await api(`/api/signals/asset/${encodeURIComponent(ticker)}`, {}, { silent: true });
+    if (sig) _injectOnDemandCard(sig);
+  } catch (e) {
+    toast('Not found', `No market data for "${ticker}". Check the symbol format.`, 'error', 3000);
+  } finally {
+    if (_searchDot) _searchDot.style.display = 'none';
+  }
+}
+
+function _injectOnDemandCard(sig) {
+  const grid = document.getElementById('signal-grid');
+  if (!grid) return;
+  const asset = escapeHtml(String(sig.asset));
+  const sigType = escapeHtml(String(sig.signal_type));
+  const rsi  = sig.features?.rsi != null ? Number(sig.features.rsi).toFixed(1) : 'N/A';
+  const mom  = sig.features?.momentum != null ? (Number(sig.features.momentum) * 100).toFixed(1) : 'N/A';
+  const macd = sig.features?.macd_histogram != null ? Number(sig.features.macd_histogram).toFixed(3) : 'N/A';
+  const confPct = Math.round(Number(sig.confidence) * 100);
+  const price = Number(sig.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
+  const exchFlags = { US:'🇺🇸',NSE:'🇮🇳',LSE:'🇬🇧',XETRA:'🇩🇪',TSE:'🇯🇵',HKEX:'🇭🇰',ASX:'🇦🇺',TSX:'🇨🇦',CRYPTO:'₿' };
+  const flag = exchFlags[sig.exchange || 'US'] || '🌐';
+
+  // Remove existing card if any
+  const old = document.getElementById(`signal-${asset}`);
+  if (old) old.remove();
+
+  const div = document.createElement('div');
+  div.className = `signal-card sig-${sigType} on-demand-card flash-update`;
+  div.id = `signal-${asset}`;
+  div.style.border = '2px solid var(--accent-light)';
+  div.innerHTML = `
+    <div class="sig-header">
+      <div>
+        <div class="asset">${asset} <span style="font-size:14px;">${flag}</span></div>
+        <div class="price">${price}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span class="badge ${sigType}">${sigType}</span>
+        <button class="bookmark-btn" data-ticker="${asset}" title="Add ${asset} to watchlist">☆</button>
+      </div>
+    </div>
+    <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
+    <div class="confidence-label"><span>Confidence</span><span><b>${confPct}%</b></span></div>
+    <div class="features-row"><span>RSI ${rsi}</span><span>Mom ${mom}%</span><span>MACD ${macd}</span></div>
+    <div style="font-family:var(--f-mono);font-size:9px;color:var(--accent);margin-top:8px;letter-spacing:.5px;">⚡ LIVE FETCH · Yahoo Finance</div>
+  `;
+  grid.prepend(div);
+  requestAnimationFrame(() => {
+    div.querySelector('.confidence-fill').style.width = confPct + '%';
+  });
+  div.querySelector('.bookmark-btn').addEventListener('click', () => addToWatchlist(sig.asset));
+  div.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  toast('Signal fetched', `Live data loaded for ${sig.asset} — ${sigType} @ ${price}`, 'success', 3500);
+}
+
+// Debounced search: instant DOM filter + autocomplete + live fetch
+_searchInput.addEventListener('input', (e) => {
+  const q = e.target.value.trim();
+  state.dashSearchQuery = q;
+
+  // Tier 1: instant DOM filter (zero latency)
+  _applyDashboardFilter();
+
+  clearTimeout(_searchDebounce);
+  clearTimeout(_searchFetchTimer);
+
+  if (!q) { _closeDropdown(); return; }
+
+  // Tier 2: catalogue autocomplete (250ms debounce)
+  _searchDebounce = setTimeout(async () => {
+    try {
+      const data = await api(`/api/signals/search?q=${encodeURIComponent(q)}`, {}, { silent: true });
+      _renderDropdownItems(data.results || [], null);
+    } catch (_) { _closeDropdown(); }
+  }, 250);
+
+  // Tier 3: live fetch if no cards match (600ms debounce, only if ≥2 chars)
+  if (q.length >= 2) {
+    _searchFetchTimer = setTimeout(async () => {
+      const existing = document.getElementById('signal-' + q.toUpperCase());
+      if (existing) return;  // already in grid
+      if (_searchDot) _searchDot.style.display = '';
+      try {
+        const sig = await api(`/api/signals/asset/${encodeURIComponent(q)}`, {}, { silent: true });
+        if (sig && sig.asset) _renderDropdownItems(_dropdownItems, sig);
+      } catch (_) { /* ticker not found — silently ignore */ }
+      finally { if (_searchDot) _searchDot.style.display = 'none'; }
+    }, 600);
+  }
+});
+
+_searchInput.addEventListener('keydown', (e) => {
+  const items = _searchDropdown.querySelectorAll('.asd-item');
+  if (e.key === 'Escape') { _closeDropdown(); _searchInput.blur(); return; }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    _dropdownFocusIdx = Math.min(_dropdownFocusIdx + 1, items.length - 1);
+    items.forEach((el, i) => el.classList.toggle('focused', i === _dropdownFocusIdx));
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    _dropdownFocusIdx = Math.max(_dropdownFocusIdx - 1, 0);
+    items.forEach((el, i) => el.classList.toggle('focused', i === _dropdownFocusIdx));
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const focused = _searchDropdown.querySelector('.asd-item.focused');
+    if (focused) _selectTicker(focused.dataset.ticker, focused.dataset.live === '1');
+    else if (_searchInput.value.trim()) _selectTicker(_searchInput.value.trim().toUpperCase(), false);
+  }
+});
+
+document.addEventListener('click', (e) => {
+  if (!_searchDropdown.contains(e.target) && e.target !== _searchInput) _closeDropdown();
+});
+_searchInput.addEventListener('focus', () => {
+  if (_searchInput.value.trim() && _dropdownItems.length) {
+    _positionDropdown();
+    _searchDropdown.classList.remove('hidden');
+  }
+});
+
+
+// Refresh market status strip every 60s
+setInterval(() => {
+  if (state.token && state.activeView === 'dashboard') loadExchanges();
+}, 60000);
+
+// ===========================================================================
+// Watchlist Manager
+// ===========================================================================
+const DEFAULT_WATCHLIST = [
+
+  'AAPL','MSFT','NVDA','GOOGL','META',
+  'TSLA','AMZN','JPM','V','JNJ',
+  'XOM','SPY','QQQ','GLD','COIN',
+  'NFLX','AMD','BKNG','LLY','TSM',
+];
+
+let _pendingWatchlist = null;
+
+function _saveWatchlistToStorage(list) {
+  localStorage.setItem('qs_watchlist', JSON.stringify(list));
+  state.watchlist = new Set(list);
+}
+
+function _currentWatchlist() {
+  return state.watchlist.size ? [...state.watchlist] : [...DEFAULT_WATCHLIST];
+}
+
+function openWatchlistModal() {
+  _pendingWatchlist = new Set(_currentWatchlist());
+  _renderWatchlistModal();
+  document.getElementById('watchlist-modal').classList.remove('hidden');
+  document.getElementById('watchlist-search').focus();
+}
+
+function _renderWatchlistModal(filter = '') {
+  const container = document.getElementById('watchlist-asset-list');
+  const filterLow = filter.toLowerCase().trim();
+  let html = '';
+  let total = 0;
+  const tracked = new Set(state.meta?.tracked_assets || []);
+
+  for (const grp of ASSET_GROUPS) {
+    const matchesGroup = !filterLow || grp.label.toLowerCase().includes(filterLow);
+    const items = grp.prefix.filter(t =>
+      tracked.has(t) && (!filterLow || matchesGroup || t.toLowerCase().includes(filterLow))
+    );
+    if (!items.length) continue;
+    html += `<div class="watchlist-group-header">${escapeHtml(grp.label)}</div>`;
+    for (const ticker of items) {
+      const active = _pendingWatchlist.has(ticker) ? 'active' : '';
+      html += `<div class="watchlist-asset-row ${active}" data-ticker="${escapeHtml(ticker)}">
+        <span class="watchlist-ticker">${escapeHtml(ticker)}</span>
+        <span class="watchlist-toggle" title="${active ? 'Remove' : 'Add'} ${escapeHtml(ticker)}"></span>
+      </div>`;
+    }
+    total += items.length;
+  }
+  if (!total) {
+    html = `<div class="empty-state" style="padding:40px 0;">No assets match "${escapeHtml(filter)}"</div>`;
+  }
+  container.innerHTML = html;
+  _updateWatchlistCount();
+  container.querySelectorAll('.watchlist-asset-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const ticker = row.dataset.ticker;
+      if (_pendingWatchlist.has(ticker)) {
+        if (_pendingWatchlist.size <= 1) { toast('Required', 'Watchlist must have at least 1 asset.', 'info', 2000); return; }
+        _pendingWatchlist.delete(ticker);
+        row.classList.remove('active');
+      } else {
+        if (_pendingWatchlist.size >= 50) { toast('Limit reached', 'Watchlist is capped at 50 assets.', 'info', 2500); return; }
+        _pendingWatchlist.add(ticker);
+        row.classList.add('active');
+      }
+      _updateWatchlistCount();
+    });
+  });
+}
+
+function _updateWatchlistCount() {
+  const el = document.getElementById('watchlist-selected-count');
+  if (el) el.textContent = `${_pendingWatchlist?.size || 0} / 50 selected`;
+}
+
+async function saveWatchlist() {
+  const list = [...(_pendingWatchlist || new Set(DEFAULT_WATCHLIST))];
+  const btn = document.getElementById('watchlist-save');
+  setButtonLoading(btn, true, 'Saving…');
+  try {
+    await api('/api/watchlist', { method: 'PUT', body: JSON.stringify({ watchlist: list }) });
+    _saveWatchlistToStorage(list);
+    document.getElementById('watchlist-modal').classList.add('hidden');
+    _pendingWatchlist = null;
+    toast('Watchlist updated', `Now tracking ${list.length} assets on your dashboard.`, 'success');
+    loadDashboard();
+  } catch (err) {
+    toast('Save failed', err.message, 'error');
+  } finally { setButtonLoading(btn, false); }
+}
+
+function closeWatchlistModal() {
+  document.getElementById('watchlist-modal').classList.add('hidden');
+  _pendingWatchlist = null;
+}
+
+document.getElementById('watchlist-modal-close').addEventListener('click', closeWatchlistModal);
+document.getElementById('watchlist-save').addEventListener('click', saveWatchlist);
+document.getElementById('watchlist-reset').addEventListener('click', () => {
+  _pendingWatchlist = new Set(DEFAULT_WATCHLIST);
+  document.getElementById('watchlist-search').value = '';
+  _renderWatchlistModal();
+});
+document.getElementById('watchlist-modal').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('watchlist-modal')) closeWatchlistModal();
+});
+document.getElementById('watchlist-search').addEventListener('input', (e) => {
+  _renderWatchlistModal(e.target.value);
+});
+document.getElementById('manage-watchlist-btn').addEventListener('click', openWatchlistModal);
+
+async function removeFromWatchlist(ticker) {
+  const current = _currentWatchlist().filter(t => t !== ticker);
+  if (!current.length) { toast('Cannot remove', 'Watchlist must have at least one asset.', 'info'); return; }
+  try {
+    await api(`/api/watchlist/${encodeURIComponent(ticker)}`, { method: 'DELETE' }, { silent: true });
+    _saveWatchlistToStorage(current);
+    loadDashboard(true);
+    toast('Removed', `${ticker} removed from watchlist.`, 'info', 2200);
+  } catch (err) { toast('Failed', err.message, 'error'); }
+}
+
+async function addToWatchlist(ticker) {
+  const current = _currentWatchlist();
+  if (current.includes(ticker)) { toast('Already tracked', `${ticker} is already in your watchlist.`, 'info', 2000); return; }
+  if (current.length >= 50) { toast('Limit reached', 'Watchlist is limited to 50 assets. Remove one first.', 'info'); return; }
+  try {
+    await api(`/api/watchlist/${encodeURIComponent(ticker)}`, { method: 'POST' }, { silent: true });
+    _saveWatchlistToStorage([...current, ticker]);
+    toast('Added', `${ticker} added to your watchlist!`, 'success', 2500);
+    // Update the bookmark button on the injected card
+    const card = document.getElementById(`signal-${ticker}`);
+    if (card) {
+      const btn = card.querySelector('.bookmark-btn');
+      if (btn) { btn.textContent = '★'; btn.classList.add('bookmarked'); btn.onclick = () => removeFromWatchlist(ticker); }
+    }
+  } catch (err) { toast('Failed', err.message, 'error'); }
+}
+
+// ─── 3D Background Initialisation ─────────────────────────────────────────────
+// Auth canvas starts immediately (vivid mode); app canvas starts on login
+window.addEventListener('load', () => {
+  const authCanvas = document.getElementById('auth-bg-canvas');
+  if (authCanvas) {
+    authCanvas.classList.add('vivid');
+    // Wait for Three.js to be available (loaded deferred)
+    const tryInit = () => {
+      if (window.THREE) {
+        QS3D.init('auth-bg-canvas', 'auth');
+      } else {
+        setTimeout(tryInit, 100);
+      }
+    };
+    tryInit();
+  }
+  // If already logged in (token persisted), start app canvas immediately
+  if (state.token) {
+    const appCanvas = document.getElementById('app-bg-canvas');
+    if (appCanvas) {
+      authCanvas?.style && (authCanvas.style.display = 'none');
+      appCanvas.style.display = '';
+      const tryInit2 = () => {
+        if (window.THREE) QS3D.init('app-bg-canvas', 'dashboard');
+        else setTimeout(tryInit2, 100);
+      };
+      tryInit2();
+    }
+  }
+});
+
 function connectSignalStream() {
+
   if (!state.token || state.signalSocket) return;
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${scheme}//${location.host}/api/signals/stream`, ['qs', state.token]);
@@ -585,17 +1283,19 @@ function connectSignalStream() {
   socket.onopen = () => { state.signalReconnectMs = 1000; setLiveIndicator('connected'); };
   socket.onmessage = (event) => {
     try {
-      if (state.activeView === 'dashboard') loadDashboard(true, JSON.parse(event.data));
+      const data = JSON.parse(event.data);
+      // Persist to cache for instant next-load
+      try { localStorage.setItem('qs_signal_cache', JSON.stringify(data)); } catch {}
+      if (state.activeView === 'dashboard') loadDashboard(true, data);
     } catch (err) {
       console.error('WebSocket message handling error:', err);
     }
   };
   socket.onerror = (err) => {
-    // onerror is followed by onclose; log it but let onclose handle reconnection.
     console.warn('WebSocket error:', err);
   };
   socket.onclose = () => {
-    if (state.signalSocket !== socket) return; // superseded socket, ignore
+    if (state.signalSocket !== socket) return;
     state.signalSocket = null;
     const delay = state.signalReconnectMs;
     state.signalReconnectMs = Math.min(30000, delay * 2);
@@ -660,10 +1360,12 @@ function skeletonGrid(container, count, cardClass) {
 }
 
 // ===========================================================================
-// Dashboard
+// Dashboard — real-time auto-refresh countdown
 // ===========================================================================
-// Live signal-age clock — updates every second without re-fetching data
 let _signalAgeTimer = null;
+let _refreshCountdown = null;
+const SIGNAL_REFRESH_INTERVAL = 30; // seconds, matches backend CACHE_TTL_SECONDS
+
 function _startSignalAgeClock(generatedAt) {
   if (_signalAgeTimer) clearInterval(_signalAgeTimer);
   const ageEl = document.getElementById('signal-age-live');
@@ -677,27 +1379,80 @@ function _startSignalAgeClock(generatedAt) {
   _signalAgeTimer = setInterval(update, 1000);
 }
 
+function startRefreshCountdown() {
+  if (_refreshCountdown) clearInterval(_refreshCountdown);
+  let remaining = SIGNAL_REFRESH_INTERVAL;
+  const countdownEl = document.getElementById('refresh-countdown');
+  function tick() {
+    if (!countdownEl) return;
+    countdownEl.textContent = remaining > 0 ? `Next refresh in ${remaining}s` : 'Refreshing…';
+    if (remaining <= 0) {
+      remaining = SIGNAL_REFRESH_INTERVAL;
+      if (state.activeView === 'dashboard' && state.token) {
+        loadDashboard(true);
+      }
+    }
+    remaining--;
+  }
+  tick();
+  _refreshCountdown = setInterval(tick, 1000);
+}
+
 async function loadDashboard(isPoll, streamedSignals = null) {
   const grid = document.getElementById('signal-grid');
-  if (!isPoll && !grid.children.length) skeletonGrid(grid, 8, 'skeleton-card');
 
-  // Fetch signals (from WebSocket push or REST); security health is fetched
-  // independently only when on the dashboard and not as part of a poll to
-  // avoid coupling two endpoints unnecessarily.
+  // INSTANT RENDER: show cached signals immediately on first load (zero latency)
+  if (!isPoll && !streamedSignals && state._signalCache) {
+    _renderSignalGrid(grid, state._signalCache, true /* fromCache */);
+  } else if (!isPoll && !grid.children.length) {
+    skeletonGrid(grid, 8, 'skeleton-card');
+  }
+
   const signals = streamedSignals || await api('/api/signals/latest', {}, { silent: isPoll }).catch(() => null);
   if (!signals) return;
 
+  // Persist to cache
+  state._signalCache = signals;
+  try { localStorage.setItem('qs_signal_cache', JSON.stringify(signals)); } catch {}
+
+  // Update watchlist state from server response
+  if (signals.watchlist?.length) _saveWatchlistToStorage(signals.watchlist);
+
   const genTime = new Date(signals.generated_at * 1000).toLocaleTimeString();
+  const totalAssets = signals.total_assets ?? signals.n_assets;
   document.getElementById('signal-meta').innerHTML =
-    `Engine pipeline: ${signals.pipeline_ms} ms total (SBA bifurcation: ${signals.sba_ms} ms) &middot; ` +
-    `${signals.n_assets} assets &middot; generated ${escapeHtml(genTime)} <span class="signal-age" id="signal-age-live"></span>` +
+    `Engine: ${signals.pipeline_ms} ms &middot; SBA: ${signals.sba_ms} ms &middot; ` +
+    `<span class="signal-count-chip">${signals.n_assets} watched &middot; ${totalAssets} tracked</span> ` +
+    `&middot; ${escapeHtml(genTime)} <span class="signal-age" id="signal-age-live"></span>` +
     (signals.error ? ` &middot; <span style="color:var(--red)">&#9888; ${escapeHtml(signals.error)}</span>` : '');
   _startSignalAgeClock(signals.generated_at);
-  // Cache prices for the order form live preview
   cacheSignalPrices(signals);
   if (state.activeView === 'trading') updateOrderPricePreview();
 
-  grid.innerHTML = signals.signals.map((s, i) => {
+  _renderSignalGrid(grid, signals, false);
+
+  if (!isPoll) {
+    api('/api/security/health', {}, { silent: true }).then((health) => {
+      if (health) animateScoreRing(health.quantum_safety_score);
+    }).catch(() => {});
+  }
+}
+
+function _renderSignalGrid(grid, signals, fromCache) {
+  const watched = _currentWatchlist();
+  const sigList = signals.signals || [];
+
+  if (!sigList.length && !fromCache) {
+    // Show empty watchlist state with CTA
+    grid.innerHTML = `<div class="watchlist-empty">
+      <h3>Your watchlist is empty</h3>
+      <p>Add assets to your watchlist to see live signals. Start with our curated blue-chip selection.</p>
+      <button class="btn-primary ripple-btn" onclick="openWatchlistModal()" style="display:inline-block;width:auto;padding:10px 24px;">&#9733; Manage Watchlist</button>
+    </div>`;
+    return;
+  }
+
+  grid.innerHTML = sigList.map((s, i) => {
     const asset = escapeHtml(String(s.asset));
     const sigType = escapeHtml(String(s.signal_type));
     const rsi = s.features?.rsi != null ? Number(s.features.rsi).toFixed(1) : 'N/A';
@@ -706,13 +1461,16 @@ async function loadDashboard(isPoll, streamedSignals = null) {
     const confPct = Math.round(Number(s.confidence) * 100);
     const price = Number(s.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
     return `
-    <div class="signal-card sig-${sigType}" id="signal-${asset}" style="animation-delay:${i * 55}ms">
+    <div class="signal-card sig-${sigType}" id="signal-${asset}" style="animation-delay:${i * 40}ms">
       <div class="sig-header">
         <div>
           <div class="asset">${asset}</div>
           <div class="price">${price}</div>
         </div>
-        <span class="badge ${sigType}">${sigType}</span>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="badge ${sigType}">${sigType}</span>
+          <button class="bookmark-btn bookmarked" data-ticker="${asset}" title="Remove ${asset} from watchlist">&#9733;</button>
+        </div>
       </div>
       <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
       <div class="confidence-label"><span>Confidence</span><span><b>${confPct}%</b></span></div>
@@ -722,13 +1480,15 @@ async function loadDashboard(isPoll, streamedSignals = null) {
         <span>MACD ${macd}</span>
       </div>
     </div>`;
-  }).join('') || '<div class="empty-state">No signals yet — the engine is warming up.</div>';
+  }).join('') || '<div class="empty-state">Signals loading — engine is warming up for your watchlist&hellip;</div>';
 
-  // animate confidence bars in on next frame + flash cards whose signal changed
+  // Animate confidence bars
   requestAnimationFrame(() => {
     grid.querySelectorAll('.confidence-fill').forEach((bar) => { bar.style.width = bar.dataset.target + '%'; });
   });
-  signals.signals.forEach((s) => {
+
+  // Flash changed signals
+  sigList.forEach((s) => {
     const prev = state.lastSignals[s.asset];
     if (prev !== undefined && prev !== s.signal_type) {
       const card = document.getElementById(`signal-${s.asset}`);
@@ -737,11 +1497,17 @@ async function loadDashboard(isPoll, streamedSignals = null) {
     state.lastSignals[s.asset] = s.signal_type;
   });
 
-  // Update the safety score ring on first load or if not already populated
-  if (!isPoll) {
-    api('/api/security/health', {}, { silent: true }).then((health) => {
-      if (health) animateScoreRing(health.quantum_safety_score);
-    }).catch(() => {});
+  // Wire bookmark (remove) buttons
+  grid.querySelectorAll('.bookmark-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeFromWatchlist(btn.dataset.ticker);
+    });
+  });
+
+  // Re-apply active search / exchange filter so cards don't flash visible then disappear
+  if (state.dashSearchQuery || state.activeExchangeFilter) {
+    requestAnimationFrame(_applyDashboardFilter);
   }
 }
 
@@ -995,7 +1761,7 @@ function animateEquityCurve(curve) {
   if (equityAnimFrame) cancelAnimationFrame(equityAnimFrame);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!curve.length) {
-    ctx.fillStyle = '#7b8fb0'; ctx.font = '12px JetBrains Mono, monospace';
+    ctx.fillStyle = 'var(--text-3, #7A8599)'; ctx.font = '12px "IBM Plex Mono", monospace';
     ctx.fillText('No equity history yet — place a trade to begin tracking.', 20, 130);
     return;
   }
@@ -1017,10 +1783,10 @@ function animateEquityCurve(curve) {
     const visible = points.slice(0, revealCount);
     const last = visible[visible.length - 1];
 
-    // Gradient fill — ice-blue for the HFT dark theme
+    // Gradient fill — institutional blue on white canvas
     const gradient = ctx.createLinearGradient(0, pad, 0, pad + h);
-    gradient.addColorStop(0, 'rgba(79,172,222,0.20)');
-    gradient.addColorStop(1, 'rgba(79,172,222,0.0)');
+    gradient.addColorStop(0, 'rgba(24,66,168,0.12)');
+    gradient.addColorStop(1, 'rgba(24,66,168,0.01)');
     ctx.beginPath();
     visible.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
     ctx.lineTo(last.x, pad + h);
@@ -1029,10 +1795,18 @@ function animateEquityCurve(curve) {
     ctx.fillStyle = gradient;
     ctx.fill();
 
+    // Grid lines (subtle)
+    ctx.strokeStyle = 'rgba(216,220,230,0.6)';
+    ctx.lineWidth = 0.5;
+    for (let gi = 0; gi <= 4; gi++) {
+      const gy = pad + (gi / 4) * h;
+      ctx.beginPath(); ctx.moveTo(pad, gy); ctx.lineTo(pad + w, gy); ctx.stroke();
+    }
+
     // Line
     ctx.beginPath();
-    ctx.strokeStyle = '#4facde';
-    ctx.lineWidth = 1.8;
+    ctx.strokeStyle = '#1842A8';
+    ctx.lineWidth = 2;
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     visible.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
@@ -1040,11 +1814,11 @@ function animateEquityCurve(curve) {
 
     // Endpoint dot
     ctx.beginPath();
-    ctx.fillStyle = '#4facde';
-    ctx.arc(last.x, last.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#1842A8';
+    ctx.arc(last.x, last.y, 4.5, 0, Math.PI * 2);
     ctx.fill();
     ctx.beginPath();
-    ctx.fillStyle = '#0f1825';
+    ctx.fillStyle = '#FFFFFF';
     ctx.arc(last.x, last.y, 2, 0, Math.PI * 2);
     ctx.fill();
 

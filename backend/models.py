@@ -26,6 +26,9 @@ class User(Base):
     tier = Column(String, default="free")  # free | pro | enterprise
     beginner_mode = Column(Boolean, default=True)
     is_active = Column(Boolean, default=True)
+    watchlist = Column(JSON, nullable=True)  # list[str] of ticker symbols; None → use default
+    preferred_exchanges = Column(JSON, nullable=True)  # list[str] e.g. ["US","NSE","CRYPTO"]
+    user_timezone = Column(String(64), nullable=True)  # IANA tz e.g. "Asia/Kolkata"
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
     key_pairs = relationship("KeyPair", back_populates="user")

@@ -6,6 +6,11 @@ collapsed into one deployable app for a portable web demo). All PQC
 operations are genuine FIPS 203/204 algorithms (see backend/crypto/pqc.py).
 """
 import datetime as dt
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+from typing import Optional, List
 import os
 import time
 import secrets
@@ -14,7 +19,7 @@ import hashlib
 from collections import defaultdict, deque
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -30,6 +35,85 @@ from .database import get_db, init_db, SessionLocal
 from .config import CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service
+
+
+# Default watchlist for new users (20 blue-chip stocks)
+DEFAULT_WATCHLIST = [
+    "AAPL","MSFT","NVDA","GOOGL","META",
+    "TSLA","AMZN","JPM","V","JNJ",
+    "XOM","SPY","QQQ","GLD","COIN",
+    "NFLX","AMD","BKNG","LLY","TSM",
+]
+
+# ── Exchange Registry ──────────────────────────────────────────────────────────
+EXCHANGE_REGISTRY = {
+    "US":     {"name": "NYSE / NASDAQ", "country": "United States", "flag": "US",
+               "tz": "America/New_York", "open": "09:30", "close": "16:00",
+               "currency": "USD", "description": "World's largest equity market"},
+    "NSE":    {"name": "NSE / BSE", "country": "India", "flag": "IN",
+               "tz": "Asia/Kolkata", "open": "09:15", "close": "15:30",
+               "currency": "INR", "description": "India's premier stock exchanges"},
+    "LSE":    {"name": "London Stock Exchange", "country": "United Kingdom", "flag": "GB",
+               "tz": "Europe/London", "open": "08:00", "close": "16:30",
+               "currency": "GBP", "description": "Europe's largest equity market"},
+    "XETRA":  {"name": "Deutsche Börse Xetra", "country": "Germany", "flag": "DE",
+               "tz": "Europe/Berlin", "open": "09:00", "close": "17:30",
+               "currency": "EUR", "description": "Germany's primary electronic trading platform"},
+    "TSE":    {"name": "Tokyo Stock Exchange", "country": "Japan", "flag": "JP",
+               "tz": "Asia/Tokyo", "open": "09:00", "close": "15:30",
+               "currency": "JPY", "description": "Asia's second-largest stock exchange"},
+    "HKEX":   {"name": "Hong Kong Stock Exchange", "country": "Hong Kong", "flag": "HK",
+               "tz": "Asia/Hong_Kong", "open": "09:30", "close": "16:00",
+               "currency": "HKD", "description": "Gateway to Chinese equity markets"},
+    "ASX":    {"name": "Australian Securities Exchange", "country": "Australia", "flag": "AU",
+               "tz": "Australia/Sydney", "open": "10:00", "close": "16:00",
+               "currency": "AUD", "description": "Australia's primary securities exchange"},
+    "TSX":    {"name": "Toronto Stock Exchange", "country": "Canada", "flag": "CA",
+               "tz": "America/Toronto", "open": "09:30", "close": "16:00",
+               "currency": "CAD", "description": "Canada's largest stock exchange"},
+    "CRYPTO": {"name": "Crypto Markets", "country": "Global", "flag": "CRYPTO",
+               "tz": "UTC", "open": "00:00", "close": "23:59",
+               "currency": "USD", "description": "24/7 digital asset markets — never closes"},
+}
+
+def _market_status(exch_key: str) -> dict:
+    """Return open/closed/pre/after-hours status for a given exchange."""
+    info = EXCHANGE_REGISTRY.get(exch_key, {})
+    if exch_key == "CRYPTO":
+        return {"status": "open", "label": "24/7 OPEN", "next_event": None}
+    tz_name = info.get("tz", "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = dt.timezone.utc
+    now = dt.datetime.now(tz)
+    open_h, open_m = map(int, info.get("open", "09:30").split(":"))
+    close_h, close_m = map(int, info.get("close", "16:00").split(":"))
+    open_time  = now.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+    close_time = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+    # Weekends
+    if now.weekday() >= 5:
+        return {"status": "closed", "label": "WEEKEND", "local_time": now.strftime("%H:%M")}
+    if now < open_time:
+        mins = int((open_time - now).total_seconds() // 60)
+        return {"status": "pre", "label": "PRE-MARKET", "opens_in_mins": mins,
+                "local_time": now.strftime("%H:%M")}
+    if now <= close_time:
+        mins = int((close_time - now).total_seconds() // 60)
+        return {"status": "open", "label": "OPEN", "closes_in_mins": mins,
+                "local_time": now.strftime("%H:%M")}
+    return {"status": "closed", "label": "CLOSED", "local_time": now.strftime("%H:%M")}
+
+
+def _user_watchlist(user: models.User) -> list[str]:
+    """Return the user's watchlist, falling back to DEFAULT_WATCHLIST."""
+    wl = user.watchlist
+    if not wl:
+        return DEFAULT_WATCHLIST[:]
+    return wl
+
+def _etag(value: str) -> str:
+    return hashlib.sha1(value.encode()).hexdigest()[:16]
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -93,8 +177,11 @@ async def security_headers_and_rate_limit(request, call_next):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self' wss: ws: https://api.github.com; "
+        "default-src 'self'; script-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data:; "
+        "connect-src 'self' wss: ws: https://api.github.com https://api.pwnedpasswords.com; "
         "frame-ancestors 'none'; base-uri 'self'"
     )
     return response
@@ -279,18 +366,87 @@ def pqc_handshake(req: schemas.HandshakeRequest, user: models.User = Depends(get
 # Signal endpoints
 # --------------------------------------------------------------------------
 @app.get("/api/signals/latest")
-def latest_signals(user: models.User = Depends(get_current_user)):
+def latest_signals(
+    request: Request,
+    assets: Optional[str] = Query(None, description="Comma-separated tickers to filter. Omit to use user watchlist."),
+    user: models.User = Depends(get_current_user),
+):
+    """Return cached signals, filtered to the user's watchlist (or ?assets= override).
+    Supports ETag / 304 Not Modified to minimise bandwidth at scale.
+    """
     data = signal_engine.get_cached_signals()
-    return data
+    tag = _etag(str(data.get("generated_at", "")))
+    if request.headers.get("if-none-match") == tag:
+        return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
+
+    # Determine filter list: query param > user watchlist > exchange filter > all
+    if assets:
+        wanted = {t.strip().upper() for t in assets.split(",") if t.strip()}
+    else:
+        wl = _user_watchlist(user)
+        # Also apply exchange filter if user has preferences set
+        preferred_ex = set(user.preferred_exchanges or ["US"])
+        exchange_map = signal_engine.ASSET_EXCHANGE_MAP
+        wanted = {t for t in wl if exchange_map.get(t, "US") in preferred_ex} or set(wl)
+
+    filtered_signals = [s for s in data.get("signals", []) if s.get("asset") in wanted]
+    result = dict(data)
+    result["signals"] = filtered_signals
+    result["n_assets"] = len(filtered_signals)
+    result["total_assets"] = data.get("n_assets", len(data.get("signals", [])))
+    result["watchlist"] = sorted(wanted)
+
+    return JSONResponse(content=result, headers={
+        "ETag": tag,
+        "Cache-Control": "no-cache",
+        "Vary": "Authorization",
+    })
 
 
 @app.post("/api/signals/refresh")
 def refresh_signals(user: models.User = Depends(get_current_user)):
-    """Force-refresh (bypasses cache) — used by the dashboard's manual refresh button.
-    Changed from GET to POST because this endpoint mutates server state (cache invalidation).
-    """
+    """Force-refresh (bypasses cache) — used by the dashboard's manual refresh button."""
     signal_engine.invalidate_cache()
     return signal_engine.get_cached_signals()
+
+
+@app.get("/api/signals/asset/{ticker}")
+def get_asset_signal(ticker: str, user: models.User = Depends(get_current_user)):
+    """Real-time on-demand signal for a single ticker (fetched live from Yahoo Finance).
+
+    Called when the user searches for a specific asset on the dashboard.
+    Results are cached for 30s to prevent hammering Yahoo Finance on each keystroke.
+    Returns 404 if the ticker is invalid or has insufficient price history.
+    """
+    clean = ticker.strip().upper()
+    if not clean or len(clean) > 20:
+        raise HTTPException(400, "Invalid ticker symbol")
+    result = signal_engine.compute_single_asset(clean)
+    if result is None:
+        raise HTTPException(404, f"No price data found for '{clean}'. "
+                            "The symbol may be delisted or incorrectly formatted.")
+    return result
+
+
+@app.get("/api/signals/search")
+def search_assets(q: str = "", user: models.User = Depends(get_current_user)):
+    """Return matching tickers from the full 300+ universe catalogue.
+
+    Used by the dashboard search bar to show autocomplete suggestions.
+    Pure in-memory filter — no network call, sub-millisecond response.
+    """
+    q = q.strip().upper()
+    if not q or len(q) < 1:
+        return {"results": [], "total": 0}
+    matches = [t for t in signal_engine.TRACKED_ASSETS if q in t.upper()][:20]
+    return {
+        "results": [
+            {"ticker": t, "exchange": signal_engine.ASSET_EXCHANGE_MAP.get(t, "US")}
+            for t in matches
+        ],
+        "total": len(matches),
+        "query": q,
+    }
 
 
 @app.websocket("/api/signals/stream")
@@ -319,11 +475,19 @@ async def signal_stream(websocket: WebSocket):
         await websocket.accept(subprotocol="qs")
         while True:
             try:
-                await websocket.send_json(signal_engine.get_cached_signals())
+                data = signal_engine.get_cached_signals()
+                wanted = set(_user_watchlist(user))
+                filtered = [s for s in data.get("signals", []) if s.get("asset") in wanted]
+                payload = dict(data)
+                payload["signals"] = filtered
+                payload["n_assets"] = len(filtered)
+                payload["total_assets"] = data.get("n_assets", len(data.get("signals", [])))
+                payload["watchlist"] = sorted(wanted)
+                await websocket.send_json(payload)
             except Exception:
                 # Connection closed mid-send or serialisation error — exit cleanly
                 break
-            await asyncio.sleep(60)  # aligned with CACHE_TTL_SECONDS=60 to avoid duplicate stale pushes
+            await asyncio.sleep(30)  # aligned with CACHE_TTL_SECONDS=30
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -332,6 +496,79 @@ async def signal_stream(websocket: WebSocket):
     finally:
         db.close()
 
+
+
+# --------------------------------------------------------------------------
+# Watchlist endpoints
+# --------------------------------------------------------------------------
+@app.get("/api/watchlist")
+def get_watchlist(user: models.User = Depends(get_current_user)):
+    """Return the current user's watchlist. Falls back to DEFAULT_WATCHLIST."""
+    return {"watchlist": _user_watchlist(user), "default": not bool(user.watchlist)}
+
+
+@app.put("/api/watchlist")
+def set_watchlist(
+    body: dict,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Replace the full watchlist. Body: {"watchlist": ["AAPL","MSFT", ...]}"""
+    tickers = body.get("watchlist", [])
+    if not isinstance(tickers, list):
+        raise HTTPException(400, "watchlist must be a list")
+    valid = set(signal_engine.TRACKED_ASSETS)
+    cleaned = [str(t).upper() for t in tickers if str(t).upper() in valid]
+    if not cleaned:
+        raise HTTPException(400, "No valid tracked tickers provided")
+    if len(cleaned) > 50:
+        raise HTTPException(400, "Watchlist limited to 50 assets")
+    db_user = db.get(models.User, user.id)
+    db_user.watchlist = cleaned
+    db.commit()
+    return {"watchlist": cleaned, "count": len(cleaned)}
+
+
+@app.post("/api/watchlist/{ticker}")
+def add_to_watchlist(
+    ticker: str,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Add a single ticker to the user's watchlist."""
+    ticker = ticker.upper()
+    if ticker not in signal_engine.TRACKED_ASSETS:
+        raise HTTPException(404, f"{ticker} is not in the tracked asset universe")
+    current = _user_watchlist(user)
+    if ticker in current:
+        return {"watchlist": current, "message": f"{ticker} already in watchlist"}
+    if len(current) >= 50:
+        raise HTTPException(400, "Watchlist limited to 50 assets")
+    current.append(ticker)
+    db_user = db.get(models.User, user.id)
+    db_user.watchlist = current
+    db.commit()
+    return {"watchlist": current, "added": ticker}
+
+
+@app.delete("/api/watchlist/{ticker}")
+def remove_from_watchlist(
+    ticker: str,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove a single ticker from the user's watchlist."""
+    ticker = ticker.upper()
+    current = _user_watchlist(user)
+    if ticker not in current:
+        raise HTTPException(404, f"{ticker} not in watchlist")
+    current = [t for t in current if t != ticker]
+    if not current:
+        raise HTTPException(400, "Cannot remove the last ticker — watchlist must have at least 1 asset")
+    db_user = db.get(models.User, user.id)
+    db_user.watchlist = current
+    db.commit()
+    return {"watchlist": current, "removed": ticker}
 
 # --------------------------------------------------------------------------
 # Trading endpoints
@@ -841,11 +1078,63 @@ def algorithms():
 
 @app.get("/api/meta")
 def meta():
+    exchanges_with_status = {}
+    for key, info in EXCHANGE_REGISTRY.items():
+        exchanges_with_status[key] = {**info, "market_status": _market_status(key)}
     return {
-        "product": "QuantumSentinel", "version": "1.0.0",
+        "product": "QuantumSentinel", "version": "1.1.0",
         "fips_standards": ["FIPS 203 (ML-KEM-768)", "FIPS 204 (ML-DSA-65)"],
         "tracked_assets": signal_engine.TRACKED_ASSETS,
+        "asset_exchange_map": signal_engine.ASSET_EXCHANGE_MAP,
+        "exchanges": exchanges_with_status,
         "alpaca_live": trading_service.alpaca_enabled(),
+    }
+
+
+@app.get("/api/exchanges")
+def get_exchanges():
+    """Return all supported exchanges with live market-hours status."""
+    result = {}
+    for key, info in EXCHANGE_REGISTRY.items():
+        result[key] = {**info, "market_status": _market_status(key),
+                       "asset_count": sum(1 for e in signal_engine.ASSET_EXCHANGE_MAP.values() if e == key)}
+    return result
+
+
+@app.get("/api/preferences")
+def get_preferences(user: models.User = Depends(get_current_user)):
+    """Return the user's regional preferences (exchanges + timezone)."""
+    return {
+        "preferred_exchanges": user.preferred_exchanges or ["US"],
+        "user_timezone": user.user_timezone or "UTC",
+        "watchlist": _user_watchlist(user),
+    }
+
+
+@app.put("/api/preferences")
+def set_preferences(
+    body: dict,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update the user's regional preferences."""
+    db_user = db.get(models.User, user.id)
+    if "preferred_exchanges" in body:
+        exchanges = [str(e).upper() for e in body["preferred_exchanges"] if str(e).upper() in EXCHANGE_REGISTRY]
+        if not exchanges:
+            raise HTTPException(400, "At least one valid exchange must be selected")
+        db_user.preferred_exchanges = exchanges
+    if "user_timezone" in body:
+        tz_val = str(body["user_timezone"])
+        try:
+            ZoneInfo(tz_val)  # validate
+            db_user.user_timezone = tz_val
+        except Exception:
+            raise HTTPException(400, f"Invalid timezone: {tz_val}")
+    db.commit()
+    return {
+        "preferred_exchanges": db_user.preferred_exchanges,
+        "user_timezone": db_user.user_timezone,
     }
 
 
@@ -853,7 +1142,19 @@ def meta():
 # Frontend static hosting + SPA catch-all
 # --------------------------------------------------------------------------
 if FRONTEND_DIR.exists():
-    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR)), name="assets")
+    # Serve static files with a custom response class that adds cache headers
+    from fastapi.responses import HTMLResponse
+    from starlette.staticfiles import StaticFiles as _StaticFiles
+
+    class CachedStaticFiles(_StaticFiles):
+        async def get_response(self, path, scope):
+            response = await super().get_response(path, scope)
+            # Cache CSS/JS for 24 hours in browser; revalidate in between
+            if hasattr(response, "headers") and path.endswith((".css", ".js")):
+                response.headers["Cache-Control"] = "public, max-age=86400, stale-while-revalidate=3600"
+            return response
+
+    app.mount("/assets", CachedStaticFiles(directory=str(FRONTEND_DIR)), name="assets")
 
     @app.get("/")
     def index():

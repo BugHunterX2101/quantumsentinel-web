@@ -17,11 +17,123 @@ import yfinance as yf
 
 log = logging.getLogger(__name__)
 
-# 12-asset basket: 8 large-caps + 4 sector diversifiers for stronger signals
-TRACKED_ASSETS = [
-    "AAPL", "MSFT", "TSLA", "NVDA", "GOOGL",
-    "AMZN", "META", "SPY", "AMD", "NFLX", "INTC", "QQQ",
+# ---------------------------------------------------------------------------
+# Default preloaded assets — only these 20 are fetched on server startup and
+# kept warm in the rolling cache. All other assets are fetched on-demand via
+# compute_single_asset() when the user searches for them.
+# ---------------------------------------------------------------------------
+PRELOADED_ASSETS = [
+    "AAPL","MSFT","NVDA","GOOGL","META",
+    "TSLA","AMZN","JPM","V","JNJ",
+    "XOM","SPY","QQQ","GLD","COIN",
+    "NFLX","AMD","BKNG","LLY","TSM",
 ]
+
+# ---------------------------------------------------------------------------
+# Full universe catalogue — used for search autocomplete & exchange mapping.
+# Signals are NOT pre-computed for this entire list; they are fetched on-demand.
+# ---------------------------------------------------------------------------
+TRACKED_ASSETS = [
+    # ══ NYSE / NASDAQ (US) ════════════════════════════════════════════════════
+    # Technology
+    "AAPL","MSFT","NVDA","GOOGL","GOOG","META","TSLA","AVGO","ORCL","ADBE",
+    "CRM","INTC","AMD","QCOM","TXN","MU","AMAT","KLAC","LRCX","SNPS",
+    "CDNS","MRVL","PANW","CRWD","ZS","NET","FTNT","OKTA","DDOG","SNOW",
+    "PLTR","UBER","LYFT","ABNB","BKNG","EXPE","PYPL","AFRM","SHOP",
+    # Communication & Media
+    "NFLX","DIS","CMCSA","T","VZ","TMUS","CHTR","WBD","PARA","FOXA",
+    # Consumer Discretionary
+    "AMZN","HD","LOW","TGT","WMT","COST","SBUX","MCD","YUM",
+    "NKE","LULU","DECK","TPR","RL","PVH","ANF",
+    # Consumer Staples
+    "PG","KO","PEP","PM","MO","MDLZ","GIS","KHC","CPB","CAG",
+    # Financials
+    "JPM","BAC","WFC","GS","MS","C","BLK","SCHW","AXP","V",
+    "MA","COF","ALLY","SYF","USB","PNC","TFC","RF","KEY",
+    # Healthcare & Pharma
+    "JNJ","UNH","LLY","PFE","ABBV","MRK","TMO","ABT","DHR","BMY",
+    "AMGN","GILD","BIIB","REGN","VRTX","MRNA","BNTX","IQV","SYK","EW",
+    # Energy
+    "XOM","CVX","COP","SLB","EOG","DVN","MPC","PSX","VLO","HAL",
+    # Industrials
+    "BA","CAT","GE","HON","LMT","RTX","NOC","GD","MMM","UPS",
+    "FDX","DE","EMR","ETN","PH","ROK","IR","CARR","OTIS",
+    # Materials
+    "LIN","APD","SHW","FCX","NEM","AA","ALB","MP","VALE",
+    # Real Estate (REITs)
+    "AMT","PLD","CCI","EQIX","PSA","SPG","O","VICI","AVB","EQR",
+    # Utilities
+    "NEE","DUK","SO","D","AEP","XEL","PCG","EXC","ED","FE",
+    # Broad Market ETFs
+    "SPY","QQQ","IWM","DIA","VTI","VOO","VEA","VWO","EFA","EEM",
+    "XLK","XLF","XLV","XLE","XLI","XLY","XLP","XLB","XLRE","XLU",
+    "GLD","SLV","USO","TLT","IEF","HYG","LQD","BND","AGG","TIPS",
+    # US-listed ADRs
+    "TSM","ASML","SAP","NVO","BABA","JD","PDD","BIDU","SE","GRAB",
+    "SONY","TM","HMC","NTDOY","LI","NIO",
+    # Crypto-equity proxies
+    "COIN","MSTR","MARA","RIOT","CLSK","HUT","WULF",
+
+    # ══ NSE / BSE (India) ═════════════════════════════════════════════════════
+    "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","HINDUNILVR.NS",
+    "ICICIBANK.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LT.NS",
+    "WIPRO.NS","BAJFINANCE.NS","HCLTECH.NS","SBIN.NS","AXISBANK.NS",
+    "MARUTI.NS","SUNPHARMA.NS","TATAMOTORS.NS","ONGC.NS","NTPC.NS",
+
+    # ══ LSE (UK) ══════════════════════════════════════════════════════════════
+    "HSBA.L","BP.L","SHEL.L","AZN.L","GSK.L",
+    "RIO.L","VOD.L","ULVR.L","LLOY.L","BARC.L",
+
+    # ══ TSE (Japan) ═══════════════════════════════════════════════════════════
+    "7203.T","6758.T","9984.T","8306.T","6861.T",
+    "7974.T","4063.T","8035.T","4502.T","9432.T",
+
+    # ══ HKEX (Hong Kong) ══════════════════════════════════════════════════════
+    "9988.HK","0700.HK","9999.HK","1810.HK","3690.HK",
+    "2318.HK","0941.HK","1299.HK","0005.HK","0939.HK",
+
+    # ══ ASX (Australia) ═══════════════════════════════════════════════════════
+    "CBA.AX","BHP.AX","NAB.AX","WBC.AX","ANZ.AX",
+    "CSL.AX","WES.AX","MQG.AX","TLS.AX","FMG.AX",
+
+    # ══ TSX (Canada) ══════════════════════════════════════════════════════════
+    "RY.TO","TD.TO","BNS.TO","BMO.TO","CNR.TO",
+    "CP.TO","SU.TO","ENB.TO","CNQ.TO","SHOP.TO",
+
+    # ══ Xetra (Germany / EU) ══════════════════════════════════════════════════
+    "SAP.DE","SIE.DE","BAYER.DE","ALV.DE","BMW.DE",
+    "MBG.DE","VOW3.DE","MUV2.DE","BAS.DE","ADS.DE",
+
+    # ══ Crypto Spot (24/7) ════════════════════════════════════════════════════
+    "BTC-USD","ETH-USD","SOL-USD","BNB-USD","ADA-USD",
+    "XRP-USD","DOGE-USD","AVAX-USD","DOT-USD","MATIC-USD",
+]
+
+# Asset → exchange mapping for market hours
+ASSET_EXCHANGE_MAP = {}
+def _build_exchange_map():
+    rules = [
+        ("US",  lambda t: not any(t.endswith(x) for x in [".NS",".L",".T",".HK",".AX",".TO",".DE","-USD"])),
+        ("NSE", lambda t: t.endswith(".NS")),
+        ("LSE", lambda t: t.endswith(".L")),
+        ("TSE", lambda t: t.endswith(".T")),
+        ("HKEX",lambda t: t.endswith(".HK")),
+        ("ASX", lambda t: t.endswith(".AX")),
+        ("TSX", lambda t: t.endswith(".TO")),
+        ("XETRA",lambda t: t.endswith(".DE")),
+        ("CRYPTO",lambda t: t.endswith("-USD")),
+    ]
+    for ticker in TRACKED_ASSETS:
+        for exch, test in rules:
+            if test(ticker):
+                ASSET_EXCHANGE_MAP[ticker] = exch
+                break
+
+_build_exchange_map()
+
+# Alias: for cache generation use PRELOADED_ASSETS; TRACKED_ASSETS = full catalogue
+def get_preloaded_assets() -> list[str]:
+    return PRELOADED_ASSETS[:]
 
 N_STEPS = 200     # More iterations → better convergence
 DT = 0.05         # Smaller step → more stable dynamics
@@ -29,7 +141,7 @@ COUPLING = 0.5    # coupling constant c
 
 _cache: dict = {"signals": {}, "generated_at": 0.0, "generating": False,
                 "lock": threading.Lock()}
-CACHE_TTL_SECONDS = 60  # 1-min live data freshness window
+CACHE_TTL_SECONDS = 30  # 1-min live data freshness window
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +325,10 @@ def _extract_close(data, asset: str) -> np.ndarray | None:
 def generate_signals(assets: list[str] | None = None) -> dict:
     """Download live data and run the full SBA signal pipeline.
 
-    Returns a structured dict that is safe to serialise directly as a JSON API
-    response.  All data is live from Yahoo Finance — no mocked prices.
+    By default only runs over PRELOADED_ASSETS (20 stocks). For on-demand
+    single-asset signals use compute_single_asset() instead.
     """
-    assets = assets or TRACKED_ASSETS
+    assets = assets or PRELOADED_ASSETS
     t0 = time.perf_counter()
 
     try:
@@ -358,3 +470,88 @@ def invalidate_cache() -> None:
     """Thread-safe cache invalidation used by POST /api/signals/refresh."""
     with _cache["lock"]:
         _cache["generated_at"] = 0.0
+
+
+# ---------------------------------------------------------------------------
+# On-demand single-asset signal (real-time Yahoo Finance fetch)
+# ---------------------------------------------------------------------------
+
+_ondemand_cache: dict = {}   # ticker -> {signal, fetched_at}
+_ONDEMAND_TTL = 30           # seconds before on-demand result expires
+
+
+def compute_single_asset(ticker: str) -> dict | None:
+    """Fetch a single asset from Yahoo Finance and compute its SBA signal.
+
+    Results are cached for _ONDEMAND_TTL seconds so rapid user typing
+    doesn't hammer the Yahoo Finance API.  Returns None if the ticker
+    is invalid or has insufficient price history.
+    """
+    ticker = ticker.strip().upper()
+    now = time.time()
+
+    # Serve from on-demand cache if fresh
+    cached = _ondemand_cache.get(ticker)
+    if cached and (now - cached["fetched_at"]) < _ONDEMAND_TTL:
+        return cached["signal"]
+
+    # Also check the main preloaded cache
+    with _cache["lock"]:
+        main = _cache.get("signals") or {}
+    for s in (main.get("signals") or []):
+        if s["asset"] == ticker:
+            _ondemand_cache[ticker] = {"signal": s, "fetched_at": now}
+            return s
+
+    # Real-time Yahoo Finance fetch
+    try:
+        data = yf.download(
+            [ticker], period="3mo", interval="1d",
+            progress=False, auto_adjust=True,
+        )
+    except Exception as exc:
+        log.warning("on-demand fetch failed for %s: %s", ticker, exc)
+        return None
+
+    if data is None or data.empty:
+        return None
+
+    close = _extract_close(data, ticker)
+    if close is None or len(close) < 50:
+        log.debug("Insufficient bars for on-demand ticker %s", ticker)
+        return None
+
+    feats = extract_features(close)
+    # Single-asset: spin = tanh(momentum z-score) as simplified SBA proxy
+    mom = feats["momentum"]
+    spin = float(np.tanh(mom * 5.0))  # scale momentum → spin range [-1, 1]
+    signal_type, confidence = score_signal(spin, feats["rsi"])
+
+    result = {
+        "asset": ticker,
+        "signal_type": signal_type,
+        "confidence": round(confidence, 4),
+        "spin": round(spin, 4),
+        "last_price": round(float(close[-1]), 2),
+        "features": {k: round(v, 4) for k, v in feats.items()},
+        "sba_iterations": 1,  # simplified single-asset mode
+        "engine_version": "1.1.0-python-sba",
+        "on_demand": True,
+        "exchange": ASSET_EXCHANGE_MAP.get(ticker, _infer_exchange(ticker)),
+    }
+
+    _ondemand_cache[ticker] = {"signal": result, "fetched_at": now}
+    return result
+
+
+def _infer_exchange(ticker: str) -> str:
+    """Infer exchange from ticker suffix for unknown tickers."""
+    if ticker.endswith(".NS"): return "NSE"
+    if ticker.endswith(".L"):  return "LSE"
+    if ticker.endswith(".T"):  return "TSE"
+    if ticker.endswith(".HK"): return "HKEX"
+    if ticker.endswith(".AX"): return "ASX"
+    if ticker.endswith(".TO"): return "TSX"
+    if ticker.endswith(".DE"): return "XETRA"
+    if ticker.endswith("-USD"): return "CRYPTO"
+    return "US"

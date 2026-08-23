@@ -38,26 +38,26 @@ TRACKED_ASSETS = PRELOADED_ASSETS[:]
 
 # Sector/company metadata for the 20 preloaded stocks (used for intelligence cards)
 ASSET_METADATA: dict[str, dict] = {
-    "AAPL":  {"name": "Apple Inc.",             "sector": "Technology",          "emoji": "🍎"},
-    "MSFT":  {"name": "Microsoft Corp.",         "sector": "Technology",          "emoji": "🪟"},
-    "NVDA":  {"name": "NVIDIA Corp.",            "sector": "Semiconductors",      "emoji": "🖥️"},
-    "GOOGL": {"name": "Alphabet Inc.",           "sector": "Communication",       "emoji": "🔍"},
-    "META":  {"name": "Meta Platforms",          "sector": "Communication",       "emoji": "📘"},
-    "TSLA":  {"name": "Tesla Inc.",              "sector": "Electric Vehicles",   "emoji": "⚡"},
-    "AMZN":  {"name": "Amazon.com Inc.",         "sector": "Consumer Tech",       "emoji": "📦"},
-    "JPM":   {"name": "JPMorgan Chase",          "sector": "Financials",          "emoji": "🏦"},
-    "V":     {"name": "Visa Inc.",               "sector": "Financials",          "emoji": "💳"},
-    "JNJ":   {"name": "Johnson & Johnson",       "sector": "Healthcare",          "emoji": "💊"},
-    "XOM":   {"name": "ExxonMobil Corp.",        "sector": "Energy",              "emoji": "⛽"},
-    "SPY":   {"name": "SPDR S&P 500 ETF",        "sector": "ETF — Broad Market",  "emoji": "📈"},
-    "QQQ":   {"name": "Invesco QQQ ETF",         "sector": "ETF — Tech",          "emoji": "💡"},
-    "GLD":   {"name": "SPDR Gold Shares",        "sector": "Commodity — Gold",    "emoji": "🥇"},
-    "COIN":  {"name": "Coinbase Global",         "sector": "Crypto-Equity",       "emoji": "₿"},
-    "NFLX":  {"name": "Netflix Inc.",            "sector": "Entertainment",       "emoji": "🎬"},
-    "AMD":   {"name": "Advanced Micro Devices",  "sector": "Semiconductors",      "emoji": "🔬"},
-    "BKNG":  {"name": "Booking Holdings",        "sector": "Travel",              "emoji": "✈️"},
-    "LLY":   {"name": "Eli Lilly & Co.",         "sector": "Pharma",              "emoji": "🧬"},
-    "TSM":   {"name": "Taiwan Semiconductor",    "sector": "Semiconductors",      "emoji": "🇹🇼"},
+    "AAPL":  {"name": "Apple Inc.",             "sector": "Technology"},
+    "MSFT":  {"name": "Microsoft Corp.",         "sector": "Technology"},
+    "NVDA":  {"name": "NVIDIA Corp.",            "sector": "Semiconductors"},
+    "GOOGL": {"name": "Alphabet Inc.",           "sector": "Communication"},
+    "META":  {"name": "Meta Platforms",          "sector": "Communication"},
+    "TSLA":  {"name": "Tesla Inc.",              "sector": "Electric Vehicles"},
+    "AMZN":  {"name": "Amazon.com Inc.",         "sector": "Consumer Tech"},
+    "JPM":   {"name": "JPMorgan Chase",          "sector": "Financials"},
+    "V":     {"name": "Visa Inc.",               "sector": "Financials"},
+    "JNJ":   {"name": "Johnson & Johnson",       "sector": "Healthcare"},
+    "XOM":   {"name": "ExxonMobil Corp.",        "sector": "Energy"},
+    "SPY":   {"name": "SPDR S&P 500 ETF",        "sector": "ETF - Broad Market"},
+    "QQQ":   {"name": "Invesco QQQ ETF",         "sector": "ETF - Tech"},
+    "GLD":   {"name": "SPDR Gold Shares",        "sector": "Commodity - Gold"},
+    "COIN":  {"name": "Coinbase Global",         "sector": "Crypto-Equity"},
+    "NFLX":  {"name": "Netflix Inc.",            "sector": "Entertainment"},
+    "AMD":   {"name": "Advanced Micro Devices",  "sector": "Semiconductors"},
+    "BKNG":  {"name": "Booking Holdings",        "sector": "Travel"},
+    "LLY":   {"name": "Eli Lilly & Co.",         "sector": "Pharma"},
+    "TSM":   {"name": "Taiwan Semiconductor",    "sector": "Semiconductors"},
 }
 
 # ---------------------------------------------------------------------------
@@ -376,7 +376,6 @@ def generate_signals(assets: list[str] | None = None) -> dict:
             "insight": _generate_insight(signal_type, feats_dict, spin_val, asset),
             "company_name": ASSET_METADATA.get(asset, {}).get("name", asset),
             "sector": ASSET_METADATA.get(asset, {}).get("sector", ""),
-            "emoji": ASSET_METADATA.get(asset, {}).get("emoji", "📊"),
         })
 
     total_ms = (time.perf_counter() - t0) * 1000.0
@@ -511,7 +510,6 @@ def compute_single_asset(ticker: str) -> dict | None:
         "insight": _generate_insight(signal_type, feats, spin, ticker),
         "company_name": ASSET_METADATA.get(ticker, {}).get("name", ticker),
         "sector": ASSET_METADATA.get(ticker, {}).get("sector", ""),
-        "emoji": ASSET_METADATA.get(ticker, {}).get("emoji", "📊"),
     }
 
     _ondemand_cache[ticker] = {"signal": result, "fetched_at": now}
@@ -534,7 +532,7 @@ def _generate_insight(signal_type: str, feats: dict, spin: float, ticker: str) -
     elif rsi < 45:
         parts.append(f"RSI at {rsi:.0f} shows bearish pressure easing")
     elif rsi > 70:
-        parts.append(f"RSI at {rsi:.0f} — overbought, watch for pullback")
+        parts.append(f"RSI at {rsi:.0f} - overbought, watch for pullback")
     elif rsi > 60:
         parts.append(f"RSI at {rsi:.0f} indicates bullish momentum")
     else:
@@ -562,14 +560,14 @@ def _generate_insight(signal_type: str, feats: dict, spin: float, ticker: str) -
 
     # Volatility
     if bb_w > 0.08:
-        parts.append("Bollinger bands wide — elevated volatility, position size carefully")
+        parts.append("Bollinger bands wide - elevated volatility, position size carefully")
     elif bb_w < 0.02:
-        parts.append("Bollinger bands narrow — potential breakout approaching")
+        parts.append("Bollinger bands narrow - potential breakout approaching")
 
     # SBA spin context
     if abs(spin) > 0.7:
         parts.append(f"SBA spin {spin:+.2f} shows strong cross-asset consensus")
     elif abs(spin) < 0.2:
-        parts.append("SBA spin near zero — mixed cross-asset signals")
+        parts.append("SBA spin near zero - mixed cross-asset signals")
 
     return ". ".join(parts[:3]) + "."  # keep to 3 most informative

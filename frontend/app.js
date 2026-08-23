@@ -560,21 +560,21 @@ document.getElementById('logout-btn').addEventListener('click', () => {
   location.reload();
 });
 
-// ── 20 preloaded assets — always available without a search ────────────────
-// Any OTHER ticker (e.g. RELIANCE.NS, BTC-USD, TSMC, SAP.DE, etc.) can be
-// searched in real time via the search bar and fetched live from Yahoo Finance.
+// -- 20 preloaded assets — always available without a search -------------------
+// Any OTHER ticker (e.g. RELIANCE.NS, BTC-USD, SAP.DE) can be searched in
+// real time via the search bar and fetched live from Yahoo Finance.
 const ASSET_GROUPS = [
-  { label: '🖥️  Technology',       prefix: ['AAPL','MSFT','NVDA','GOOGL','META','AMD'] },
-  { label: '⚡  EV & Consumer',    prefix: ['TSLA','AMZN'] },
-  { label: '🏦  Financials',       prefix: ['JPM','V'] },
-  { label: '💊  Healthcare',       prefix: ['JNJ','LLY'] },
-  { label: '⛽  Energy',           prefix: ['XOM'] },
-  { label: '📈  ETFs',            prefix: ['SPY','QQQ'] },
-  { label: '🥇  Commodities',     prefix: ['GLD'] },
-  { label: '₿   Crypto-Equity',   prefix: ['COIN'] },
-  { label: '🎬  Entertainment',   prefix: ['NFLX'] },
-  { label: '✈️  Travel',          prefix: ['BKNG'] },
-  { label: '🇹🇼  Semiconductors', prefix: ['TSM'] },
+  { label: 'Technology',        prefix: ['AAPL','MSFT','NVDA','GOOGL','META','AMD'] },
+  { label: 'EV & Consumer',     prefix: ['TSLA','AMZN'] },
+  { label: 'Financials',        prefix: ['JPM','V'] },
+  { label: 'Healthcare',        prefix: ['JNJ','LLY'] },
+  { label: 'Energy',            prefix: ['XOM'] },
+  { label: 'ETFs',              prefix: ['SPY','QQQ'] },
+  { label: 'Commodities',       prefix: ['GLD'] },
+  { label: 'Crypto-Equity',     prefix: ['COIN'] },
+  { label: 'Entertainment',     prefix: ['NFLX'] },
+  { label: 'Travel',            prefix: ['BKNG'] },
+  { label: 'Semiconductors',    prefix: ['TSM'] },
 ];
 
 function buildAssetOptions(trackedAssets) {
@@ -986,9 +986,8 @@ function _injectOnDemandCard(sig) {
   const confPct   = Math.min(100, Math.max(0, Math.round(Number(sig.confidence) * 100)));
   const rawPrice  = Number(sig.last_price);
   const price     = rawPrice.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawPrice < 1 ? 6 : 2 });
-  const exchFlags = { US:'🇺🇸',NSE:'🇮🇳',LSE:'🇬🇧',XETRA:'🇩🇪',TSE:'🇯🇵',HKEX:'🇭🇰',ASX:'🇦🇺',TSX:'🇨🇦',CRYPTO:'₿' };
-  const flag      = exchFlags[sig.exchange || 'US'] || '🌐';
-  const emoji     = escapeHtml(sig.emoji || '📊');
+  const exchCodes = { US:'[US]',NSE:'[NSE]',LSE:'[LSE]',XETRA:'[XETRA]',TSE:'[TSE]',HKEX:'[HKEX]',ASX:'[ASX]',TSX:'[TSX]',CRYPTO:'[CRYPTO]' };
+  const flag      = exchCodes[sig.exchange || 'US'] || '[INTL]';
   const companyName = escapeHtml(sig.company_name || rawAsset);
   const sector    = escapeHtml(sig.sector || '');
   const insight   = escapeHtml(sig.insight || '');
@@ -1019,8 +1018,8 @@ function _injectOnDemandCard(sig) {
   div.innerHTML = `
     <div class="sig-header">
       <div>
-        <div class="sig-company-name">${emoji} ${companyName}</div>
-        <div class="asset">${asset} <span style="font-size:13px">${flag}</span>${sector ? ` <span class="sig-sector-pill">${sector}</span>` : ''}</div>
+        <div class="sig-company-name">${companyName}</div>
+        <div class="asset">${asset} <span class="sig-exch-code">${flag}</span>${sector ? ` <span class="sig-sector-pill">${sector}</span>` : ''}</div>
         <div class="price">${price} ${changePct != null ? `<span class="sig-change ${changeClass}">${changeStr}</span>` : ''}</div>
       </div>
       <div style="display:flex;align-items:flex-start;gap:8px">
@@ -1031,14 +1030,14 @@ function _injectOnDemandCard(sig) {
     <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
     <div class="confidence-label"><span>Confidence</span><span><b>${confPct}%</b></span></div>
     ${rangeBarHtml}
-    ${insight ? `<div class="sig-insight">💡 ${insight}</div>` : ''}
+    ${insight ? `<div class="sig-insight">Insight: ${insight}</div>` : ''}
     <div class="features-row">
       <span title="Relative Strength Index">RSI <b>${rsi}</b></span>
       <span title="20-day Momentum">Mom <b>${mom}%</b></span>
       <span title="MACD Histogram">MACD <b>${macd}</b></span>
       <span title="Bollinger Width">BBW <b>${bbw}</b></span>
     </div>
-    <div class="sig-live-badge">⚡ LIVE · Yahoo Finance</div>
+    <div class="sig-live-badge">LIVE · Yahoo Finance</div>
   `;
   grid.prepend(div);
   requestAnimationFrame(() => { div.querySelector('.confidence-fill').style.width = confPct + '%'; });
@@ -1492,9 +1491,8 @@ function _renderSignalGrid(grid, signals, fromCache) {
     const confPct   = Math.min(100, Math.max(0, Math.round(Number(s.confidence) * 100)));
     const rawP      = Number(s.last_price);
     const price     = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawP < 1 ? 6 : 2 });
-    const exchFlags = { US:'🇺🇸',NSE:'🇮🇳',LSE:'🇬🇧',XETRA:'🇩🇪',TSE:'🇯🇵',HKEX:'🇭🇰',ASX:'🇦🇺',TSX:'🇨🇦',CRYPTO:'₿' };
-    const flag      = exchFlags[s.exchange || 'US'] || '🌐';
-    const emoji     = escapeHtml(s.emoji || '📊');
+    const exchCodes = { US:'[US]',NSE:'[NSE]',LSE:'[LSE]',XETRA:'[XETRA]',TSE:'[TSE]',HKEX:'[HKEX]',ASX:'[ASX]',TSX:'[TSX]',CRYPTO:'[CRYPTO]' };
+    const flag      = exchCodes[s.exchange || 'US'] || '[INTL]';
     const companyName = escapeHtml(s.company_name || String(s.asset));
     const sector    = escapeHtml(s.sector || '');
     const insight   = escapeHtml(s.insight || '');
@@ -1502,8 +1500,8 @@ function _renderSignalGrid(grid, signals, fromCache) {
     <div class="signal-card sig-${sigType}" id="signal-${asset}" style="animation-delay:${i * 40}ms">
       <div class="sig-header">
         <div>
-          <div class="sig-company-name">${emoji} ${companyName}</div>
-          <div class="asset">${asset} <span style="font-size:13px">${flag}</span>${sector ? ` <span class="sig-sector-pill">${sector}</span>` : ''}</div>
+          <div class="sig-company-name">${companyName}</div>
+          <div class="asset">${asset} <span class="sig-exch-code">${flag}</span>${sector ? ` <span class="sig-sector-pill">${sector}</span>` : ''}</div>
           <div class="price">${price}</div>
         </div>
         <div style="display:flex;align-items:flex-start;gap:8px">
@@ -1513,7 +1511,7 @@ function _renderSignalGrid(grid, signals, fromCache) {
       </div>
       <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
       <div class="confidence-label"><span>Confidence</span><span><b>${confPct}%</b></span></div>
-      ${insight ? `<div class="sig-insight">💡 ${insight}</div>` : ''}
+      ${insight ? `<div class="sig-insight">Insight: ${insight}</div>` : ''}
       <div class="features-row">
         <span title="Relative Strength Index">RSI <b>${rsi}</b></span>
         <span title="20-day Momentum">Mom <b>${mom}%</b></span>

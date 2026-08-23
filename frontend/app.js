@@ -335,7 +335,12 @@ async function afterLogin(data) {
   const authCanvas = document.getElementById('auth-bg-canvas');
   const appCanvas  = document.getElementById('app-bg-canvas');
   if (authCanvas) { authCanvas.style.opacity = '0'; setTimeout(() => { authCanvas.style.display = 'none'; }, 600); }
-  if (appCanvas)  { appCanvas.style.display = ''; setTimeout(() => QS3D?.init('app-bg-canvas', 'dashboard'), 100); }
+  if (appCanvas)  {
+    appCanvas.style.display = '';
+    // Use window.QS3D?.init to gracefully handle the case where bg3d.js hasn't
+    // fully executed yet (e.g. slow network, script load race with defer attribute).
+    setTimeout(() => window.QS3D?.init('app-bg-canvas', 'dashboard'), 100);
+  }
   await performHandshake({ showOverlay: true });
   document.getElementById('app').classList.remove('hidden');
   document.getElementById('user-email').textContent = state.user.email;
@@ -1240,7 +1245,11 @@ function connectSignalStream() {
 
   if (!state.token || state.signalSocket) return;
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socket = new WebSocket(`${scheme}//${location.host}/api/signals/stream`, ['qs', state.token]);
+  // URL-encode the JWT to prevent header parse failures on tokens with
+  // special characters ('+', '/', '=') that are not valid in WS subprotocol values.
+  // The server decodes it identically since it only calls decode_access_token().
+  const safeToken = encodeURIComponent(state.token);
+  const socket = new WebSocket(`${scheme}//${location.host}/api/signals/stream`, ['qs', safeToken]);
   state.signalSocket = socket;
   setLiveIndicator('reconnecting');
   socket.onopen = () => { state.signalReconnectMs = 1000; setLiveIndicator('connected'); };
@@ -1386,10 +1395,11 @@ async function loadDashboard(isPoll, streamedSignals = null) {
   if (signals.watchlist?.length) _saveWatchlistToStorage(signals.watchlist);
 
   const genTime = new Date(signals.generated_at * 1000).toLocaleTimeString();
+  // total_assets = full preloaded count; n_assets = currently displayed (filtered to watchlist)
   const totalAssets = signals.total_assets ?? signals.n_assets;
   document.getElementById('signal-meta').innerHTML =
     `Engine: ${signals.pipeline_ms} ms &middot; SBA: ${signals.sba_ms} ms &middot; ` +
-    `<span class="signal-count-chip">${signals.n_assets} watched &middot; ${totalAssets} tracked</span> ` +
+    `<span class="signal-count-chip">${signals.n_assets} in view &middot; ${totalAssets} generated</span> ` +
     `&middot; ${escapeHtml(genTime)} <span class="signal-age" id="signal-age-live"></span>` +
     (signals.error ? ` &middot; <span style="color:var(--red)">&#9888; ${escapeHtml(signals.error)}</span>` : '');
   _startSignalAgeClock(signals.generated_at);
@@ -1425,7 +1435,8 @@ function _renderSignalGrid(grid, signals, fromCache) {
     const rsi = s.features?.rsi != null ? Number(s.features.rsi).toFixed(1) : 'N/A';
     const mom = s.features?.momentum != null ? (Number(s.features.momentum) * 100).toFixed(1) : 'N/A';
     const macd = s.features?.macd_histogram != null ? Number(s.features.macd_histogram).toFixed(3) : 'N/A';
-    const confPct = Math.round(Number(s.confidence) * 100);
+    // Clamp to [0,100] — confidence is [0,1] but floating-point can exceed 1.0
+    const confPct = Math.min(100, Math.max(0, Math.round(Number(s.confidence) * 100)));
     const price = Number(s.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
     return `
     <div class="signal-card sig-${sigType}" id="signal-${asset}" style="animation-delay:${i * 40}ms">
@@ -1688,18 +1699,22 @@ async function loadPortfolio(isPoll) {
 
   const list = document.getElementById('positions-list');
   list.innerHTML = positions.map((p, i) => {
-    const asset   = escapeHtml(String(p.asset));
-    const qty     = Number(p.quantity);
-    const entry   = Number(p.avg_entry_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-    const pnl     = Number(p.unrealized_pnl);
-    const pnlFmt  = pnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });
-    const pnlClass = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const asset    = escapeHtml(String(p.asset));
+    const qty      = Number(p.quantity);
+    const entry    = Number(p.avg_entry_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+    const uPnl     = Number(p.unrealized_pnl);
+    const rPnl     = Number(p.realized_pnl || 0);
+    const uPnlFmt  = uPnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });
+    const rPnlFmt  = rPnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });
+    const uClass   = uPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const rClass   = rPnl >= 0 ? 'pnl-pos' : 'pnl-neg';
     return `
     <div class="pos-row" style="animation-delay:${i * 50}ms">
       <span style="font-weight:600">${asset}</span>
       <span>${qty} sh</span>
       <span>${entry} avg</span>
-      <span class="${pnlClass}">${pnlFmt}</span>
+      <span class="${uClass}" title="Unrealized P&amp;L">${uPnlFmt} <small style="opacity:.65;font-size:10px">unrl.</small></span>
+      ${rPnl !== 0 ? `<span class="${rClass}" title="Realized P&amp;L">${rPnlFmt} <small style="opacity:.65;font-size:10px">rlzd.</small></span>` : ''}
     </div>`;
   }).join('') || '<div class="empty-state">No open positions.</div>';
 

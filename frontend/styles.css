@@ -120,6 +120,12 @@ a:hover { color: var(--accent-hi); text-decoration: underline; }
   transition: opacity .6s ease;
 }
 .bg-canvas.vivid { opacity: 0.28; }  /* auth screen = more prominent */
+/* Dark-mode override: force-dark browsers invert the palette so light particles
+   become nearly invisible at 0.18. Raise to a readable level. */
+@media (prefers-color-scheme: dark) {
+  .bg-canvas       { opacity: 0.55; }
+  .bg-canvas.vivid { opacity: 0.70; }
+}
 
 /* Skeleton */
 .skeleton { background: linear-gradient(90deg, var(--s2) 25%, var(--s3) 50%, var(--s2) 75%);
@@ -507,7 +513,7 @@ h3 { font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spaci
 .metric-box:hover { border-color: var(--b2); box-shadow: var(--sh-sm); transform: translateY(-2px); }
 .metric-box .val { font-family: var(--f-mono); font-size: 22px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -0.5px; line-height: 1.2; }
 .metric-box .lbl { font-family: var(--f-ui); font-size: 10px; color: var(--text-3); margin-top: 5px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; }
-.positions-list .pos-row { display: grid; grid-template-columns: 1.6fr 1fr 1.3fr 1fr; align-items: center; padding: 9px 4px; border-bottom: 1px solid var(--b0); font-family: var(--f-mono); font-size: 11.5px; animation: fadeUp .24s ease both; transition: background .1s; font-variant-numeric: tabular-nums; }
+.positions-list .pos-row { display: grid; grid-template-columns: 1.6fr 0.8fr 1.2fr 1fr 1fr; align-items: center; padding: 9px 4px; border-bottom: 1px solid var(--b0); font-family: var(--f-mono); font-size: 11.5px; animation: fadeUp .24s ease both; transition: background .1s; font-variant-numeric: tabular-nums; }
 .positions-list .pos-row:hover { background: var(--s1); }
 .positions-list .pos-row:last-child { border-bottom: none; }
 .pnl-pos { color: var(--green); font-weight: 600; }

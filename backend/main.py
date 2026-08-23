@@ -461,7 +461,11 @@ async def signal_stream(websocket: WebSocket):
     """
     origin = websocket.headers.get("origin")
     protocols = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
-    token = protocols[1] if len(protocols) == 2 and protocols[0] == "qs" else None
+    raw_token = protocols[1] if len(protocols) == 2 and protocols[0] == "qs" else None
+    # URL-decode: frontend sends encodeURIComponent(jwt) to avoid header parse issues
+    # with JWT special chars (+, /, =). Decode before verification.
+    from urllib.parse import unquote
+    token = unquote(raw_token) if raw_token else None
     payload = auth_service.decode_access_token(token) if token else None
     # FIX: When CORS_ORIGINS contains "*" (dev mode), skip origin check.
     # A literal `origin not in ["*"]` always fails for specific origin strings.

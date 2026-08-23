@@ -527,7 +527,7 @@ def set_watchlist(
     valid = set(signal_engine.TRACKED_ASSETS)
     cleaned = [str(t).upper() for t in tickers if str(t).upper() in valid]
     if not cleaned:
-        raise HTTPException(400, "No valid tracked tickers provided")
+        raise HTTPException(400, "No recognized tickers provided")
     if len(cleaned) > 50:
         raise HTTPException(400, "Watchlist limited to 50 assets")
     db_user = db.get(models.User, user.id)
@@ -545,7 +545,7 @@ def add_to_watchlist(
     """Add a single ticker to the user's watchlist."""
     ticker = ticker.upper()
     if ticker not in signal_engine.TRACKED_ASSETS:
-        raise HTTPException(404, f"{ticker} is not in the tracked asset universe")
+        raise HTTPException(404, f"{ticker} is not a recognized tradable instrument")
     current = _user_watchlist(user)
     if ticker in current:
         return {"watchlist": current, "message": f"{ticker} already in watchlist"}

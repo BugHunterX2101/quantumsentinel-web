@@ -612,13 +612,28 @@ function buildAssetOptions(trackedAssets) {
 
 async function bootstrapApp() {
   applyBeginnerMode();
-  state.meta = await api('/api/meta');
+
+  // C6: Resilient meta fetch — a /api/meta failure must not block the whole app.
+  // Graceful defaults let the user still trade and navigate, with degraded exchange data.
+  const META_DEFAULTS = {
+    tracked_assets: [
+      ...ASSET_GROUPS.flatMap(g => g.prefix),
+    ],
+    exchanges: [],
+    version: 'unknown',
+  };
+  try {
+    state.meta = await api('/api/meta');
+  } catch (err) {
+    console.warn('bootstrapApp: /api/meta failed, using defaults:', err.message);
+    state.meta = META_DEFAULTS;
+  }
   // Populate exchange map from meta (avoids extra round-trip)
   if (state.meta.exchanges) {
     _exchangeData = state.meta.exchanges;
     state.exchanges = state.meta.exchanges;
   }
-  const assetHtml = buildAssetOptions(state.meta.tracked_assets);
+  const assetHtml = buildAssetOptions(state.meta.tracked_assets || META_DEFAULTS.tracked_assets);
   const sel = document.getElementById('order-asset');
   sel.innerHTML = assetHtml;
   document.getElementById('strategy-asset').innerHTML = assetHtml;

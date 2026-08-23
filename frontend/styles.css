@@ -453,7 +453,55 @@ h3 { font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spaci
 .signal-card.sig-HOLD .confidence-fill { background: var(--amber); }
 .confidence-label { display: flex; justify-content: space-between; font-family: var(--f-mono); font-size: 9.5px; color: var(--text-3); margin-top: 5px; }
 .confidence-label b { color: var(--text-2); }
-.features-row { display: flex; justify-content: space-between; font-family: var(--f-mono); font-size: 9.5px; color: var(--text-3); margin-top: 10px; border-top: 1px solid var(--b0); padding-top: 8px; letter-spacing: .1px; }
+.features-row { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px; font-family: var(--f-mono); font-size: 9.5px; color: var(--text-3); margin-top: 10px; border-top: 1px solid var(--b0); padding-top: 8px; letter-spacing: .1px; }
+.features-row span b { color: var(--text-2); }
+
+/* ── Intelligence card elements ──────────────────────────────────────────── */
+.sig-company-name {
+  font-family: var(--f-ui); font-size: 11.5px; font-weight: 700;
+  color: var(--text-2); margin-bottom: 2px; letter-spacing: .1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px;
+}
+.sig-sector-pill {
+  display: inline-block; font-family: var(--f-ui); font-size: 8.5px; font-weight: 700;
+  letter-spacing: .5px; text-transform: uppercase; padding: 1px 6px;
+  background: var(--s2); border: 1px solid var(--b1); border-radius: 20px;
+  color: var(--text-3); margin-left: 5px; vertical-align: middle;
+  transition: background .14s, color .14s;
+}
+.signal-card:hover .sig-sector-pill { background: var(--s3); color: var(--text-2); }
+.sig-insight {
+  font-family: var(--f-ui); font-size: 10.5px; color: var(--text-3); line-height: 1.5;
+  background: var(--s1); border: 1px solid var(--b0); border-radius: var(--r-sm);
+  padding: 7px 10px; margin: 8px 0 6px; border-left: 2px solid var(--accent-light);
+  animation: fadeUp .3s ease both;
+}
+.sig-change { font-family: var(--f-mono); font-size: 10px; font-weight: 700; margin-left: 6px; }
+.sig-change.positive { color: var(--green); }
+.sig-change.negative { color: var(--red); }
+
+/* 52-week range bar */
+.sig-range-wrap {
+  display: flex; align-items: center; gap: 5px; margin: 8px 0 4px;
+  font-family: var(--f-mono); font-size: 8.5px; color: var(--text-3);
+}
+.sig-range-bar {
+  flex: 1; height: 3px; background: var(--s3); border-radius: 2px;
+  position: relative; overflow: visible;
+}
+.sig-range-fill {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 2px var(--bg);
+}
+.sig-range-lo, .sig-range-hi { font-variant-numeric: tabular-nums; }
+
+/* Live badge */
+.sig-live-badge {
+  font-family: var(--f-mono); font-size: 8.5px; color: var(--accent);
+  letter-spacing: .6px; margin-top: 9px; text-transform: uppercase; opacity: .8;
+}
+
 
 /* Grids */
 .trading-grid, .portfolio-grid, .security-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }

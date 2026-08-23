@@ -520,16 +520,40 @@ def set_watchlist(
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Replace the full watchlist. Body: {"watchlist": ["AAPL","MSFT", ...]}"""
+    """Replace the full watchlist. Body: {"watchlist": ["AAPL","MSFT", ...]}
+    
+    Accepts any ticker that Yahoo Finance can resolve — not limited to the 20
+    preloaded stocks. Unknown tickers are validated via a fast yfinance probe.
+    """
+    import yfinance as yf
     tickers = body.get("watchlist", [])
     if not isinstance(tickers, list):
         raise HTTPException(400, "watchlist must be a list")
-    valid = set(signal_engine.TRACKED_ASSETS)
-    cleaned = [str(t).upper() for t in tickers if str(t).upper() in valid]
+    if len(tickers) > 50:
+        raise HTTPException(400, "Watchlist limited to 50 assets")
+    
+    cleaned: list[str] = []
+    preloaded_set = set(signal_engine.PRELOADED_ASSETS)
+    for raw in tickers:
+        t = str(raw).upper().strip()
+        if not t:
+            continue
+        # Preloaded assets are always valid — no need to probe
+        if t in preloaded_set:
+            cleaned.append(t)
+            continue
+        # For unknown tickers, do a fast yfinance probe (history returns non-empty if valid)
+        try:
+            probe = yf.Ticker(t)
+            info = probe.fast_info
+            if getattr(info, 'last_price', None) is not None:
+                cleaned.append(t)
+        except Exception:
+            pass  # skip invalid tickers silently
+    
     if not cleaned:
         raise HTTPException(400, "No recognized tickers provided")
-    if len(cleaned) > 50:
-        raise HTTPException(400, "Watchlist limited to 50 assets")
+    
     db_user = db.get(models.User, user.id)
     db_user.watchlist = cleaned
     db.commit()
@@ -542,15 +566,29 @@ def add_to_watchlist(
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Add a single ticker to the user's watchlist."""
-    ticker = ticker.upper()
-    if ticker not in signal_engine.TRACKED_ASSETS:
-        raise HTTPException(404, f"{ticker} is not a recognized tradable instrument")
+    """Add a single ticker to the user's watchlist.
+    
+    Accepts any ticker that Yahoo Finance can resolve — not limited to preloaded assets.
+    """
+    import yfinance as yf
+    ticker = ticker.upper().strip()
     current = _user_watchlist(user)
     if ticker in current:
         return {"watchlist": current, "message": f"{ticker} already in watchlist"}
     if len(current) >= 50:
         raise HTTPException(400, "Watchlist limited to 50 assets")
+    
+    # Validate: preloaded assets are always valid; others are probed via yfinance
+    if ticker not in signal_engine.PRELOADED_ASSETS:
+        try:
+            probe = yf.Ticker(ticker)
+            if getattr(probe.fast_info, 'last_price', None) is None:
+                raise HTTPException(404, f"{ticker} is not a recognized tradable instrument")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(404, f"{ticker} is not a recognized tradable instrument")
+    
     current.append(ticker)
     db_user = db.get(models.User, user.id)
     db_user.watchlist = current

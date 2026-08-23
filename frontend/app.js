@@ -560,34 +560,21 @@ document.getElementById('logout-btn').addEventListener('click', () => {
   location.reload();
 });
 
-// Asset categories for grouped dropdown.
-// IMPORTANT: keep in sync with signal_engine.TRACKED_ASSETS — stale tickers
-// produce empty optgroups in the watchlist modal.
+// ── 20 preloaded assets — always available without a search ────────────────
+// Any OTHER ticker (e.g. RELIANCE.NS, BTC-USD, TSMC, SAP.DE, etc.) can be
+// searched in real time via the search bar and fetched live from Yahoo Finance.
 const ASSET_GROUPS = [
-  { label: 'Technology', prefix: ['AAPL','MSFT','NVDA','GOOGL','GOOG','META','TSLA','AVGO','ORCL','ADBE','CRM','INTC','AMD','QCOM','TXN','MU','AMAT','KLAC','LRCX','SNPS','CDNS','MRVL','PANW','CRWD','ZS','NET','FTNT','OKTA','DDOG','SNOW','PLTR','UBER','LYFT','ABNB','BKNG','EXPE','SHOP','PYPL','AFRM'] },
-  { label: 'Communication & Media', prefix: ['NFLX','DIS','CMCSA','T','VZ','TMUS','CHTR','WBD','PARA','FOXA'] },
-  { label: 'Consumer Discretionary', prefix: ['AMZN','HD','LOW','TGT','WMT','COST','SBUX','MCD','YUM','NKE','LULU','DECK','TPR','RL','PVH','ANF'] },
-  { label: 'Consumer Staples', prefix: ['PG','KO','PEP','PM','MO','MDLZ','GIS','KHC','CPB','CAG'] },
-  { label: 'Financials', prefix: ['JPM','BAC','WFC','GS','MS','C','BLK','SCHW','AXP','V','MA','COF','ALLY','SYF','USB','PNC','TFC','RF','KEY'] },
-  { label: 'Healthcare & Pharma', prefix: ['JNJ','UNH','LLY','PFE','ABBV','MRK','TMO','ABT','DHR','BMY','AMGN','GILD','BIIB','REGN','VRTX','MRNA','BNTX','IQV','SYK','EW'] },
-  { label: 'Energy', prefix: ['XOM','CVX','COP','SLB','EOG','DVN','MPC','PSX','VLO','HAL'] },
-  { label: 'Industrials', prefix: ['BA','CAT','GE','HON','LMT','RTX','NOC','GD','MMM','UPS','FDX','DE','EMR','ETN','PH','ROK','IR','CARR','OTIS'] },
-  { label: 'Materials', prefix: ['LIN','APD','SHW','FCX','NEM','AA','ALB','MP','VALE'] },
-  { label: 'Real Estate (REITs)', prefix: ['AMT','PLD','CCI','EQIX','PSA','SPG','O','VICI','AVB','EQR'] },
-  { label: 'Utilities', prefix: ['NEE','DUK','SO','D','AEP','XEL','PCG','EXC','ED','FE'] },
-  { label: 'ETFs — Broad Market', prefix: ['SPY','QQQ','IWM','DIA','VTI','VOO','VEA','VWO','EFA','EEM'] },
-  { label: 'ETFs — Sector', prefix: ['XLK','XLF','XLV','XLE','XLI','XLY','XLP','XLB','XLRE','XLU'] },
-  { label: 'ETFs — Fixed Income & Commodities', prefix: ['GLD','SLV','USO','TLT','IEF','HYG','LQD','BND','AGG','TIPS'] },
-  { label: 'International ADRs', prefix: ['TSM','ASML','SAP','NVO','BABA','JD','PDD','BIDU','SE','GRAB','SONY','TM','HMC','NTDOY','LI','NIO'] },
-  { label: 'Crypto-Equity Proxies', prefix: ['COIN','MSTR','MARA','RIOT','CLSK','HUT','WULF'] },
-  { label: 'Indian Equities (NSE)', prefix: ['RELIANCE.NS','TCS.NS','INFY.NS','HDFCBANK.NS','HINDUNILVR.NS','ICICIBANK.NS','BHARTIARTL.NS','ITC.NS','KOTAKBANK.NS','LT.NS','WIPRO.NS','BAJFINANCE.NS','HCLTECH.NS','SBIN.NS','AXISBANK.NS','MARUTI.NS','SUNPHARMA.NS','TATAMOTORS.NS','ONGC.NS','NTPC.NS'] },
-  { label: 'UK Equities (LSE)', prefix: ['HSBA.L','BP.L','SHEL.L','AZN.L','GSK.L','RIO.L','VOD.L','ULVR.L','LLOY.L','BARC.L'] },
-  { label: 'German Equities (Xetra)', prefix: ['SAP.DE','SIE.DE','BAYER.DE','ALV.DE','BMW.DE','MBG.DE','VOW3.DE','MUV2.DE','BAS.DE','ADS.DE'] },
-  { label: 'Japanese Equities (TSE)', prefix: ['7203.T','6758.T','9984.T','8306.T','6861.T','7974.T','4063.T','8035.T','4502.T','9432.T'] },
-  { label: 'Hong Kong Equities (HKEX)', prefix: ['9988.HK','0700.HK','9999.HK','1810.HK','3690.HK','2318.HK','0941.HK','1299.HK','0005.HK','0939.HK'] },
-  { label: 'Australian Equities (ASX)', prefix: ['CBA.AX','BHP.AX','NAB.AX','WBC.AX','ANZ.AX','CSL.AX','WES.AX','MQG.AX','TLS.AX','FMG.AX'] },
-  { label: 'Canadian Equities (TSX)', prefix: ['RY.TO','TD.TO','BNS.TO','BMO.TO','CNR.TO','CP.TO','SU.TO','ENB.TO','CNQ.TO','SHOP.TO'] },
-  { label: 'Crypto Spot', prefix: ['BTC-USD','ETH-USD','SOL-USD','BNB-USD','ADA-USD','XRP-USD','DOGE-USD','AVAX-USD','DOT-USD','MATIC-USD'] },
+  { label: '🖥️  Technology',       prefix: ['AAPL','MSFT','NVDA','GOOGL','META','AMD'] },
+  { label: '⚡  EV & Consumer',    prefix: ['TSLA','AMZN'] },
+  { label: '🏦  Financials',       prefix: ['JPM','V'] },
+  { label: '💊  Healthcare',       prefix: ['JNJ','LLY'] },
+  { label: '⛽  Energy',           prefix: ['XOM'] },
+  { label: '📈  ETFs',            prefix: ['SPY','QQQ'] },
+  { label: '🥇  Commodities',     prefix: ['GLD'] },
+  { label: '₿   Crypto-Equity',   prefix: ['COIN'] },
+  { label: '🎬  Entertainment',   prefix: ['NFLX'] },
+  { label: '✈️  Travel',          prefix: ['BKNG'] },
+  { label: '🇹🇼  Semiconductors', prefix: ['TSM'] },
 ];
 
 function buildAssetOptions(trackedAssets) {
@@ -989,47 +976,72 @@ async function _selectTicker(ticker, isLive) {
 function _injectOnDemandCard(sig) {
   const grid = document.getElementById('signal-grid');
   if (!grid) return;
-  // Use raw ticker for DOM id (escapeHtml would break getElementById lookups)
-  const rawAsset = String(sig.asset);
-  const asset = escapeHtml(rawAsset);
-  const sigType = escapeHtml(String(sig.signal_type));
-  const rsi  = sig.features?.rsi != null ? Number(sig.features.rsi).toFixed(1) : 'N/A';
-  const mom  = sig.features?.momentum != null ? (Number(sig.features.momentum) * 100).toFixed(1) : 'N/A';
-  const macd = sig.features?.macd_histogram != null ? Number(sig.features.macd_histogram).toFixed(3) : 'N/A';
-  const confPct = Math.min(100, Math.max(0, Math.round(Number(sig.confidence) * 100)));
-  const rawPrice = Number(sig.last_price);
-  const price = rawPrice.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawPrice < 1 ? 6 : 2 });
+  const rawAsset  = String(sig.asset);
+  const asset     = escapeHtml(rawAsset);
+  const sigType   = escapeHtml(String(sig.signal_type));
+  const rsi       = sig.features?.rsi != null ? Number(sig.features.rsi).toFixed(1) : 'N/A';
+  const mom       = sig.features?.momentum != null ? (Number(sig.features.momentum) * 100).toFixed(1) : 'N/A';
+  const macd      = sig.features?.macd_histogram != null ? Number(sig.features.macd_histogram).toFixed(3) : 'N/A';
+  const bbw       = sig.features?.bb_width != null ? Number(sig.features.bb_width).toFixed(3) : 'N/A';
+  const confPct   = Math.min(100, Math.max(0, Math.round(Number(sig.confidence) * 100)));
+  const rawPrice  = Number(sig.last_price);
+  const price     = rawPrice.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawPrice < 1 ? 6 : 2 });
   const exchFlags = { US:'🇺🇸',NSE:'🇮🇳',LSE:'🇬🇧',XETRA:'🇩🇪',TSE:'🇯🇵',HKEX:'🇭🇰',ASX:'🇦🇺',TSX:'🇨🇦',CRYPTO:'₿' };
-  const flag = exchFlags[sig.exchange || 'US'] || '🌐';
+  const flag      = exchFlags[sig.exchange || 'US'] || '🌐';
+  const emoji     = escapeHtml(sig.emoji || '📊');
+  const companyName = escapeHtml(sig.company_name || rawAsset);
+  const sector    = escapeHtml(sig.sector || '');
+  const insight   = escapeHtml(sig.insight || '');
+  const changePct = sig.change_pct != null ? Number(sig.change_pct) : null;
+  const changeStr = changePct != null ? `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%` : '';
+  const changeClass = changePct != null ? (changePct >= 0 ? 'positive' : 'negative') : '';
 
-  // Remove existing card if any (use raw asset for id lookup)
+  // 52-week range bar position
+  let rangeBarHtml = '';
+  if (sig.high_52w && sig.low_52w && sig.high_52w > sig.low_52w) {
+    const pct = Math.min(100, Math.max(0, ((rawPrice - sig.low_52w) / (sig.high_52w - sig.low_52w)) * 100));
+    const lo  = rawPrice < 1 ? sig.low_52w.toFixed(4) : sig.low_52w.toFixed(2);
+    const hi  = rawPrice < 1 ? sig.high_52w.toFixed(4) : sig.high_52w.toFixed(2);
+    rangeBarHtml = `
+      <div class="sig-range-wrap">
+        <span class="sig-range-label">52W</span>
+        <div class="sig-range-bar"><div class="sig-range-fill" style="left:${pct.toFixed(1)}%"></div></div>
+        <span class="sig-range-lo">$${lo}</span>–<span class="sig-range-hi">$${hi}</span>
+      </div>`;
+  }
+
   const old = document.getElementById(`signal-${rawAsset}`);
   if (old) old.remove();
 
   const div = document.createElement('div');
   div.className = `signal-card sig-${sigType} on-demand-card flash-update`;
-  div.id = `signal-${rawAsset}`;  // raw id for getElementById compatibility
-  div.style.border = '2px solid var(--accent-light)';
+  div.id = `signal-${rawAsset}`;
   div.innerHTML = `
     <div class="sig-header">
       <div>
-        <div class="asset">${asset} <span style="font-size:14px;">${flag}</span></div>
-        <div class="price">${price}</div>
+        <div class="sig-company-name">${emoji} ${companyName}</div>
+        <div class="asset">${asset} <span style="font-size:13px">${flag}</span>${sector ? ` <span class="sig-sector-pill">${sector}</span>` : ''}</div>
+        <div class="price">${price} ${changePct != null ? `<span class="sig-change ${changeClass}">${changeStr}</span>` : ''}</div>
       </div>
-      <div style="display:flex;align-items:center;gap:8px;">
+      <div style="display:flex;align-items:flex-start;gap:8px">
         <span class="badge ${sigType}">${sigType}</span>
         <button class="bookmark-btn" data-ticker="${asset}" title="Add ${asset} to watchlist">☆</button>
       </div>
     </div>
     <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
     <div class="confidence-label"><span>Confidence</span><span><b>${confPct}%</b></span></div>
-    <div class="features-row"><span>RSI ${rsi}</span><span>Mom ${mom}%</span><span>MACD ${macd}</span></div>
-    <div style="font-family:var(--f-mono);font-size:9px;color:var(--accent);margin-top:8px;letter-spacing:.5px;">⚡ LIVE FETCH · Yahoo Finance</div>
+    ${rangeBarHtml}
+    ${insight ? `<div class="sig-insight">💡 ${insight}</div>` : ''}
+    <div class="features-row">
+      <span title="Relative Strength Index">RSI <b>${rsi}</b></span>
+      <span title="20-day Momentum">Mom <b>${mom}%</b></span>
+      <span title="MACD Histogram">MACD <b>${macd}</b></span>
+      <span title="Bollinger Width">BBW <b>${bbw}</b></span>
+    </div>
+    <div class="sig-live-badge">⚡ LIVE · Yahoo Finance</div>
   `;
   grid.prepend(div);
-  requestAnimationFrame(() => {
-    div.querySelector('.confidence-fill').style.width = confPct + '%';
-  });
+  requestAnimationFrame(() => { div.querySelector('.confidence-fill').style.width = confPct + '%'; });
   div.querySelector('.bookmark-btn').addEventListener('click', () => addToWatchlist(sig.asset));
   div.scrollIntoView({ behavior: 'smooth', block: 'start' });
   toast('Signal fetched', `Live data loaded for ${sig.asset} — ${sigType} @ ${price}`, 'success', 3500);
@@ -1471,33 +1483,42 @@ function _renderSignalGrid(grid, signals, fromCache) {
   }
 
   grid.innerHTML = sigList.map((s, i) => {
-    const asset = escapeHtml(String(s.asset));
-    const sigType = escapeHtml(String(s.signal_type));
-    const rsi = s.features?.rsi != null ? Number(s.features.rsi).toFixed(1) : 'N/A';
-    const mom = s.features?.momentum != null ? (Number(s.features.momentum) * 100).toFixed(1) : 'N/A';
-    const macd = s.features?.macd_histogram != null ? Number(s.features.macd_histogram).toFixed(3) : 'N/A';
-    // Clamp to [0,100] — confidence is [0,1] but floating-point can exceed 1.0
-    const confPct = Math.min(100, Math.max(0, Math.round(Number(s.confidence) * 100)));
-    const rawP = Number(s.last_price);
-    const price = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawP < 1 ? 6 : 2 });
+    const asset     = escapeHtml(String(s.asset));
+    const sigType   = escapeHtml(String(s.signal_type));
+    const rsi       = s.features?.rsi != null ? Number(s.features.rsi).toFixed(1) : 'N/A';
+    const mom       = s.features?.momentum != null ? (Number(s.features.momentum) * 100).toFixed(1) : 'N/A';
+    const macd      = s.features?.macd_histogram != null ? Number(s.features.macd_histogram).toFixed(3) : 'N/A';
+    const bbw       = s.features?.bb_width != null ? Number(s.features.bb_width).toFixed(3) : 'N/A';
+    const confPct   = Math.min(100, Math.max(0, Math.round(Number(s.confidence) * 100)));
+    const rawP      = Number(s.last_price);
+    const price     = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawP < 1 ? 6 : 2 });
+    const exchFlags = { US:'🇺🇸',NSE:'🇮🇳',LSE:'🇬🇧',XETRA:'🇩🇪',TSE:'🇯🇵',HKEX:'🇭🇰',ASX:'🇦🇺',TSX:'🇨🇦',CRYPTO:'₿' };
+    const flag      = exchFlags[s.exchange || 'US'] || '🌐';
+    const emoji     = escapeHtml(s.emoji || '📊');
+    const companyName = escapeHtml(s.company_name || String(s.asset));
+    const sector    = escapeHtml(s.sector || '');
+    const insight   = escapeHtml(s.insight || '');
     return `
     <div class="signal-card sig-${sigType}" id="signal-${asset}" style="animation-delay:${i * 40}ms">
       <div class="sig-header">
         <div>
-          <div class="asset">${asset}</div>
+          <div class="sig-company-name">${emoji} ${companyName}</div>
+          <div class="asset">${asset} <span style="font-size:13px">${flag}</span>${sector ? ` <span class="sig-sector-pill">${sector}</span>` : ''}</div>
           <div class="price">${price}</div>
         </div>
-        <div style="display:flex;align-items:center;gap:8px;">
+        <div style="display:flex;align-items:flex-start;gap:8px">
           <span class="badge ${sigType}">${sigType}</span>
           <button class="bookmark-btn bookmarked" data-ticker="${asset}" title="Remove ${asset} from watchlist">&#9733;</button>
         </div>
       </div>
       <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
       <div class="confidence-label"><span>Confidence</span><span><b>${confPct}%</b></span></div>
+      ${insight ? `<div class="sig-insight">💡 ${insight}</div>` : ''}
       <div class="features-row">
-        <span>RSI ${rsi}</span>
-        <span>Mom ${mom}%</span>
-        <span>MACD ${macd}</span>
+        <span title="Relative Strength Index">RSI <b>${rsi}</b></span>
+        <span title="20-day Momentum">Mom <b>${mom}%</b></span>
+        <span title="MACD Histogram">MACD <b>${macd}</b></span>
+        <span title="Bollinger Width">BBW <b>${bbw}</b></span>
       </div>
     </div>`;
   }).join('') || '<div class="empty-state">Signals loading — engine is warming up for your watchlist&hellip;</div>';

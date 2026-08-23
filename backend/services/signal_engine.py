@@ -30,110 +30,58 @@ PRELOADED_ASSETS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Full universe catalogue — used for search autocomplete & exchange mapping.
-# Signals are NOT pre-computed for this entire list; they are fetched on-demand.
+# TRACKED_ASSETS = only the 20 preloaded stocks.
+# Any other ticker a user searches is fetched LIVE on demand via
+# compute_single_asset() — no hardcoded universe catalogue needed.
 # ---------------------------------------------------------------------------
-TRACKED_ASSETS = [
-    # ══ NYSE / NASDAQ (US) ════════════════════════════════════════════════════
-    # Technology
-    "AAPL","MSFT","NVDA","GOOGL","GOOG","META","TSLA","AVGO","ORCL","ADBE",
-    "CRM","INTC","AMD","QCOM","TXN","MU","AMAT","KLAC","LRCX","SNPS",
-    "CDNS","MRVL","PANW","CRWD","ZS","NET","FTNT","OKTA","DDOG","SNOW",
-    "PLTR","UBER","LYFT","ABNB","BKNG","EXPE","PYPL","AFRM","SHOP",
-    # Communication & Media
-    "NFLX","DIS","CMCSA","T","VZ","TMUS","CHTR","WBD","PARA","FOXA",
-    # Consumer Discretionary
-    "AMZN","HD","LOW","TGT","WMT","COST","SBUX","MCD","YUM",
-    "NKE","LULU","DECK","TPR","RL","PVH","ANF",
-    # Consumer Staples
-    "PG","KO","PEP","PM","MO","MDLZ","GIS","KHC","CPB","CAG",
-    # Financials
-    "JPM","BAC","WFC","GS","MS","C","BLK","SCHW","AXP","V",
-    "MA","COF","ALLY","SYF","USB","PNC","TFC","RF","KEY",
-    # Healthcare & Pharma
-    "JNJ","UNH","LLY","PFE","ABBV","MRK","TMO","ABT","DHR","BMY",
-    "AMGN","GILD","BIIB","REGN","VRTX","MRNA","BNTX","IQV","SYK","EW",
-    # Energy
-    "XOM","CVX","COP","SLB","EOG","DVN","MPC","PSX","VLO","HAL",
-    # Industrials
-    "BA","CAT","GE","HON","LMT","RTX","NOC","GD","MMM","UPS",
-    "FDX","DE","EMR","ETN","PH","ROK","IR","CARR","OTIS",
-    # Materials
-    "LIN","APD","SHW","FCX","NEM","AA","ALB","MP","VALE",
-    # Real Estate (REITs)
-    "AMT","PLD","CCI","EQIX","PSA","SPG","O","VICI","AVB","EQR",
-    # Utilities
-    "NEE","DUK","SO","D","AEP","XEL","PCG","EXC","ED","FE",
-    # Broad Market ETFs
-    "SPY","QQQ","IWM","DIA","VTI","VOO","VEA","VWO","EFA","EEM",
-    "XLK","XLF","XLV","XLE","XLI","XLY","XLP","XLB","XLRE","XLU",
-    "GLD","SLV","USO","TLT","IEF","HYG","LQD","BND","AGG","TIPS",
-    # US-listed ADRs
-    "TSM","ASML","SAP","NVO","BABA","JD","PDD","BIDU","SE","GRAB",
-    "SONY","TM","HMC","NTDOY","LI","NIO",
-    # Crypto-equity proxies
-    "COIN","MSTR","MARA","RIOT","CLSK","HUT","WULF",
+TRACKED_ASSETS = PRELOADED_ASSETS[:]
 
-    # ══ NSE / BSE (India) ═════════════════════════════════════════════════════
-    "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","HINDUNILVR.NS",
-    "ICICIBANK.NS","BHARTIARTL.NS","ITC.NS","KOTAKBANK.NS","LT.NS",
-    "WIPRO.NS","BAJFINANCE.NS","HCLTECH.NS","SBIN.NS","AXISBANK.NS",
-    "MARUTI.NS","SUNPHARMA.NS","TATAMOTORS.NS","ONGC.NS","NTPC.NS",
+# Sector/company metadata for the 20 preloaded stocks (used for intelligence cards)
+ASSET_METADATA: dict[str, dict] = {
+    "AAPL":  {"name": "Apple Inc.",             "sector": "Technology",          "emoji": "🍎"},
+    "MSFT":  {"name": "Microsoft Corp.",         "sector": "Technology",          "emoji": "🪟"},
+    "NVDA":  {"name": "NVIDIA Corp.",            "sector": "Semiconductors",      "emoji": "🖥️"},
+    "GOOGL": {"name": "Alphabet Inc.",           "sector": "Communication",       "emoji": "🔍"},
+    "META":  {"name": "Meta Platforms",          "sector": "Communication",       "emoji": "📘"},
+    "TSLA":  {"name": "Tesla Inc.",              "sector": "Electric Vehicles",   "emoji": "⚡"},
+    "AMZN":  {"name": "Amazon.com Inc.",         "sector": "Consumer Tech",       "emoji": "📦"},
+    "JPM":   {"name": "JPMorgan Chase",          "sector": "Financials",          "emoji": "🏦"},
+    "V":     {"name": "Visa Inc.",               "sector": "Financials",          "emoji": "💳"},
+    "JNJ":   {"name": "Johnson & Johnson",       "sector": "Healthcare",          "emoji": "💊"},
+    "XOM":   {"name": "ExxonMobil Corp.",        "sector": "Energy",              "emoji": "⛽"},
+    "SPY":   {"name": "SPDR S&P 500 ETF",        "sector": "ETF — Broad Market",  "emoji": "📈"},
+    "QQQ":   {"name": "Invesco QQQ ETF",         "sector": "ETF — Tech",          "emoji": "💡"},
+    "GLD":   {"name": "SPDR Gold Shares",        "sector": "Commodity — Gold",    "emoji": "🥇"},
+    "COIN":  {"name": "Coinbase Global",         "sector": "Crypto-Equity",       "emoji": "₿"},
+    "NFLX":  {"name": "Netflix Inc.",            "sector": "Entertainment",       "emoji": "🎬"},
+    "AMD":   {"name": "Advanced Micro Devices",  "sector": "Semiconductors",      "emoji": "🔬"},
+    "BKNG":  {"name": "Booking Holdings",        "sector": "Travel",              "emoji": "✈️"},
+    "LLY":   {"name": "Eli Lilly & Co.",         "sector": "Pharma",              "emoji": "🧬"},
+    "TSM":   {"name": "Taiwan Semiconductor",    "sector": "Semiconductors",      "emoji": "🇹🇼"},
+}
 
-    # ══ LSE (UK) ══════════════════════════════════════════════════════════════
-    "HSBA.L","BP.L","SHEL.L","AZN.L","GSK.L",
-    "RIO.L","VOD.L","ULVR.L","LLOY.L","BARC.L",
+# ---------------------------------------------------------------------------
+# Exchange inference — works for ANY ticker (not just preloaded)
+# ---------------------------------------------------------------------------
+def infer_exchange(ticker: str) -> str:
+    """Infer the exchange for any ticker by its suffix."""
+    t = ticker.upper()
+    if t.endswith(".NS") or t.endswith(".BO"): return "NSE"
+    if t.endswith(".L"):   return "LSE"
+    if t.endswith(".T"):   return "TSE"
+    if t.endswith(".HK"):  return "HKEX"
+    if t.endswith(".AX"):  return "ASX"
+    if t.endswith(".TO"):  return "TSX"
+    if t.endswith(".DE") or t.endswith(".F") or t.endswith(".MU"): return "XETRA"
+    if t.endswith("-USD") or t.endswith("-BTC") or t.endswith("-ETH"): return "CRYPTO"
+    return "US"
 
-    # ══ TSE (Japan) ═══════════════════════════════════════════════════════════
-    "7203.T","6758.T","9984.T","8306.T","6861.T",
-    "7974.T","4063.T","8035.T","4502.T","9432.T",
+# Build the exchange map for the 20 preloaded assets
+ASSET_EXCHANGE_MAP: dict[str, str] = {t: infer_exchange(t) for t in TRACKED_ASSETS}
 
-    # ══ HKEX (Hong Kong) ══════════════════════════════════════════════════════
-    "9988.HK","0700.HK","9999.HK","1810.HK","3690.HK",
-    "2318.HK","0941.HK","1299.HK","0005.HK","0939.HK",
-
-    # ══ ASX (Australia) ═══════════════════════════════════════════════════════
-    "CBA.AX","BHP.AX","NAB.AX","WBC.AX","ANZ.AX",
-    "CSL.AX","WES.AX","MQG.AX","TLS.AX","FMG.AX",
-
-    # ══ TSX (Canada) ══════════════════════════════════════════════════════════
-    "RY.TO","TD.TO","BNS.TO","BMO.TO","CNR.TO",
-    "CP.TO","SU.TO","ENB.TO","CNQ.TO","SHOP.TO",
-
-    # ══ Xetra (Germany / EU) ══════════════════════════════════════════════════
-    "SAP.DE","SIE.DE","BAYER.DE","ALV.DE","BMW.DE",
-    "MBG.DE","VOW3.DE","MUV2.DE","BAS.DE","ADS.DE",
-
-    # ══ Crypto Spot (24/7) ════════════════════════════════════════════════════
-    "BTC-USD","ETH-USD","SOL-USD","BNB-USD","ADA-USD",
-    "XRP-USD","DOGE-USD","AVAX-USD","DOT-USD","MATIC-USD",
-]
-
-# Asset → exchange mapping for market hours
-ASSET_EXCHANGE_MAP = {}
-def _build_exchange_map():
-    rules = [
-        ("US",  lambda t: not any(t.endswith(x) for x in [".NS",".L",".T",".HK",".AX",".TO",".DE","-USD"])),
-        ("NSE", lambda t: t.endswith(".NS")),
-        ("LSE", lambda t: t.endswith(".L")),
-        ("TSE", lambda t: t.endswith(".T")),
-        ("HKEX",lambda t: t.endswith(".HK")),
-        ("ASX", lambda t: t.endswith(".AX")),
-        ("TSX", lambda t: t.endswith(".TO")),
-        ("XETRA",lambda t: t.endswith(".DE")),
-        ("CRYPTO",lambda t: t.endswith("-USD")),
-    ]
-    for ticker in TRACKED_ASSETS:
-        for exch, test in rules:
-            if test(ticker):
-                ASSET_EXCHANGE_MAP[ticker] = exch
-                break
-
-_build_exchange_map()
-
-# Alias: for cache generation use PRELOADED_ASSETS; TRACKED_ASSETS = full catalogue
 def get_preloaded_assets() -> list[str]:
     return PRELOADED_ASSETS[:]
+
 
 N_STEPS = 200     # More iterations → better convergence
 DT = 0.05         # Smaller step → more stable dynamics
@@ -406,20 +354,29 @@ def generate_signals(assets: list[str] | None = None) -> dict:
     signals = []
     for i, asset in enumerate(valid_assets):
         signal_type, confidence = score_signal(float(spins[i]), rsis[asset])
+        close_arr_last = closes_last[asset]
+        feats_dict = {
+            k: round(v, 4) for k, v in zip(
+                ["rsi", "macd_histogram", "momentum", "bb_width"],
+                feature_rows[i],
+            )
+        }
+        spin_val = float(spins[i])
         signals.append({
             "asset": asset,
             "signal_type": signal_type,
             "confidence": round(confidence, 4),
-            "spin": round(float(spins[i]), 4),
-            "last_price": round(closes_last[asset], 2),
-            "features": {
-                k: round(v, 4) for k, v in zip(
-                    ["rsi", "macd_histogram", "momentum", "bb_width"],
-                    feature_rows[i],
-                )
-            },
+            "spin": round(spin_val, 4),
+            "last_price": round(close_arr_last, 6 if close_arr_last < 1 else 2),
+            "features": feats_dict,
             "sba_iterations": N_STEPS,
             "engine_version": "1.1.0-python-sba",
+            "exchange": ASSET_EXCHANGE_MAP.get(asset, infer_exchange(asset)),
+            # Intelligence fields — same as on-demand
+            "insight": _generate_insight(signal_type, feats_dict, spin_val, asset),
+            "company_name": ASSET_METADATA.get(asset, {}).get("name", asset),
+            "sector": ASSET_METADATA.get(asset, {}).get("sector", ""),
+            "emoji": ASSET_METADATA.get(asset, {}).get("emoji", "📊"),
         })
 
     total_ms = (time.perf_counter() - t0) * 1000.0
@@ -541,26 +498,78 @@ def compute_single_asset(ticker: str) -> dict | None:
         "signal_type": signal_type,
         "confidence": round(confidence, 4),
         "spin": round(spin, 4),
-        "last_price": round(float(close[-1]), 2),
+        "last_price": round(float(close[-1]), 6 if float(close[-1]) < 1 else 2),
+        "change_pct": round(float((close[-1] - close[-2]) / close[-2] * 100), 2) if len(close) > 1 else 0.0,
+        "high_52w": round(float(np.max(close)), 2),
+        "low_52w":  round(float(np.min(close)), 2),
         "features": {k: round(v, 4) for k, v in feats.items()},
-        "sba_iterations": 1,  # simplified single-asset mode
+        "sba_iterations": 1,
         "engine_version": "1.1.0-python-sba",
         "on_demand": True,
-        "exchange": ASSET_EXCHANGE_MAP.get(ticker, _infer_exchange(ticker)),
+        "exchange": ASSET_EXCHANGE_MAP.get(ticker, infer_exchange(ticker)),
+        # Intelligence fields
+        "insight": _generate_insight(signal_type, feats, spin, ticker),
+        "company_name": ASSET_METADATA.get(ticker, {}).get("name", ticker),
+        "sector": ASSET_METADATA.get(ticker, {}).get("sector", ""),
+        "emoji": ASSET_METADATA.get(ticker, {}).get("emoji", "📊"),
     }
 
     _ondemand_cache[ticker] = {"signal": result, "fetched_at": now}
     return result
 
 
-def _infer_exchange(ticker: str) -> str:
-    """Infer exchange from ticker suffix for unknown tickers."""
-    if ticker.endswith(".NS"): return "NSE"
-    if ticker.endswith(".L"):  return "LSE"
-    if ticker.endswith(".T"):  return "TSE"
-    if ticker.endswith(".HK"): return "HKEX"
-    if ticker.endswith(".AX"): return "ASX"
-    if ticker.endswith(".TO"): return "TSX"
-    if ticker.endswith(".DE"): return "XETRA"
-    if ticker.endswith("-USD"): return "CRYPTO"
-    return "US"
+def _generate_insight(signal_type: str, feats: dict, spin: float, ticker: str) -> str:
+    """Generate a human-readable AI-style insight explaining the signal."""
+    rsi    = feats.get("rsi", 50.0)
+    macd   = feats.get("macd_histogram", 0.0)
+    mom    = feats.get("momentum", 0.0)
+    bb_w   = feats.get("bollinger_width", 0.0)
+    mom_pct = round(mom * 100, 1)
+
+    parts: list[str] = []
+
+    # RSI interpretation
+    if rsi < 35:
+        parts.append(f"RSI at {rsi:.0f} signals deep oversold territory")
+    elif rsi < 45:
+        parts.append(f"RSI at {rsi:.0f} shows bearish pressure easing")
+    elif rsi > 70:
+        parts.append(f"RSI at {rsi:.0f} — overbought, watch for pullback")
+    elif rsi > 60:
+        parts.append(f"RSI at {rsi:.0f} indicates bullish momentum")
+    else:
+        parts.append(f"RSI at {rsi:.0f} is neutral")
+
+    # MACD interpretation
+    if macd > 0.002:
+        parts.append("MACD histogram turning positive (bullish crossover)")
+    elif macd > 0:
+        parts.append("MACD slightly positive")
+    elif macd < -0.002:
+        parts.append("MACD histogram negative (bearish crossover)")
+    else:
+        parts.append("MACD near zero")
+
+    # Momentum
+    if mom > 0.05:
+        parts.append(f"20-day momentum strongly positive ({mom_pct:+.1f}%)")
+    elif mom > 0:
+        parts.append(f"20-day momentum slightly positive ({mom_pct:+.1f}%)")
+    elif mom < -0.05:
+        parts.append(f"20-day momentum sharply negative ({mom_pct:+.1f}%)")
+    else:
+        parts.append(f"momentum slightly negative ({mom_pct:+.1f}%)")
+
+    # Volatility
+    if bb_w > 0.08:
+        parts.append("Bollinger bands wide — elevated volatility, position size carefully")
+    elif bb_w < 0.02:
+        parts.append("Bollinger bands narrow — potential breakout approaching")
+
+    # SBA spin context
+    if abs(spin) > 0.7:
+        parts.append(f"SBA spin {spin:+.2f} shows strong cross-asset consensus")
+    elif abs(spin) < 0.2:
+        parts.append("SBA spin near zero — mixed cross-asset signals")
+
+    return ". ".join(parts[:3]) + "."  # keep to 3 most informative

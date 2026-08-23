@@ -439,6 +439,14 @@ document.addEventListener('keydown', (e) => {
   if (idx >= 0 && idx < VIEW_KEYS.length) switchView(VIEW_KEYS[idx]);
 });
 
+// ── Browser back/forward support ────────────────────────────────
+window.addEventListener('popstate', () => {
+  const hashView = location.hash.replace('#', '');
+  if (VIEW_KEYS.includes(hashView) && hashView !== state.activeView) {
+    switchView(hashView);
+  }
+});
+
 // ── Confirmation modal helper ───────────────────────────────────
 function confirmAction(title, body) {
   return new Promise((resolve) => {
@@ -463,8 +471,12 @@ function confirmAction(title, body) {
   });
 }
 
-const PAGE_TITLES = { dashboard:'Dashboard', trading:'Trading', strategies:'Strategies',
-  portfolio:'Portfolio', security:'Security', integrations:'Integrations', community:'Community' };
+const PAGE_TITLES = { dashboard:'Dashboard', trading:'Order Desk', strategies:'Strategies',
+  portfolio:'Portfolio', security:'Security', integrations:'Integrations', community:'Open Source' };
+
+// Smart freshness gate — skip re-fetching data if the view was loaded < 5s ago
+const _viewLastLoaded = {};
+const _VIEW_FRESHNESS_MS = 5000;
 
 function switchView(view) {
   state.activeView = view;
@@ -479,8 +491,12 @@ function switchView(view) {
   // Breadcrumb
   const titleEl = document.getElementById('page-title');
   if (titleEl) titleEl.textContent = PAGE_TITLES[view] || view;
-  // URL hash (back-button support)
-  history.replaceState(null, '', '#' + view);
+  // URL hash — pushState on first visit (enables back-button), replaceState on revisit
+  if (location.hash.replace('#', '') !== view) {
+    history.pushState(null, '', '#' + view);
+  } else {
+    history.replaceState(null, '', '#' + view);
+  }
   // Beginner banner
   const banners = {
     dashboard: 'Tip: BUY signals with higher confidence bars indicate stronger multi-asset agreement. Use keys 1–7 to navigate.',
@@ -492,20 +508,28 @@ function switchView(view) {
   const banner = document.getElementById('beginner-banner');
   if (state.beginner && banners[view]) { banner.textContent = banners[view]; banner.classList.remove('hidden'); }
   else banner.classList.add('hidden');
-  if (view === 'dashboard')   loadDashboard();
-  if (view === 'trading')     loadTrading();
-  if (view === 'strategies')  loadStrategies();
-  if (view === 'portfolio')   loadPortfolio();
-  if (view === 'security')    loadSecurity();
-  if (view === 'integrations') loadIntegrations();
-  if (view === 'community')   loadCommunity();
+
+  // Smart data loading — skip if view was loaded < 5s ago to avoid redundant API calls
+  const now = Date.now();
+  const fresh = (_viewLastLoaded[view] && (now - _viewLastLoaded[view]) < _VIEW_FRESHNESS_MS);
+  _viewLastLoaded[view] = now;
+
+  if (!fresh) {
+    if (view === 'dashboard')   loadDashboard();
+    if (view === 'trading')     loadTrading();
+    if (view === 'strategies')  loadStrategies();
+    if (view === 'portfolio')   loadPortfolio();
+    if (view === 'security')    loadSecurity();
+    if (view === 'integrations') loadIntegrations();
+    if (view === 'community')   loadCommunity();
+  }
   restartPolling();
 }
 
 function restartPolling() {
   if (state.pollTimer) clearInterval(state.pollTimer);
   // community tab fetches from GitHub API — exclude from polling to avoid rate-limits
-  const loaders = { dashboard: loadDashboard, trading: refreshOrders, strategies: loadStrategies, portfolio: loadPortfolio, security: loadSecurity, integrations: loadIntegrations };
+  const loaders = { dashboard: () => loadDashboard(true), trading: () => refreshOrders(true), strategies: loadStrategies, portfolio: () => loadPortfolio(true), security: () => loadSecurity(true), integrations: loadIntegrations };
   const fn = loaders[state.activeView];
   if (!fn) return;
   // Poll every 30s on dashboard (aligns with backend CACHE_TTL_SECONDS=30), 20s elsewhere
@@ -889,7 +913,8 @@ function _renderDropdownItems(items, liveSignal) {
 
   if (liveSignal) {
     const sig = liveSignal;
-    const price = Number(sig.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
+    const rawLivePrice = Number(sig.last_price);
+    const price = rawLivePrice.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawLivePrice < 1 ? 6 : 2 });
     const ex = sig.exchange || 'US';
     html += `<div class="asd-group-label">Live result — fetched from Yahoo Finance</div>
       <div class="asd-item" data-ticker="${escapeHtml(sig.asset)}" data-live="1">
@@ -957,7 +982,8 @@ function _injectOnDemandCard(sig) {
   const mom  = sig.features?.momentum != null ? (Number(sig.features.momentum) * 100).toFixed(1) : 'N/A';
   const macd = sig.features?.macd_histogram != null ? Number(sig.features.macd_histogram).toFixed(3) : 'N/A';
   const confPct = Math.min(100, Math.max(0, Math.round(Number(sig.confidence) * 100)));
-  const price = Number(sig.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
+  const rawPrice = Number(sig.last_price);
+  const price = rawPrice.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawPrice < 1 ? 6 : 2 });
   const exchFlags = { US:'🇺🇸',NSE:'🇮🇳',LSE:'🇬🇧',XETRA:'🇩🇪',TSE:'🇯🇵',HKEX:'🇭🇰',ASX:'🇦🇺',TSX:'🇨🇦',CRYPTO:'₿' };
   const flag = exchFlags[sig.exchange || 'US'] || '🌐';
 
@@ -1437,7 +1463,8 @@ function _renderSignalGrid(grid, signals, fromCache) {
     const macd = s.features?.macd_histogram != null ? Number(s.features.macd_histogram).toFixed(3) : 'N/A';
     // Clamp to [0,100] — confidence is [0,1] but floating-point can exceed 1.0
     const confPct = Math.min(100, Math.max(0, Math.round(Number(s.confidence) * 100)));
-    const price = Number(s.last_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+    const rawP = Number(s.last_price);
+    const price = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawP < 1 ? 6 : 2 });
     return `
     <div class="signal-card sig-${sigType}" id="signal-${asset}" style="animation-delay:${i * 40}ms">
       <div class="sig-header">
@@ -1714,7 +1741,7 @@ async function loadPortfolio(isPoll) {
       <span>${qty} sh</span>
       <span>${entry} avg</span>
       <span class="${uClass}" title="Unrealized P&amp;L">${uPnlFmt} <small style="opacity:.65;font-size:10px">unrl.</small></span>
-      ${rPnl !== 0 ? `<span class="${rClass}" title="Realized P&amp;L">${rPnlFmt} <small style="opacity:.65;font-size:10px">rlzd.</small></span>` : ''}
+      <span class="${rClass}" title="Realized P&amp;L">${rPnlFmt} <small style="opacity:.65;font-size:10px">rlzd.</small></span>
     </div>`;
   }).join('') || '<div class="empty-state">No open positions.</div>';
 
@@ -1910,7 +1937,10 @@ document.getElementById('api-key-form').addEventListener('submit', async (event)
     const result = await api('/api/integrations/api-keys', { method: 'POST', body: JSON.stringify({
       name: document.getElementById('api-key-name').value, scopes: selectedValues('api-key-scopes'),
     }) });
-    document.getElementById('api-key-secret').textContent = `Copy this API key now; it will not be shown again: ${result.api_key}`;
+    const secretEl = document.getElementById('api-key-secret');
+    secretEl.textContent = `Copy this API key now; it will not be shown again: ${result.api_key}`;
+    // Auto-clear API key from display after 60 seconds for security
+    setTimeout(() => { if (secretEl.textContent.includes(result.api_key)) secretEl.textContent = 'API key cleared from display for security.'; }, 60000);
     await loadIntegrations();
   } finally { setButtonLoading(btn, false); }
 });

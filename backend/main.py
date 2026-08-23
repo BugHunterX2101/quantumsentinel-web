@@ -144,7 +144,7 @@ async def security_headers_and_rate_limit(request, call_next):
     principal_hash = hashlib.sha256(principal.encode()).hexdigest()[:16] if principal else client
     key = f"{principal_hash}:{request.url.path}"
     now = time.monotonic()
-    limit = 20 if request.url.path.startswith("/api/auth/") else 240
+    limit = 10 if request.url.path.startswith("/api/auth/") else 240
     current = 0
     if _redis_client:
         try:
@@ -182,7 +182,7 @@ async def security_headers_and_rate_limit(request, call_next):
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data:; "
-        "connect-src 'self' wss: ws: https://api.github.com https://api.pwnedpasswords.com; "
+        "connect-src 'self' wss://self ws://self https://api.github.com https://api.pwnedpasswords.com; "
         "frame-ancestors 'none'; base-uri 'self'"
     )
     return response
@@ -613,6 +613,10 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     for ft in filled_trades:
         notional = float(ft.quantity) * float(ft.filled_price or 0)
         cash -= notional if ft.side == "buy" else -notional
+    # Floor cash at zero — a negative balance means over-leveraged. Use the
+    # larger of actual cash and a $5k minimum for equity so the 5% cap
+    # doesn't collapse to zero but also doesn't create phantom buying power.
+    cash = max(0.0, cash)
     account_equity = max(5_000.0, cash)
     position_cap = account_equity * 0.05
     if req.side == "buy" and req.quantity * price_for_risk > position_cap:

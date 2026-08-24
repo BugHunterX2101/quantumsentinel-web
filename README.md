@@ -597,25 +597,6 @@ docker compose up --build -d
 curl http://localhost:8000/health/ready
 ```
 
----
-
-## Changelog
-
-### Real-Time Intelligence Update (August 2026)
-
-- **`/api/price/{ticker}`** -- Always-live price endpoint with 5s micro-cache using yfinance `fast_info`. Returns price, daily change %, currency, and data age.
-- **`/api/asset/info/{ticker}`** -- Rich instrument metadata: type (EQUITY/ETF/CRYPTO), exchange code, market-open/closed status (timezone-aware), fractional share eligibility, 24/7 trading flag.
-- **Dynamic Order Desk** -- Asset-info bar renders immediately on ticker change. Live price polled every 10s while Order Desk is open. Market-closed warning shown for market orders outside trading hours.
-- **Signal cache TTLs reduced** -- Preloaded: 30s -> 20s; On-demand: 30s -> 15s for near-real-time accuracy.
-- **Emoji-free UI** -- All emoji removed from signal cards, group labels, insight text, and badges for a clean, professional interface.
-- **Custom Checkbox Groups** -- Permission Scopes and Event Subscriptions replaced with fully styled checkbox lists matching the dark premium theme. CSS-only animated checkmarks.
-- **Exchange code badges** -- Country flags replaced with compact text badges: `[US]`, `[NSE]`, `[LSE]`, `[CRYPTO]`, etc.
-- **AI Insight text** -- Each signal card displays a human-readable paragraph covering RSI, MACD, momentum, volatility, and SBA cross-asset consensus.
-- **Smarter search** -- `/api/signals/search` now returns company names, sectors, and treats the raw query itself as a candidate so any world ticker can be searched.
-- **`_market_is_open()`** -- Timezone-aware market hours check for all 8 major exchanges + 24/7 for crypto.
-
----
-
 ## Contributing
 
 Contributions are welcome. Good first issues are tagged on [GitHub Issues](https://github.com/BugHunterX2101/quantumsentinel-web/issues?q=label%3A%22good+first+issue%22).

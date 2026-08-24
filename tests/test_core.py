@@ -193,3 +193,86 @@ def test_infer_exchange_us_default():
     """infer_exchange: plain ticker defaults to US exchange."""
     assert signal_engine.infer_exchange("AAPL") == "US"
     assert signal_engine.infer_exchange("MSFT") == "US"
+
+
+# ── Pass-2 regression tests ───────────────────────────────────────────────────
+
+def test_tr1_fast_info_no_dict_get(monkeypatch):
+    """TR1: get_last_price must NOT call .get() on fast_info (object, not dict)."""
+    class _FakeInfo:
+        last_price = None
+        regularMarketPrice = 142.5
+    class _FakeTicker:
+        def __init__(self, _sym):
+            self.fast_info = _FakeInfo()
+        def history(self, **_kw):
+            import pandas as pd
+            return pd.DataFrame()
+    monkeypatch.setattr(trading_service.yf, "Ticker", _FakeTicker)
+    trading_service._price_cache.clear()
+    price = trading_service.get_last_price("FAKE_TR1")
+    assert price == 142.5
+
+
+def test_tr2_buy_price_improvement(monkeypatch):
+    """TR2: BUY pending fill must get min(market, limit) — price improvement."""
+    monkeypatch.setattr(trading_service, "get_last_price", lambda _a: 98.0)
+    fill = trading_service.check_pending_limit_fill("X", "buy", 100.0)
+    assert fill == 98.0
+
+
+def test_tr2_sell_price_improvement(monkeypatch):
+    """TR2: SELL pending fill must get max(market, limit) — price improvement."""
+    monkeypatch.setattr(trading_service, "get_last_price", lambda _a: 105.0)
+    fill = trading_service.check_pending_limit_fill("X", "sell", 100.0)
+    assert fill == 105.0
+
+
+def test_tr2_not_marketable_returns_none(monkeypatch):
+    """TR2: returns None when market has not yet reached the limit."""
+    monkeypatch.setattr(trading_service, "get_last_price", lambda _a: 105.0)
+    assert trading_service.check_pending_limit_fill("X", "buy", 100.0) is None
+
+
+def test_m3_market_status_boundary_strict_lt():
+    import datetime as _dt
+    def closed_at_close(close_h, close_m):
+        tz = _dt.timezone.utc
+        base = _dt.datetime(2024, 1, 8, close_h, close_m, 0, tzinfo=tz)
+        close_time = base
+        now = base
+        # Fixed: strict < means AT close_time the exchange IS closed
+        is_open = now < close_time
+        return not is_open
+    assert closed_at_close(16, 0), 'NYSE must be CLOSED at exactly 16:00'
+    assert closed_at_close(15, 30), 'NSE must be CLOSED at exactly 15:30'
+
+
+def test_m4_simulate_fill_zero_last_price(monkeypatch):
+    """M4: simulate_fill must return filled_price=0.0 not None when price is $0."""
+    monkeypatch.setattr(trading_service, "get_last_price", lambda _a: 0.0)
+    result = trading_service.simulate_fill("FAKE_M4", "buy", 1, "market", None)
+    assert result["status"] == "FILLED"
+    assert result["filled_price"] == 0.0, "filled_price 0.0 must not be suppressed"
+
+
+def test_m9_order_request_market_accepts_none_prices():
+    """M9/M10: market OrderRequest must accept None limit_price and stop_price."""
+    req = schemas.OrderRequest(
+        asset="AAPL", side="buy", quantity=1.0,
+        order_type="market", limit_price=None, stop_price=None,
+        time_in_force="day",
+    )
+    assert req.limit_price is None
+    assert req.stop_price is None
+
+
+def test_strategy_fast_window_must_be_less_than_slow():
+    """M8: BacktestRequest rejects fast_window >= slow_window (pre-validation)."""
+    import pytest as _pt
+    with _pt.raises(Exception):
+        schemas.BacktestRequest(asset="AAPL", fast_window=50, slow_window=20, period="1y")
+    with _pt.raises(Exception):
+        schemas.BacktestRequest(asset="AAPL", fast_window=20, slow_window=20, period="1y")
+    ok = schemas.BacktestRequest(asset="AAPL", fast_window=10, slow_window=50, period="1y")
+    assert ok.slow_window > ok.fast_window

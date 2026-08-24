@@ -807,9 +807,11 @@ function _renderExchangeGrid() {
     const flag = EXCHANGE_FLAGS[key] || '🌐';
     const opensIn = ex.market_status?.opens_in_mins;
     const closesIn = ex.market_status?.closes_in_mins;
+    // FIX F11: CRYPTO status is 'open' (like all open exchanges), NOT 'crypto'.
+    // The old `st === 'crypto'` branch could never match any real status value.
     const timeHint = st === 'open' && closesIn != null ? `Closes in ${closesIn}m` :
                      st === 'pre' && opensIn != null ? `Opens in ${opensIn}m` :
-                     st === 'crypto' ? 'Always open' : '';
+                     key === 'CRYPTO' ? 'Always open — 24/7' : '';
     return `<div class="exchange-card ${selected}" data-key="${escapeHtml(key)}">
       <div class="exchange-flag">${flag}</div>
       <div class="exchange-name">${escapeHtml(ex.name)}</div>
@@ -997,15 +999,19 @@ function _injectOnDemandCard(sig) {
   const changeStr = changePct != null ? `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%` : '';
   const changeClass = changePct != null ? (changePct >= 0 ? 'positive' : 'negative') : '';
 
-  // 52-week range bar position
+  // 3-month price range bar (renamed from 52w in signal engine fix B4)
   let rangeBarHtml = '';
-  if (sig.high_52w && sig.low_52w && sig.high_52w > sig.low_52w) {
-    const pct = Math.min(100, Math.max(0, ((rawPrice - sig.low_52w) / (sig.high_52w - sig.low_52w)) * 100));
-    const lo  = rawPrice < 1 ? sig.low_52w.toFixed(4) : sig.low_52w.toFixed(2);
-    const hi  = rawPrice < 1 ? sig.high_52w.toFixed(4) : sig.high_52w.toFixed(2);
+  // FIX F8: fields were renamed high_3mo/low_3mo in signal_engine.py (B4).
+  // The old high_52w/low_52w keys no longer exist on on-demand signal cards.
+  const loP = sig.low_3mo ?? sig.low_52w;    // support both names during rollout
+  const hiP = sig.high_3mo ?? sig.high_52w;
+  if (hiP && loP && hiP > loP) {
+    const pct = Math.min(100, Math.max(0, ((rawPrice - loP) / (hiP - loP)) * 100));
+    const lo  = rawPrice < 1 ? loP.toFixed(4) : loP.toFixed(2);
+    const hi  = rawPrice < 1 ? hiP.toFixed(4) : hiP.toFixed(2);
     rangeBarHtml = `
       <div class="sig-range-wrap">
-        <span class="sig-range-label">52W</span>
+        <span class="sig-range-label">3Mo</span>
         <div class="sig-range-bar"><div class="sig-range-fill" style="left:${pct.toFixed(1)}%"></div></div>
         <span class="sig-range-lo">$${lo}</span>–<span class="sig-range-hi">$${hi}</span>
       </div>`;
@@ -1344,11 +1350,19 @@ document.getElementById('strategy-form').addEventListener('submit', async (e) =>
   e.preventDefault();
   const error = document.getElementById('strategy-error'); error.textContent = '';
   const btn = e.currentTarget.querySelector('button[type=submit]');
+  const fastW = Number(document.getElementById('strategy-fast').value);
+  const slowW = Number(document.getElementById('strategy-slow').value);
+  // M8 FIX: pre-validate window relationship on the frontend to give a clear
+  // error message instead of a raw 400 from the server.
+  if (fastW >= slowW) {
+    error.textContent = `Fast window (${fastW}) must be smaller than slow window (${slowW}).`;
+    return;
+  }
   const body = {
     name: document.getElementById('strategy-name').value,
     asset: document.getElementById('strategy-asset').value,
-    fast_window: Number(document.getElementById('strategy-fast').value),
-    slow_window: Number(document.getElementById('strategy-slow').value),
+    fast_window: fastW,
+    slow_window: slowW,
     period: document.getElementById('strategy-period').value,
   };
   setButtonLoading(btn, true, 'Backtesting historical data…');
@@ -1554,11 +1568,13 @@ function _renderSignalGrid(grid, signals, fromCache) {
 
 document.getElementById('refresh-signals').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
-  const icon = btn.querySelector('.refresh-icon');
+  const icon = document.getElementById('refresh-icon-el');
+  // FIX F13: setButtonLoading replaces .btn-label innerHTML, destroying the .refresh-icon
+  // span. Store the icon's presence BEFORE setButtonLoading mutates the DOM.
+  const hadIcon = !!icon;
   if (icon) icon.classList.add('spinning');
   setButtonLoading(btn, true, ' Refreshing…');
   try {
-    // POST to /api/signals/refresh (state-mutating endpoint)
     await api('/api/signals/refresh', { method: 'POST' });
     await loadDashboard();
     toast('Signals refreshed', 'SBA engine re-ran over live market data', 'success', 2200);
@@ -1566,7 +1582,9 @@ document.getElementById('refresh-signals').addEventListener('click', async (e) =
     toast('Refresh failed', err.message, 'error');
   } finally {
     setButtonLoading(btn, false);
-    if (icon) icon.classList.remove('spinning');
+    // Re-query the icon AFTER restoring the button label
+    const iconAfter = document.getElementById('refresh-icon-el');
+    if (iconAfter) iconAfter.classList.remove('spinning');
   }
 });
 
@@ -1760,7 +1778,9 @@ function renderOrderList(orders) {
     const qty    = Number(o.quantity);
     const qtyStr = qty < 1 ? qty.toFixed(6) : qty % 1 === 0 ? qty.toFixed(0) : qty.toFixed(4);
     const type   = escapeHtml(String(o.order_type || 'market'));
-    const fillPrice = o.filled_price ? Number(o.filled_price).toLocaleString('en-US',{style:'currency',currency:'USD'}) : '—';
+    const fillPrice = o.filled_price != null
+      ? Number(o.filled_price).toLocaleString('en-US',{style:'currency',currency:'USD'})
+      : '—'; // FIX F9: was `o.filled_price ?` which treats 0.0 as null (falsy)
     const cancelBtn = cancellable.has(o.status)
       ? `<button class="cancel-btn ripple-btn" data-order-id="${orderId}">Cancel</button>` : '';
     return `
@@ -1849,7 +1869,7 @@ async function loadPortfolio(isPoll) {
     return `
     <div class="pos-row" style="animation-delay:${i * 50}ms">
       <span style="font-weight:600">${asset}</span>
-      <span>${qty} sh</span>
+      <span>${qtyFmt} sh</span><!-- FIX F10: was raw qty, now uses qtyFmt for fractional display -->
       <span>${entry} avg</span>
       <span class="${uClass}" title="Unrealized P&amp;L">${uPnlFmt} <small style="opacity:.65;font-size:10px">unrl.</small></span>
       <span class="${rClass}" title="Realized P&amp;L">${rPnlFmt} <small style="opacity:.65;font-size:10px">rlzd.</small></span>
@@ -1987,7 +2007,7 @@ async function loadSecurity(isPoll) {
     <div class="audit-row" style="animation-delay:${i * 30}ms">
       <div class="audit-meta"><span>${escapeHtml(String(l.user_email || ''))}</span><span>${ts}</span></div>
       <div class="audit-action">${action}${resType}</div>
-      ${l.signature ? `<div class="audit-sig">${verified} ${escapeHtml(String(l.signature).slice(0,80))}…</div>` : ''}
+      ${l.signature_preview ? `<div class="audit-sig">${verified} ${escapeHtml(String(l.signature_preview).slice(0,80))}…</div>` : ''}
     </div>`;
   }).join('') || '';
 }

@@ -30,7 +30,12 @@ def get_last_price(asset: str) -> float:
         return cached[0]
     try:
         fast = yf.Ticker(asset).fast_info
-        price = float(getattr(fast, "last_price", None) or getattr(fast, "regularMarketPrice", None) or fast.get("last_price", None))
+        # FIX TR1: fast_info is an object, not a dict — `.get()` raises AttributeError.
+        # Chain getattr calls with explicit None fallback.
+        price = getattr(fast, "last_price", None) or getattr(fast, "regularMarketPrice", None)
+        if price is None or not isinstance(price, (int, float)):
+            raise ValueError("no price attribute")
+        price = float(price)
     except Exception:
         hist = yf.Ticker(asset).history(period="1d")
         price = float(hist["Close"].iloc[-1]) if len(hist) else 100.0
@@ -93,10 +98,13 @@ def simulate_fill(asset: str, side: str, qty: float, order_type: str,
 
 
 def check_pending_limit_fill(asset: str, side: str, limit_price: float) -> float | None:
-    """Called on read to see if a pending limit order has become marketable."""
+    """Called on read to see if a pending limit order has become marketable.
+    Returns the fill price with best-price improvement (mirrors simulate_fill).
+    FIX TR2: was returning limit_price even when market was better.
+    """
     last_price = get_last_price(asset)
     if side == "buy" and last_price <= limit_price:
-        return limit_price
+        return round(min(last_price, limit_price), 6 if last_price < 1 else 2)
     if side == "sell" and last_price >= limit_price:
-        return limit_price
+        return round(max(last_price, limit_price), 6 if last_price < 1 else 2)
     return None

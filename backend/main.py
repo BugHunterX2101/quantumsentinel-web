@@ -98,7 +98,9 @@ def _market_status(exch_key: str) -> dict:
         mins = int((open_time - now).total_seconds() // 60)
         return {"status": "pre", "label": "PRE-MARKET", "opens_in_mins": mins,
                 "local_time": now.strftime("%H:%M")}
-    if now <= close_time:
+    # FIX M3/B7 parity: strict < so the exchange shows CLOSED at exactly close_time,
+    # not one extra minute OPEN after the bell.
+    if now < close_time:
         mins = int((close_time - now).total_seconds() // 60)
         return {"status": "open", "label": "OPEN", "closes_in_mins": mins,
                 "local_time": now.strftime("%H:%M")}
@@ -436,7 +438,9 @@ def search_assets(q: str = "", user: models.User = Depends(get_current_user)):
     """Return matching tickers. Searches preloaded assets first, then includes
     the raw query so users can search any world ticker."""
     q = q.strip().upper()
-    if not q or len(q) < 1:
+    # FIX M5: `len(q) < 1` is always False after .strip() when `not q` already
+    # handles the empty-string case — the redundant len() check is removed.
+    if not q:
         return {"results": [], "total": 0}
     matches = [t for t in signal_engine.TRACKED_ASSETS if q in t.upper()][:10]
     if q not in matches and len(q) >= 1:
@@ -655,9 +659,11 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     # time_in_force in (day/gtc/ioc) — these checks are now redundant.
     # Cross-field semantic checks (price required for conditional order types)
     # are not expressible in Literal and must stay here.
-    if req.order_type in ("limit", "stop_limit") and not req.limit_price:
+    # FIX M9/M10: use explicit `is None` — `not price` would reject a
+    # valid limit_price of 0.0 (impossible for a real asset but defensive).
+    if req.order_type in ("limit", "stop_limit") and req.limit_price is None:
         raise HTTPException(400, "limit_price required for limit orders")
-    if req.order_type in ("stop", "stop_limit") and not req.stop_price:
+    if req.order_type in ("stop", "stop_limit") and req.stop_price is None:
         raise HTTPException(400, "stop_price required for stop orders")
 
     # Paper account guardrails from the architecture: no naked shorting,
@@ -804,11 +810,13 @@ def _serialize_trade(t: models.Trade) -> dict:
         "order_type": t.order_type,
         # FIX: time_in_force was missing from the response — frontend showed blank
         "time_in_force": t.time_in_force,
-        "limit_price": float(t.limit_price) if t.limit_price else None,
-        "stop_price": float(t.stop_price) if t.stop_price else None,
+        # FIX M4: use explicit `is not None` — SQLAlchemy Numeric columns return
+        # Decimal objects; a falsy check would incorrectly treat 0.0 as null.
+        "limit_price": float(t.limit_price) if t.limit_price is not None else None,
+        "stop_price": float(t.stop_price) if t.stop_price is not None else None,
         "status": t.status,
         "alpaca_order_id": t.alpaca_order_id,
-        "filled_price": float(t.filled_price) if t.filled_price else None,
+        "filled_price": float(t.filled_price) if t.filled_price is not None else None,
         "pqc_signature_preview": (
             (t.pqc_signature or "")[:32] + "..." if t.pqc_signature else None
         ),
@@ -1086,16 +1094,24 @@ def audit_log(limit: int = 50, user: models.User = Depends(get_current_user), db
         select(models.AuditLog).where(models.AuditLog.user_id == user.id)
         .order_by(models.AuditLog.created_at.desc()).limit(limit)
     ).scalars().all()
-    def _user_email(user_id: str | None) -> str | None:
-        if not user_id:
-            return None
-        u = db.get(models.User, user_id)
-        return u.email if u else None
+
+    # FIX M6: N+1 query — build a user-id → email map in ONE query instead of
+    # calling db.get(User, uid) inside the loop (= 50 extra DB reads for 50 logs).
+    unique_user_ids = {l.user_id for l in logs if l.user_id}
+    if unique_user_ids:
+        user_rows = db.execute(
+            select(models.User.id, models.User.email).where(
+                models.User.id.in_(unique_user_ids)
+            )
+        ).all()
+        _uid_to_email: dict[str, str] = {row.id: row.email for row in user_rows}
+    else:
+        _uid_to_email = {}
 
     return [{
         "id": l.id, "action": l.action, "resource_type": l.resource_type,
         "resource_id": l.resource_id, "metadata": l.metadata_json,
-        "user_email": _user_email(l.user_id),
+        "user_email": _uid_to_email.get(l.user_id) if l.user_id else None,
         "signature_preview": (l.pqc_signature or "")[:24] + "...",
         "verified": security_service.verify_audit_log(db, l.id),
         "created_at": l.created_at.isoformat(),

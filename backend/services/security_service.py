@@ -10,8 +10,26 @@ from ..crypto import pqc
 from ..config import (PRIVATE_KEY_ENCRYPTION_KEY, SERVER_DSA_PRIVATE_KEY,
                       SERVER_DSA_PUBLIC_KEY, SERVER_DSA_CREATED_AT)
 
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
 SERVER_KEY_ROTATION_DAYS = 90
-_PRIVATE_KEY_FERNET = Fernet(PRIVATE_KEY_ENCRYPTION_KEY.encode() if PRIVATE_KEY_ENCRYPTION_KEY else Fernet.generate_key())
+if PRIVATE_KEY_ENCRYPTION_KEY:
+    _PRIVATE_KEY_FERNET = Fernet(PRIVATE_KEY_ENCRYPTION_KEY.encode())
+else:
+    # FIX S2: generate an ephemeral key ONLY in development. Every process restart
+    # will generate a new key, making previously encrypted private keys permanently
+    # unreadable. Log CRITICAL so this is never silently ignored in production.
+    _ephemeral_key = Fernet.generate_key()
+    _PRIVATE_KEY_FERNET = Fernet(_ephemeral_key)
+    _log.critical(
+        "PRIVATE_KEY_ENCRYPTION_KEY is not set. An ephemeral Fernet key was "
+        "generated for this process. All user DSA private keys encrypted in "
+        "previous sessions are now UNREADABLE. Set PRIVATE_KEY_ENCRYPTION_KEY "
+        "in your environment (.env or secret manager) and restart."
+    )
+
 
 
 def protect_private_key(value: str) -> str:

@@ -293,8 +293,31 @@
       <div class="section-header"><h2>Enterprise Integrations</h2></div>
       <p class="hint" data-beginner>Issue least-privilege API credentials and configure signed event webhooks. Secrets are displayed once at creation &mdash; store them in your secret manager immediately.</p>
       <div class="trading-grid">
-        <div class="card"><h3>Scoped API Credentials</h3><form id="api-key-form"><label>Credential Name<input id="api-key-name" value="Automation key" maxlength="80" required></label><label>Permission Scopes<select id="api-key-scopes" multiple size="3"><option value="read" selected>Read portfolio</option><option value="trade">Place paper orders</option><option value="admin">Administration</option></select></label><button class="btn-primary ripple-btn" type="submit"><span class="btn-label">Issue API Key</span></button></form><div id="api-key-secret" class="hint"></div><div id="api-key-list" class="order-list"></div></div>
-        <div class="card"><h3>Signed Event Webhooks</h3><form id="webhook-form"><label>HTTPS Endpoint<input id="webhook-url" type="url" placeholder="https://your-system.com/events" required></label><label>Event Subscriptions<select id="webhook-events" multiple size="4"><option value="order.filled" selected>Order filled</option><option value="order.rejected">Order rejected</option><option value="order.cancelled">Order cancelled</option><option value="key.rotated" selected>Key rotation</option></select></label><button class="btn-primary ripple-btn" type="submit"><span class="btn-label">Register Webhook</span></button></form><div id="webhook-secret" class="hint"></div><div id="webhook-list" class="order-list"></div></div>
+        <div class="card"><h3>Scoped API Credentials</h3><form id="api-key-form">
+          <label>Credential Name<input id="api-key-name" value="Automation key" maxlength="80" required></label>
+          <div class="form-field">
+            <span class="form-field-label">Permission Scopes</span>
+            <div class="checkbox-group" id="api-key-scopes">
+              <label class="checkbox-item"><input type="checkbox" value="read" checked><span class="checkbox-box"></span>Read portfolio</label>
+              <label class="checkbox-item"><input type="checkbox" value="trade"><span class="checkbox-box"></span>Place paper orders</label>
+              <label class="checkbox-item"><input type="checkbox" value="admin"><span class="checkbox-box"></span>Administration</label>
+            </div>
+          </div>
+          <button class="btn-primary ripple-btn" type="submit"><span class="btn-label">Issue API Key</span></button>
+        </form><div id="api-key-secret" class="hint"></div><div id="api-key-list" class="order-list"></div></div>
+        <div class="card"><h3>Signed Event Webhooks</h3><form id="webhook-form">
+          <label>HTTPS Endpoint<input id="webhook-url" type="url" placeholder="https://your-system.com/events" required></label>
+          <div class="form-field">
+            <span class="form-field-label">Event Subscriptions</span>
+            <div class="checkbox-group" id="webhook-events">
+              <label class="checkbox-item"><input type="checkbox" value="order.filled" checked><span class="checkbox-box"></span>Order filled</label>
+              <label class="checkbox-item"><input type="checkbox" value="order.rejected"><span class="checkbox-box"></span>Order rejected</label>
+              <label class="checkbox-item"><input type="checkbox" value="order.cancelled"><span class="checkbox-box"></span>Order cancelled</label>
+              <label class="checkbox-item"><input type="checkbox" value="key.rotated" checked><span class="checkbox-box"></span>Key rotation</label>
+            </div>
+          </div>
+          <button class="btn-primary ripple-btn" type="submit"><span class="btn-label">Register Webhook</span></button>
+        </form><div id="webhook-secret" class="hint"></div><div id="webhook-list" class="order-list"></div></div>
       </div>
     </section>
 

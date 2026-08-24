@@ -629,8 +629,10 @@ async function bootstrapApp() {
   switchView(VIEW_KEYS.includes(hashView) ? hashView : 'dashboard');
   connectSignalStream();
   startOnboardingIfNeeded();
-  sel.addEventListener('change', updateOrderPricePreview);
+  sel.addEventListener('change', () => { updateOrderPricePreview(); updateAssetInfo(); });
   updateOrderPricePreview();
+  updateAssetInfo();
+  _startOrderPricePolling();
   const searchEl = document.getElementById('order-search');
   if (searchEl) searchEl.addEventListener('input', filterOrderList);
   startRefreshCountdown();
@@ -1571,38 +1573,92 @@ document.getElementById('refresh-signals').addEventListener('click', async (e) =
 // ===========================================================================
 // Trading
 // ===========================================================================
-function loadTrading() { refreshOrders(); updateOrderPricePreview(); }
+function loadTrading() { refreshOrders(); updateOrderPricePreview(); updateAssetInfo(); _startOrderPricePolling(); }
 
-// Live price preview — pulls from cached signal data
-function updateOrderPricePreview() {
-  const asset = document.getElementById('order-asset')?.value;
+// Live price preview -- always fetches fresh via /api/price
+let _priceRefreshInterval = null;
+
+function _startOrderPricePolling() {
+  clearInterval(_priceRefreshInterval);
+  _priceRefreshInterval = setInterval(() => {
+    if (state.activeView === 'trading') updateOrderPricePreview();
+  }, 10000);
+}
+
+async function updateOrderPricePreview() {
+  const asset   = document.getElementById('order-asset')?.value;
   const preview = document.getElementById('order-price-preview');
-  const valEl = document.getElementById('order-price-val');
+  const valEl   = document.getElementById('order-price-val');
   const labelEl = document.getElementById('order-price-label');
   if (!preview || !valEl || !asset) return;
-  // Try to find the price in the last known signals
-  const sigData = state.lastSignalPrices || {};
-  if (sigData[asset]) {
-    const price = Number(sigData[asset]).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-    valEl.textContent = price;
-    labelEl.textContent = 'Last market price';
+  try {
+    const data = await api(`/api/price/${encodeURIComponent(asset)}`, {}, { silent: true });
+    if (!data?.price) return;
+    const rawP  = Number(data.price);
+    const curr  = data.currency || 'USD';
+    const price = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD',
+                    maximumFractionDigits: rawP < 1 ? 6 : 2 });
+    const chg   = data.change_pct != null ? Number(data.change_pct) : null;
+    const chgHtml = chg != null
+      ? ` <span class="sig-change ${chg >= 0 ? 'positive' : 'negative'}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>`
+      : '';
+    const age   = Math.round(Date.now() / 1000 - (data.fetched_at || 0));
+    valEl.innerHTML = price + chgHtml;
+    labelEl.textContent = `Live price (${curr})${age < 10 ? '' : ' · ' + age + 's ago'}`;
     preview.classList.remove('hidden');
-  } else {
-    // Fetch from latest signals quietly
-    api('/api/signals/latest', {}, { silent: true }).then((signals) => {
-      if (!signals?.signals) return;
-      signals.signals.forEach((s) => {
-        if (!state.lastSignalPrices) state.lastSignalPrices = {};
-        state.lastSignalPrices[s.asset] = s.last_price;
-      });
-      const p = state.lastSignalPrices[asset];
-      if (p) {
-        valEl.textContent = Number(p).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-        labelEl.textContent = 'Last market price';
-        preview.classList.remove('hidden');
-      }
-    }).catch(() => {});
+    if (!state.lastSignalPrices) state.lastSignalPrices = {};
+    state.lastSignalPrices[asset] = rawP;
+  } catch (_) {
+    const p2 = state.lastSignalPrices?.[asset];
+    if (p2) {
+      valEl.textContent = Number(p2).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+      labelEl.textContent = 'Cached price (live fetch failed)';
+      preview.classList.remove('hidden');
+    }
   }
+}
+
+// Dynamic asset info -- updates order form based on instrument type
+let _assetInfoEl = null;
+async function updateAssetInfo() {
+  const asset = document.getElementById('order-asset')?.value;
+  if (!asset) return;
+  if (!_assetInfoEl) {
+    _assetInfoEl = document.createElement('div');
+    _assetInfoEl.id = 'asset-info-bar';
+    _assetInfoEl.className = 'asset-info-bar';
+    const form = document.getElementById('order-form');
+    if (form) form.insertBefore(_assetInfoEl, form.firstChild);
+  }
+  _assetInfoEl.innerHTML = '<span class="hint">Loading asset info...</span>';
+  try {
+    const info = await api(`/api/asset/info/${encodeURIComponent(asset)}`, {}, { silent: true });
+    if (!info) { _assetInfoEl.innerHTML = ''; return; }
+    const mktOpen  = info.market_open;
+    const dotClass = mktOpen ? 'open' : 'closed';
+    const dotText  = mktOpen ? 'Market Open' : 'Market Closed';
+    const typeLabel = info.instrument_type || 'EQUITY';
+    const fractLabel = info.fractional_allowed ? 'Fractional OK' : 'Whole shares only';
+    const h24 = info.trading_24_7 ? ' · 24/7' : '';
+    _assetInfoEl.innerHTML =
+      `<span class="aib-name">${escapeHtml(info.company_name || asset)}</span>` +
+      `<span class="aib-sep">·</span><span class="aib-type">${typeLabel}</span>` +
+      `<span class="aib-sep">·</span><span class="aib-market"><span class="mkt-dot ${dotClass}"></span>${dotText}</span>` +
+      `<span class="aib-sep">·</span><span class="aib-frac">${fractLabel}${h24}</span>`;
+    // Warn if market closed + market order
+    let warn = document.getElementById('market-closed-warn');
+    if (!warn) {
+      warn = document.createElement('div');
+      warn.id = 'market-closed-warn';
+      warn.className = 'hint warn';
+      warn.style.cssText = 'color:var(--amber);margin-bottom:10px;';
+      warn.textContent = 'Market is currently closed. Market orders will queue until next open.';
+      const ot = document.getElementById('order-type');
+      if (ot?.parentElement) ot.parentElement.after(warn);
+    }
+    const isMarketOrder = ['market','stop'].includes(document.getElementById('order-type')?.value);
+    warn.style.display = (!mktOpen && isMarketOrder && !info.trading_24_7) ? '' : 'none';
+  } catch (_) { _assetInfoEl.innerHTML = ''; }
 }
 
 // Store prices when signals load
@@ -1610,6 +1666,7 @@ function cacheSignalPrices(signals) {
   if (!state.lastSignalPrices) state.lastSignalPrices = {};
   (signals?.signals || []).forEach((s) => { state.lastSignalPrices[s.asset] = s.last_price; });
 }
+
 
 document.getElementById('order-type').addEventListener('change', (e) => {
   const type = e.target.value;
@@ -1947,7 +2004,13 @@ document.getElementById('compliance-export').addEventListener('click', async () 
 // Enterprise integrations
 // ===========================================================================
 function selectedValues(id) {
-  return Array.from(document.getElementById(id).selectedOptions).map((option) => option.value);
+  const el = document.getElementById(id);
+  if (!el) return [];
+  // Support both <select multiple> (legacy) and .checkbox-group (new)
+  if (el.tagName === 'SELECT') {
+    return Array.from(el.selectedOptions).map((o) => o.value);
+  }
+  return Array.from(el.querySelectorAll('input[type="checkbox"]:checked')).map((cb) => cb.value);
 }
 
 async function loadIntegrations() {

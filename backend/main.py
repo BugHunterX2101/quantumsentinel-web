@@ -433,23 +433,52 @@ def get_asset_signal(ticker: str, user: models.User = Depends(get_current_user))
 
 @app.get("/api/signals/search")
 def search_assets(q: str = "", user: models.User = Depends(get_current_user)):
-    """Return matching tickers from the full 300+ universe catalogue.
-
-    Used by the dashboard search bar to show autocomplete suggestions.
-    Pure in-memory filter — no network call, sub-millisecond response.
-    """
+    """Return matching tickers. Searches preloaded assets first, then includes
+    the raw query so users can search any world ticker."""
     q = q.strip().upper()
     if not q or len(q) < 1:
         return {"results": [], "total": 0}
-    matches = [t for t in signal_engine.TRACKED_ASSETS if q in t.upper()][:20]
-    return {
-        "results": [
-            {"ticker": t, "exchange": signal_engine.ASSET_EXCHANGE_MAP.get(t, "US")}
-            for t in matches
-        ],
-        "total": len(matches),
-        "query": q,
-    }
+    matches = [t for t in signal_engine.TRACKED_ASSETS if q in t.upper()][:10]
+    if q not in matches and len(q) >= 1:
+        matches.append(q)
+    results = []
+    for t in matches:
+        exch = signal_engine.ASSET_EXCHANGE_MAP.get(t) or signal_engine.infer_exchange(t)
+        meta = signal_engine.ASSET_METADATA.get(t, {})
+        results.append({
+            "ticker": t, "exchange": exch,
+            "company_name": meta.get("name", t),
+            "sector": meta.get("sector", ""),
+        })
+    return {"results": results, "total": len(results), "query": q}
+
+
+@app.get("/api/price/{ticker}")
+def get_live_price_endpoint(ticker: str, user: models.User = Depends(get_current_user)):
+    """Always-fresh price for any ticker - 5-second micro-cache.
+    Used by the order price preview for current bid/ask rather than stale signal price."""
+    clean = ticker.strip().upper()
+    if not clean or len(clean) > 20:
+        raise HTTPException(400, "Invalid ticker symbol")
+    result = signal_engine.get_live_price(clean)
+    if result is None:
+        raise HTTPException(404, f"No live price data found for '{clean}'")
+    return result
+
+
+@app.get("/api/asset/info/{ticker}")
+def get_asset_info_endpoint(ticker: str, user: models.User = Depends(get_current_user)):
+    """Rich metadata: instrument type, exchange, market open status, trading features.
+    Called by the order form on asset change so the form adapts dynamically."""
+    clean = ticker.strip().upper()
+    if not clean or len(clean) > 20:
+        raise HTTPException(400, "Invalid ticker symbol")
+    result = signal_engine.get_asset_info(clean)
+    if result is None:
+        raise HTTPException(404, f"No info available for '{clean}'")
+    result.pop("_fetched_at", None)
+    return result
+
 
 
 @app.websocket("/api/signals/stream")

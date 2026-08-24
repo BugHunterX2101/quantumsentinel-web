@@ -89,7 +89,7 @@ COUPLING = 0.5    # coupling constant c
 
 _cache: dict = {"signals": None, "generated_at": 0.0, "generating": False,
                 "lock": threading.Lock()}
-CACHE_TTL_SECONDS = 30  # 1-min live data freshness window
+CACHE_TTL_SECONDS = 20  # signal cache freshness — 20s for near-real-time data
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +441,7 @@ def invalidate_cache() -> None:
 # ---------------------------------------------------------------------------
 
 _ondemand_cache: dict = {}   # ticker -> {signal, fetched_at}
-_ONDEMAND_TTL = 30           # seconds before on-demand result expires
+_ONDEMAND_TTL = 15           # seconds before on-demand signal expires
 
 
 def compute_single_asset(ticker: str) -> dict | None:
@@ -571,3 +571,121 @@ def _generate_insight(signal_type: str, feats: dict, spin: float, ticker: str) -
         parts.append("SBA spin near zero - mixed cross-asset signals")
 
     return ". ".join(parts[:3]) + "."  # keep to 3 most informative
+
+
+# ---------------------------------------------------------------------------
+# Live price -- 5s micro-cache, always fetches fresh from yfinance
+# ---------------------------------------------------------------------------
+_price_cache = {}
+_PRICE_TTL = 5  # seconds -- near-real-time
+
+def get_live_price(ticker):
+    """Return freshest price for any ticker. Micro-cached for _PRICE_TTL seconds."""
+    import yfinance as yf
+    ticker = ticker.upper().strip()
+    now = time.time()
+    cached = _price_cache.get(ticker)
+    if cached and (now - cached["fetched_at"]) < _PRICE_TTL:
+        return cached
+    try:
+        fi    = yf.Ticker(ticker).fast_info
+        price = getattr(fi, "last_price", None)
+        if price is None:
+            return None
+        prev     = getattr(fi, "previous_close", None)
+        chg      = round((price - prev) / prev * 100, 2) if prev and prev != 0 else None
+        currency = getattr(fi, "currency", "USD") or "USD"
+        result   = {
+            "ticker":     ticker,
+            "price":      round(float(price), 6 if float(price) < 1 else 2),
+            "change_pct": chg,
+            "currency":   currency,
+            "fetched_at": now,
+            "source":     "yfinance",
+        }
+        _price_cache[ticker] = result
+        return result
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Asset info -- type, exchange, market status, trading features
+# ---------------------------------------------------------------------------
+_asset_info_cache = {}
+_ASSET_INFO_TTL = 30
+
+def _market_is_open(exchange):
+    if exchange == "CRYPTO":
+        return True
+    try:
+        from datetime import datetime, time as dtime
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        tz_map = {
+            "US":    ("America/New_York", dtime(9, 30),  dtime(16, 0)),
+            "NSE":   ("Asia/Kolkata",     dtime(9, 15),  dtime(15, 30)),
+            "LSE":   ("Europe/London",    dtime(8, 0),   dtime(16, 30)),
+            "XETRA": ("Europe/Berlin",    dtime(9, 0),   dtime(17, 30)),
+            "TSE":   ("Asia/Tokyo",       dtime(9, 0),   dtime(15, 30)),
+            "HKEX":  ("Asia/Hong_Kong",   dtime(9, 30),  dtime(16, 0)),
+            "ASX":   ("Australia/Sydney", dtime(10, 0),  dtime(16, 0)),
+            "TSX":   ("America/Toronto",  dtime(9, 30),  dtime(16, 0)),
+        }
+        entry = tz_map.get(exchange)
+        if not entry:
+            return False
+        tz_str, open_t, close_t = entry
+        now_local = datetime.now(ZoneInfo(tz_str))
+        if now_local.weekday() >= 5:
+            return False
+        cur = now_local.time().replace(second=0, microsecond=0)
+        return open_t <= cur <= close_t
+    except Exception:
+        return False
+
+
+def get_asset_info(ticker):
+    """Return rich metadata: instrument type, exchange, market status, trading features."""
+    import yfinance as yf
+    ticker = ticker.upper().strip()
+    now = time.time()
+    cached = _asset_info_cache.get(ticker)
+    if cached and (now - cached.get("_fetched_at", 0)) < _ASSET_INFO_TTL:
+        return cached
+    exchange   = infer_exchange(ticker)
+    is_crypto  = exchange == "CRYPTO" or "-USD" in ticker or "-USDT" in ticker
+    _ETF_SET   = {"SPY","QQQ","IWM","DIA","VTI","VOO","GLD","SLV","USO","TLT","IEF",
+                  "HYG","LQD","BND","AGG","TIPS","XLK","XLF","XLV","XLE","XLI",
+                  "XLY","XLP","XLB","XLRE","XLU","VEA","VWO","EFA","EEM"}
+    is_etf     = ticker in _ETF_SET
+    company_name = ASSET_METADATA.get(ticker, {}).get("name", ticker)
+    sector       = ASSET_METADATA.get(ticker, {}).get("sector", "")
+    currency     = "USD"
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        currency = getattr(fi, "currency", "USD") or "USD"
+        if company_name == ticker:
+            info = yf.Ticker(ticker).info
+            company_name = info.get("shortName") or info.get("longName") or ticker
+            sector       = info.get("sector") or sector
+    except Exception:
+        pass
+    result = {
+        "ticker":             ticker,
+        "company_name":       company_name,
+        "sector":             sector,
+        "exchange":           exchange,
+        "instrument_type":    "CRYPTO" if is_crypto else ("ETF" if is_etf else "EQUITY"),
+        "currency":           currency,
+        "market_open":        _market_is_open(exchange),
+        "fractional_allowed": is_crypto or exchange == "US",
+        "is_crypto":          is_crypto,
+        "is_etf":             is_etf,
+        "trading_24_7":       is_crypto,
+        "_fetched_at":        now,
+    }
+    _asset_info_cache[ticker] = result
+    return result

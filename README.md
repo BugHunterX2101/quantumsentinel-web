@@ -254,13 +254,69 @@ flowchart LR
 
 ```mermaid
 erDiagram
-    users { string id PK; string email UK; string password_hash; boolean is_admin }
-    trades { string id PK; string user_id FK; string asset; string side; float quantity; string status; string pqc_signature }
-    positions { string id PK; string user_id FK; string asset; float quantity; float avg_entry_price; float realized_pnl }
-    key_pairs { string id PK; string user_id FK; string algorithm; text public_key_b64; boolean is_active }
-    audit_logs { string id PK; string user_id FK; string action; string pqc_signature; datetime created_at }
-    api_keys { string id PK; string user_id FK; string name; json scopes; boolean is_revoked }
-    webhooks { string id PK; string user_id FK; string url; json event_types; boolean is_active }
+    users {
+        string id PK
+        string email UK
+        string password_hash
+        boolean is_admin
+        boolean is_active
+        datetime created_at
+    }
+    trades {
+        string id PK
+        string user_id FK
+        string asset
+        string side
+        float quantity
+        string order_type
+        string status
+        float filled_price
+        string pqc_signature
+        datetime submitted_at
+    }
+    positions {
+        string id PK
+        string user_id FK
+        string asset
+        float quantity
+        float avg_entry_price
+        float realized_pnl
+        datetime updated_at
+    }
+    key_pairs {
+        string id PK
+        string user_id FK
+        string algorithm
+        text public_key_b64
+        boolean is_active
+        int rotation_count
+        datetime created_at
+    }
+    audit_logs {
+        string id PK
+        string user_id FK
+        string action
+        string resource_type
+        string pqc_signature
+        datetime created_at
+    }
+    api_keys {
+        string id PK
+        string user_id FK
+        string name
+        string prefix
+        json scopes
+        boolean is_revoked
+        datetime expires_at
+    }
+    webhooks {
+        string id PK
+        string user_id FK
+        string url
+        json event_types
+        boolean is_active
+        datetime last_delivery_at
+    }
 
     users ||--o{ trades : "places"
     users ||--o{ positions : "holds"
@@ -269,6 +325,7 @@ erDiagram
     users ||--o{ api_keys : "manages"
     users ||--o{ webhooks : "configures"
 ```
+
 
 ---
 

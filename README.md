@@ -596,6 +596,7 @@ pytest -q
 docker compose up --build -d
 curl http://localhost:8000/health/ready
 ```
+---
 
 ## Contributing
 

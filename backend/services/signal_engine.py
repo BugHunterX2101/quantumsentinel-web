@@ -300,7 +300,7 @@ def generate_signals(assets: list[str] | None = None) -> dict:
             "error": "empty market data response",
         }
 
-    feature_rows, returns_rows, closes_last, rsis = [], [], {}, {}
+    feature_rows, returns_rows, closes_last, rsis, closes_change_pct = [], [], {}, {}, {}
     valid_assets: list[str] = []
     MIN_BARS = 50  # need enough history for Wilder's RSI (14*3) + Bollinger (20)
 
@@ -326,6 +326,8 @@ def generate_signals(assets: list[str] | None = None) -> dict:
         )
         returns_rows.append(rets)
         closes_last[asset] = float(close[-1])
+        _prev2 = float(close[-2]) if len(close) > 1 else 0.0
+        closes_change_pct[asset] = round((float(close[-1]) - _prev2) / _prev2 * 100, 2) if _prev2 != 0.0 else None
         rsis[asset] = feats["rsi"]
         valid_assets.append(asset)
 
@@ -368,6 +370,7 @@ def generate_signals(assets: list[str] | None = None) -> dict:
             "confidence": round(confidence, 4),
             "spin": round(spin_val, 4),
             "last_price": round(close_arr_last, 6 if close_arr_last < 1 else 2),
+            "change_pct": closes_change_pct.get(asset),
             "features": feats_dict,
             "sba_iterations": N_STEPS,
             "engine_version": "1.1.0-python-sba",
@@ -406,9 +409,11 @@ def get_cached_signals(assets: list[str] | None = None) -> dict:
         if has_data and (now - _cache["generated_at"] < CACHE_TTL_SECONDS):
             return _cache["signals"]
         if _cache["generating"]:
-            # Another thread is generating — return stale data to avoid pile-up
-            if _cache.get("signals"):
-                return _cache["signals"]
+            # Another thread is generating -- return stale data or empty response to avoid pile-up
+            cached_sig = _cache.get("signals")
+            if cached_sig:
+                return cached_sig
+            return {"signals": [], "generated_at": time.time(), "pipeline_ms": 0, "sba_ms": 0, "n_assets": 0}
         _cache["generating"] = True
 
     try:
@@ -498,9 +503,9 @@ def compute_single_asset(ticker: str) -> dict | None:
         "confidence": round(confidence, 4),
         "spin": round(spin, 4),
         "last_price": round(float(close[-1]), 6 if float(close[-1]) < 1 else 2),
-        "change_pct": round(float((close[-1] - close[-2]) / close[-2] * 100), 2) if len(close) > 1 else 0.0,
-        "high_52w": round(float(np.max(close)), 2),
-        "low_52w":  round(float(np.min(close)), 2),
+        "change_pct": round(float((close[-1] - close[-2]) / close[-2] * 100), 2) if len(close) > 1 and float(close[-2]) != 0.0 else 0.0,
+        "high_3mo": round(float(np.max(close)), 2),
+        "low_3mo":  round(float(np.min(close)), 2),
         "features": {k: round(v, 4) for k, v in feats.items()},
         "sba_iterations": 1,
         "engine_version": "1.1.0-python-sba",
@@ -521,7 +526,7 @@ def _generate_insight(signal_type: str, feats: dict, spin: float, ticker: str) -
     rsi    = feats.get("rsi", 50.0)
     macd   = feats.get("macd_histogram", 0.0)
     mom    = feats.get("momentum", 0.0)
-    bb_w   = feats.get("bollinger_width", 0.0)
+    bb_w   = feats.get("bb_width", 0.0)  # key matches extract_features() output
     mom_pct = round(mom * 100, 1)
 
     parts: list[str] = []
@@ -570,21 +575,20 @@ def _generate_insight(signal_type: str, feats: dict, spin: float, ticker: str) -
     elif abs(spin) < 0.2:
         parts.append("SBA spin near zero - mixed cross-asset signals")
 
-    return ". ".join(parts[:3]) + "."  # keep to 3 most informative
+    return ". ".join(parts[:4]) + "."  # keep top 4 most informative parts
 
 
 # ---------------------------------------------------------------------------
 # Live price -- 5s micro-cache, always fetches fresh from yfinance
 # ---------------------------------------------------------------------------
-_price_cache = {}
+_live_price_cache = {}
 _PRICE_TTL = 5  # seconds -- near-real-time
 
 def get_live_price(ticker):
     """Return freshest price for any ticker. Micro-cached for _PRICE_TTL seconds."""
-    import yfinance as yf
     ticker = ticker.upper().strip()
     now = time.time()
-    cached = _price_cache.get(ticker)
+    cached = _live_price_cache.get(ticker)
     if cached and (now - cached["fetched_at"]) < _PRICE_TTL:
         return cached
     try:
@@ -603,7 +607,7 @@ def get_live_price(ticker):
             "fetched_at": now,
             "source":     "yfinance",
         }
-        _price_cache[ticker] = result
+        _live_price_cache[ticker] = result
         return result
     except Exception:
         return None
@@ -642,14 +646,13 @@ def _market_is_open(exchange):
         if now_local.weekday() >= 5:
             return False
         cur = now_local.time().replace(second=0, microsecond=0)
-        return open_t <= cur <= close_t
+        return open_t <= cur < close_t  # strict < at close avoids 1-minute overshoot
     except Exception:
         return False
 
 
 def get_asset_info(ticker):
     """Return rich metadata: instrument type, exchange, market status, trading features."""
-    import yfinance as yf
     ticker = ticker.upper().strip()
     now = time.time()
     cached = _asset_info_cache.get(ticker)

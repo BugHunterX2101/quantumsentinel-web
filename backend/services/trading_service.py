@@ -30,7 +30,7 @@ def get_last_price(asset: str) -> float:
         return cached[0]
     try:
         fast = yf.Ticker(asset).fast_info
-        price = float(fast["last_price"])
+        price = float(getattr(fast, "last_price", None) or getattr(fast, "regularMarketPrice", None) or fast.get("last_price", None))
     except Exception:
         hist = yf.Ticker(asset).history(period="1d")
         price = float(hist["Close"].iloc[-1]) if len(hist) else 100.0
@@ -78,11 +78,17 @@ def simulate_fill(asset: str, side: str, qty: float, order_type: str,
             return {"status": "ACCEPTED", "filled_price": None, "alpaca_order_id": None}
         if order_type == "stop":
             return {"status": "FILLED", "filled_price": last_price, "alpaca_order_id": None}
-    # limit and triggered stop-limit order: fill immediately if marketable, else pending
+    # limit and triggered stop-limit: fill if marketable at best available price
+    if limit_price is None:
+        # stop_limit without a limit_price — treat as market fill at stop trigger price
+        return {"status": "FILLED", "filled_price": last_price, "alpaca_order_id": None}
     marketable = (side == "buy" and last_price <= limit_price) or \
                  (side == "sell" and last_price >= limit_price)
     if marketable:
-        return {"status": "FILLED", "filled_price": limit_price, "alpaca_order_id": None}
+        # FIX T3: fill at the BETTER of market price and limit (price improvement)
+        # Buy: fill at min(last_price, limit_price); Sell: fill at max(last_price, limit_price)
+        fill_px = min(last_price, limit_price) if side == "buy" else max(last_price, limit_price)
+        return {"status": "FILLED", "filled_price": round(fill_px, 6 if fill_px < 1 else 2), "alpaca_order_id": None}
     return {"status": "ACCEPTED", "filled_price": None, "alpaca_order_id": None}
 
 

@@ -666,7 +666,14 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     held = existing_positions.get(req.asset, {}).get("quantity", 0.0)
     if req.side == "sell" and req.quantity > held:
         raise HTTPException(400, "sell quantity exceeds the available paper position")
-    price_for_risk = req.limit_price or req.stop_price or trading_service.get_last_price(req.asset)
+    # Use `is not None` not `or` -- `or` evaluates 0.0 as falsy (impossible here since gt=0,
+    # but defensive coding prevents future regressions if schema changes).
+    if req.limit_price is not None:
+        price_for_risk = float(req.limit_price)
+    elif req.stop_price is not None:
+        price_for_risk = float(req.stop_price)
+    else:
+        price_for_risk = trading_service.get_last_price(req.asset)
 
     # FIX: Compute real account cash from FILLED trades instead of using the
     # static subtraction (100k - notional_held) which goes negative when
@@ -679,7 +686,10 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     cash = 100_000.0
     for ft in filled_trades:
         notional = float(ft.quantity) * float(ft.filled_price or 0)
-        cash -= notional if ft.side == "buy" else -notional
+        if ft.side == "buy":
+            cash -= notional  # buying costs cash
+        else:
+            cash += notional  # selling returns cash
     # Floor cash at zero — a negative balance means over-leveraged. Use the
     # larger of actual cash and a $5k minimum for equity so the 5% cap
     # doesn't collapse to zero but also doesn't create phantom buying power.

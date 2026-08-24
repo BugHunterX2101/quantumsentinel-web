@@ -1599,7 +1599,7 @@ async function updateOrderPricePreview() {
     const price = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD',
                     maximumFractionDigits: rawP < 1 ? 6 : 2 });
     const chg   = data.change_pct != null ? Number(data.change_pct) : null;
-    const chgHtml = chg != null
+    const chgHtml = chg != null && isFinite(chg)
       ? ` <span class="sig-change ${chg >= 0 ? 'positive' : 'negative'}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>`
       : '';
     const age   = Math.round(Date.now() / 1000 - (data.fetched_at || 0));
@@ -1683,7 +1683,7 @@ document.getElementById('order-form').addEventListener('submit', async (e) => {
   const body = {
     asset: document.getElementById('order-asset').value,
     side: document.getElementById('order-side').value,
-    quantity: parseFloat(document.getElementById('order-qty').value),
+    quantity: parseFloat(document.getElementById('order-qty').value) || 0,
     order_type: orderType,
     time_in_force: document.getElementById('order-tif').value,
     limit_price: ['limit', 'stop_limit'].includes(orderType)
@@ -1691,13 +1691,24 @@ document.getElementById('order-form').addEventListener('submit', async (e) => {
     stop_price: ['stop', 'stop_limit'].includes(orderType)
       ? parseFloat(document.getElementById('order-stop-price').value) : null,
   };
+  // F1: validate numeric inputs before sending to server
+  if (!body.asset) { errEl.textContent = 'Asset is required.'; return; }
+  if (!isFinite(body.quantity) || body.quantity <= 0) {
+    errEl.textContent = 'Please enter a valid positive quantity.'; return;
+  }
+  if (['limit','stop_limit'].includes(body.order_type) && (!isFinite(body.limit_price) || body.limit_price <= 0)) {
+    errEl.textContent = 'Please enter a valid limit price > 0.'; return;
+  }
+  if (['stop','stop_limit'].includes(body.order_type) && (!isFinite(body.stop_price) || body.stop_price <= 0)) {
+    errEl.textContent = 'Please enter a valid stop price > 0.'; return;
+  }
   setButtonLoading(btn, true, 'Signing with ML-DSA-65…');
   try {
     const order = await api('/api/trading/orders', { method: 'POST', body: JSON.stringify(body) }, { silent: true });
     await refreshOrders();
     toast(
       order.status === 'FILLED' ? 'Order filled' : 'Order submitted',
-      `${body.side.toUpperCase()} ${body.quantity} ${body.asset}${order.filled_price ? ' @ $' + order.filled_price.toFixed(2) : ''}`,
+      `${body.side.toUpperCase()} ${body.quantity} ${body.asset}${order.filled_price != null ? ' @ $' + Number(order.filled_price).toFixed(2) : ''}`,
       order.status === 'FILLED' ? 'success' : 'info'
     );
   } catch (err) { errEl.textContent = err.message; } finally { setButtonLoading(btn, false); }
@@ -1747,6 +1758,7 @@ function renderOrderList(orders) {
     const status = escapeHtml(String(o.status));
     const orderId = escapeHtml(String(o.order_id));
     const qty    = Number(o.quantity);
+    const qtyStr = qty < 1 ? qty.toFixed(6) : qty % 1 === 0 ? qty.toFixed(0) : qty.toFixed(4);
     const type   = escapeHtml(String(o.order_type || 'market'));
     const fillPrice = o.filled_price ? Number(o.filled_price).toLocaleString('en-US',{style:'currency',currency:'USD'}) : '—';
     const cancelBtn = cancellable.has(o.status)
@@ -1801,7 +1813,14 @@ async function loadPortfolio(isPoll) {
 
   // Total portfolio value
   // Include realized_pnl so sold gains are not erased from the display total.
-  const totalPnl = positions.reduce((sum, p) => sum + Number(p.unrealized_pnl) + Number(p.realized_pnl || 0), 0);
+  // F3 FIX: sum unrealized from open positions + realized from ALL positions.
+  // Realized PnL from fully-sold (qty=0) positions is NOT in the positions array
+  // (server excludes zero-qty rows). We still show it if it was previously loaded
+  // from risk_metrics (via equity_curve / trades). For open positions, realized
+  // comes from partial sells tracked per-asset.
+  const totalUnrealized = positions.reduce((s, p) => s + Number(p.unrealized_pnl || 0), 0);
+  const totalRealized   = positions.reduce((s, p) => s + Number(p.realized_pnl  || 0), 0);
+  const totalPnl = totalUnrealized + totalRealized;
   const totalEl = document.getElementById('portfolio-total');
   if (totalEl) {
     totalEl.textContent = totalPnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });
@@ -1819,6 +1838,7 @@ async function loadPortfolio(isPoll) {
   list.innerHTML = positions.map((p, i) => {
     const asset    = escapeHtml(String(p.asset));
     const qty      = Number(p.quantity);
+    const qtyFmt   = qty < 1 ? qty.toFixed(6) : qty % 1 === 0 ? qty.toFixed(0) : qty.toFixed(4);
     const entry    = Number(p.avg_entry_price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
     const uPnl     = Number(p.unrealized_pnl);
     const rPnl     = Number(p.realized_pnl || 0);

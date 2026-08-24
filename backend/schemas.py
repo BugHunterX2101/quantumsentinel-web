@@ -393,6 +393,14 @@ class BacktestRequest(BaseModel):
     def normalized_backtest_asset(cls, value: str) -> str:
         return OrderRequest.normalized_asset(value)
 
+    @field_validator("slow_window")
+    @classmethod
+    def backtest_valid_windows(cls, value: int, info) -> int:
+        """slow_window must exceed fast_window -- identical rule as StrategyRequest."""
+        if "fast_window" in info.data and value <= info.data["fast_window"]:
+            raise ValueError("slow_window must be larger than fast_window")
+        return value
+
     @field_validator("period")
     @classmethod
     def valid_period(cls, value: str) -> str:

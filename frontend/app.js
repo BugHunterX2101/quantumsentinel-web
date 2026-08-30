@@ -431,7 +431,7 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
 });
 
 // ── Keyboard shortcuts 1-7 ──────────────────────────────────────
-const VIEW_KEYS = ['dashboard','trading','strategies','portfolio','security','integrations','community'];
+const VIEW_KEYS = ['dashboard','trading','strategies','research','portfolio','security','integrations','community'];
 document.addEventListener('keydown', (e) => {
   // Only when not typing in an input/textarea
   if (e.target.matches('input,textarea,select')) return;
@@ -471,7 +471,7 @@ function confirmAction(title, body) {
   });
 }
 
-const PAGE_TITLES = { dashboard:'Dashboard', trading:'Order Desk', strategies:'Strategies',
+const PAGE_TITLES = { dashboard:'Dashboard', trading:'Order Desk', strategies:'Strategies', research:'Research',
   portfolio:'Portfolio', security:'Security', integrations:'Integrations', community:'Open Source' };
 
 // Smart freshness gate — skip re-fetching data if the view was loaded < 5s ago
@@ -503,6 +503,7 @@ function switchView(view) {
     trading: 'Tip: every order is cryptographically signed with ML-DSA-65 before submission and settles as a paper (simulated) trade.',
     portfolio: 'Tip: Sharpe ratio > 1 is generally considered good risk-adjusted performance. Max drawdown shows worst peak-to-trough loss.',
     strategies: 'Tip: validate a strategy on historical data first. A positive backtest is not a prediction of future returns.',
+    research: 'Tip: use walk-forward validation to detect overfitting. The Deflated Sharpe Ratio accounts for the number of strategies you tested.',
     security: 'Tip: the Quantum Safety Score reflects how fresh your cryptographic keys are — green means fully rotated and FIPS-compliant.',
   };
   const banner = document.getElementById('beginner-banner');
@@ -2159,3 +2160,734 @@ async function loadCommunity() {
     }
   }
 })();
+
+// ══════════════════════════════════════════════════════════════════
+// RESEARCH ENGINE — Advanced backtest, walk-forward, stat tests
+// ══════════════════════════════════════════════════════════════════
+
+let _lastBacktestReturns = null;
+
+// ── Helper: metric card ──
+function metricCard(label, value, unit='', cls='') {
+  const vStr = typeof value === 'number' ? (Math.abs(value) < 1 && unit === '%' ? (value * 100).toFixed(2) + '%' : value.toFixed(3)) : value;
+  return `<div class="metric-card ${cls}"><div class="metric-label">${label}</div><div class="metric-value">${vStr}${unit && typeof value !== 'string' && Math.abs(value) >= 1 ? unit : ''}</div></div>`;
+}
+
+function signalBadge(ok, label) {
+  return `<span style="display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;background:${ok ? 'var(--up-bg,#0d2b1a)' : 'var(--down-bg,#2b0d0d)'};color:${ok ? 'var(--up,#22c55e)' : 'var(--down,#ef4444)'};">${ok ? '✓' : '✗'} ${label}</span>`;
+}
+
+// ── Advanced Backtest form ──
+document.getElementById('research-backtest-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('rb-error');
+  const resultEl = document.getElementById('research-backtest-result');
+  errEl.textContent = '';
+  resultEl.innerHTML = '<div class="empty-state">Running backtest with execution costs…</div>';
+
+  const assets = document.getElementById('rb-assets').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  const body = {
+    assets,
+    strategy_type: document.getElementById('rb-strategy').value,
+    period: document.getElementById('rb-period').value,
+    fast_window: +document.getElementById('rb-fast').value,
+    slow_window: +document.getElementById('rb-slow').value,
+    execution_preset: document.getElementById('rb-exec').value,
+    sizing_method: document.getElementById('rb-sizing').value,
+    initial_capital: +document.getElementById('rb-capital').value,
+    benchmark: document.getElementById('rb-benchmark').value.trim().toUpperCase() || 'SPY',
+    allow_short_selling: document.getElementById('rb-short').checked,
+  };
+
+  try {
+    const res = await fetch('/api/research/backtest', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+    const d = await res.json();
+    _lastBacktestReturns = d.equity_curve_net ? d.equity_curve_net.map((v, i, a) => i > 0 && a[i-1] ? (v - a[i-1]) / a[i-1] : 0).slice(1) : null;
+    renderBacktestResult(d, resultEl);
+  } catch (err) {
+    errEl.textContent = err.message;
+    resultEl.innerHTML = '<div class="empty-state">Backtest failed. Check parameters and try again.</div>';
+  }
+});
+
+function renderBacktestResult(d, el) {
+  const retClass = d.total_return >= 0 ? 'up' : 'down';
+  const cb = d.cost_breakdown || {};
+  let html = `
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+      ${metricCard('Total Return', d.total_return, '%', retClass)}
+      ${metricCard('Sharpe (net)', d.sharpe_ratio_net)}
+      ${metricCard('Sharpe (gross)', d.sharpe_ratio_gross)}
+      ${metricCard('Sortino', d.sortino_ratio)}
+      ${metricCard('Calmar', d.calmar_ratio)}
+      ${metricCard('Max DD (net)', d.max_drawdown_net, '%')}
+      ${metricCard('VaR 95%', d.var_95, '%')}
+      ${metricCard('CVaR 95%', d.cvar_95, '%')}
+      ${metricCard('Win Rate', d.win_rate, '%')}
+      ${metricCard('Total Trades', d.total_trades)}
+    </div>`;
+
+  // Cost breakdown
+  html += `<h4 style="margin:12px 0 6px;">Transaction Cost Breakdown</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+      ${metricCard('Commission', '$' + (cb.total_commission || 0).toFixed(2))}
+      ${metricCard('Slippage', '$' + (cb.total_slippage || 0).toFixed(2))}
+      ${metricCard('Spread', '$' + (cb.total_spread || 0).toFixed(2))}
+      ${metricCard('Borrow', '$' + (cb.total_borrow || 0).toFixed(2))}
+      ${metricCard('Total Costs', '$' + (cb.total_costs || 0).toFixed(2))}
+      ${metricCard('Costs % Capital', (cb.costs_pct_of_capital || 0).toFixed(2) + '%')}
+    </div>`;
+
+  // Benchmark comparison
+  if (d.benchmark) {
+    html += `<h4 style="margin:12px 0 6px;">vs Benchmark (${d.benchmark.ticker})</h4>
+      <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+        ${metricCard('Bench Return', d.benchmark.total_return, '%')}
+        ${metricCard('Bench Sharpe', d.benchmark.sharpe)}
+        ${metricCard('Alpha', d.alpha || 0)}
+        ${metricCard('Beta', d.beta || 0)}
+        ${metricCard('Info Ratio', d.information_ratio || 0)}
+        ${metricCard('Track Error', d.tracking_error || 0)}
+      </div>`;
+  }
+
+  // Mini equity chart (ASCII sparkline)
+  if (d.equity_curve_net && d.equity_curve_net.length > 1) {
+    const curve = d.equity_curve_net;
+    const mn = Math.min(...curve), mx = Math.max(...curve);
+    const bars = curve.map(v => {
+      const h = mx > mn ? Math.round(((v - mn) / (mx - mn)) * 40) + 2 : 20;
+      return `<div style="flex:1;min-width:2px;height:${h}px;background:var(--accent);border-radius:1px 1px 0 0;"></div>`;
+    }).join('');
+    html += `<h4 style="margin:12px 0 6px;">Equity Curve (Net of Costs)</h4>
+      <div style="display:flex;align-items:flex-end;height:50px;gap:1px;padding:4px 0;">${bars}</div>
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-3);"><span>$${curve[0].toLocaleString()}</span><span>$${curve[curve.length-1].toLocaleString()}</span></div>`;
+  }
+
+  html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">Executed in ${d.execution_time_ms}ms</div>`;
+  el.innerHTML = html;
+}
+
+// ── Walk-Forward form ──
+document.getElementById('research-wf-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('wf-error');
+  const resultEl = document.getElementById('research-wf-result');
+  errEl.textContent = '';
+  resultEl.innerHTML = '<div class="empty-state">Running walk-forward validation (this may take 30-60s)…</div>';
+
+  const body = {
+    assets: [document.getElementById('wf-asset').value.trim().toUpperCase()],
+    window_type: document.getElementById('wf-type').value,
+    total_years: +document.getElementById('wf-total').value,
+    train_years: +document.getElementById('wf-train').value,
+    test_years: +document.getElementById('wf-test').value,
+    optimize_parameters: document.getElementById('wf-optimize').checked,
+  };
+
+  try {
+    const res = await fetch('/api/research/walk-forward', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+    const d = await res.json();
+    renderWalkForwardResult(d, resultEl);
+  } catch (err) {
+    errEl.textContent = err.message;
+    resultEl.innerHTML = '<div class="empty-state">Walk-forward failed. Check parameters.</div>';
+  }
+});
+
+function renderWalkForwardResult(d, el) {
+  const agg = d.aggregated_oos || {};
+  const of = d.overfitting_analysis || {};
+  const ps = d.parameter_stability || {};
+
+  let html = `
+    <h4 style="margin:0 0 8px;">Aggregated Out-of-Sample (${d.n_folds} folds, ${d.window_type})</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:16px;">
+      ${metricCard('OOS Sharpe', agg.sharpe)}
+      ${metricCard('OOS Sortino', agg.sortino)}
+      ${metricCard('OOS Return', agg.total_return, '%')}
+      ${metricCard('OOS Max DD', agg.max_drawdown, '%')}
+      ${metricCard('OOS Calmar', agg.calmar)}
+      ${metricCard('OOS CVaR 95', agg.cvar_95, '%')}
+    </div>`;
+
+  // Overfitting analysis
+  html += `<h4 style="margin:12px 0 6px;">Overfitting Analysis</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:10px;">
+      ${metricCard('Avg Train Sharpe', of.avg_train_sharpe)}
+      ${metricCard('Avg OOS Sharpe', of.avg_oos_sharpe)}
+      ${metricCard('Sharpe Decay', of.sharpe_decay)}
+      ${metricCard('Overfit Score', of.overfitting_score)}
+    </div>
+    <div style="margin-bottom:12px;">
+      ${signalBadge(!of.likely_overfit, of.likely_overfit ? 'Likely Overfit — OOS performance decays significantly' : 'No strong overfitting signal — OOS performance holds')}
+    </div>`;
+
+  // Parameter stability
+  if (ps.fast_windows) {
+    html += `<h4 style="margin:12px 0 6px;">Parameter Stability</h4>
+      <div style="font-size:13px;margin-bottom:6px;">
+        <span style="color:var(--text-2);">Fast windows:</span> ${ps.fast_windows.join(', ')}
+        <span style="margin-left:12px;color:var(--text-2);">Slow windows:</span> ${ps.slow_windows.join(', ')}
+      </div>
+      ${signalBadge(ps.parameters_stable, ps.parameters_stable ? 'Parameters stable across folds' : 'Parameters vary — possible instability')}`;
+  }
+
+  // Per-fold table
+  if (d.folds && d.folds.length > 0) {
+    html += `<h4 style="margin:16px 0 6px;">Per-Fold Results</h4>
+      <div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">
+        <thead><tr style="border-bottom:1px solid var(--border);">
+          <th style="padding:4px 8px;text-align:left;">Fold</th>
+          <th style="padding:4px 8px;">Train Sharpe</th>
+          <th style="padding:4px 8px;">OOS Sharpe</th>
+          <th style="padding:4px 8px;">OOS Return</th>
+          <th style="padding:4px 8px;">OOS Max DD</th>
+          <th style="padding:4px 8px;">Best Fast</th>
+          <th style="padding:4px 8px;">Best Slow</th>
+        </tr></thead><tbody>`;
+    for (const f of d.folds) {
+      html += `<tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:4px 8px;">${f.fold + 1}</td>
+        <td style="padding:4px 8px;text-align:center;">${f.train_sharpe.toFixed(3)}</td>
+        <td style="padding:4px 8px;text-align:center;color:${f.oos_sharpe > 0 ? 'var(--up)' : 'var(--down)'}">${f.oos_sharpe.toFixed(3)}</td>
+        <td style="padding:4px 8px;text-align:center;">${(f.oos_return * 100).toFixed(2)}%</td>
+        <td style="padding:4px 8px;text-align:center;">${(f.oos_max_dd * 100).toFixed(2)}%</td>
+        <td style="padding:4px 8px;text-align:center;">${f.best_fast_window}</td>
+        <td style="padding:4px 8px;text-align:center;">${f.best_slow_window}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+
+  html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">Completed in ${d.execution_time_ms}ms</div>`;
+  el.innerHTML = html;
+}
+
+// ── Statistical Tests form ──
+document.getElementById('research-stat-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('st-error');
+  const resultEl = document.getElementById('research-stat-result');
+  errEl.textContent = '';
+
+  if (!_lastBacktestReturns || _lastBacktestReturns.length < 5) {
+    errEl.textContent = 'Run an advanced backtest first to generate return data.';
+    return;
+  }
+
+  resultEl.innerHTML = '<div class="empty-state">Running statistical tests (bootstrap + permutation)…</div>';
+
+  const body = {
+    returns: _lastBacktestReturns,
+    n_strategies_tested: +document.getElementById('st-trials').value,
+  };
+
+  try {
+    const res = await fetch('/api/research/stat-test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+    const d = await res.json();
+    renderStatResult(d, resultEl);
+  } catch (err) {
+    errEl.textContent = err.message;
+    resultEl.innerHTML = '<div class="empty-state">Statistical tests failed.</div>';
+  }
+});
+
+function renderStatResult(d, el) {
+  const summ = d.summary || {};
+  const tt = d.ttest_nw || {};
+  const bs = d.bootstrap_sharpe || {};
+  const pm = d.permutation_test || {};
+  const dsr = d.deflated_sharpe || {};
+  const lb = d.ljung_box || {};
+
+  let html = `
+    <h4 style="margin:0 0 10px;">Overall Verdict</h4>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;">
+      ${signalBadge(summ.overall_credible, summ.overall_credible ? 'Strategy is statistically credible' : 'Strategy does NOT pass all significance tests')}
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px;">
+      ${signalBadge(summ.mean_return_significant, 'Mean Return ≠ 0')}
+      ${signalBadge(summ.sharpe_ci_excludes_zero, 'Sharpe CI > 0')}
+      ${signalBadge(summ.permutation_significant, 'Permutation Test')}
+      ${signalBadge(summ.survives_deflation, 'Deflated Sharpe')}
+      ${signalBadge(!summ.has_autocorrelation, 'No Autocorrelation')}
+    </div>`;
+
+  // t-test
+  html += `<h4 style="margin:12px 0 6px;">t-Test (Newey-West HAC)</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:12px;">
+      ${metricCard('t-Statistic', tt.t_stat)}
+      ${metricCard('p-Value', tt.p_value)}
+      ${metricCard('Ann. Mean', tt.annualized_mean)}
+      ${metricCard('N', tt.n)}
+    </div>`;
+
+  // Bootstrap
+  html += `<h4 style="margin:12px 0 6px;">Bootstrap Sharpe (${bs.n_bootstrap?.toLocaleString()} samples)</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:12px;">
+      ${metricCard('Sharpe', bs.sharpe)}
+      ${metricCard('95% CI Lower', bs.ci_lower)}
+      ${metricCard('95% CI Upper', bs.ci_upper)}
+      ${metricCard('P(Sharpe > 0)', bs.probability_positive, '%')}
+    </div>`;
+
+  // Permutation
+  html += `<h4 style="margin:12px 0 6px;">Permutation Test</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:12px;">
+      ${metricCard('Observed SR', pm.observed_sharpe)}
+      ${metricCard('p-Value', pm.p_value)}
+      ${metricCard('Exceeded By', pm.count_exceeding + '/' + pm.n_permutations)}
+    </div>`;
+
+  // Deflated Sharpe
+  html += `<h4 style="margin:12px 0 6px;">Deflated Sharpe Ratio (Bailey & López de Prado)</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:8px;">
+      ${metricCard('Observed SR', dsr.observed_sharpe)}
+      ${metricCard('E[max(SR)]', dsr.expected_max_sharpe)}
+      ${metricCard('DSR p-Value', dsr.dsr_p_value)}
+      ${metricCard('# Trials', dsr.n_trials)}
+      ${metricCard('Haircut %', dsr.haircut_pct + '%')}
+    </div>
+    <p style="font-size:12px;color:var(--text-2);margin:4px 0 12px;">${dsr.interpretation || ''}</p>`;
+
+  // Autocorrelation
+  html += `<h4 style="margin:12px 0 6px;">Ljung-Box Autocorrelation</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:8px;">
+      ${metricCard('Q-Statistic', lb.test_statistic)}
+      ${metricCard('p-Value', lb.p_value)}
+    </div>
+    <p style="font-size:12px;color:var(--text-2);">${lb.interpretation || ''}</p>`;
+
+  el.innerHTML = html;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// PHASE 2 — Alpha Research, Factor Model, Correlation, Port Opt
+// ══════════════════════════════════════════════════════════════════
+
+function parseAssets(inputEl) {
+  return inputEl.value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+}
+
+// ── Alpha Research ──────────────────────────────────────────────
+document.getElementById('alpha-research-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('ar-error');
+  const resultEl = document.getElementById('alpha-research-result');
+  errEl.textContent = '';
+  resultEl.innerHTML = '<div class="empty-state">Running alpha research (computing IC, decay, quintile analysis)…</div>';
+
+  const body = {
+    assets: parseAssets(document.getElementById('ar-assets')),
+    signal_type: document.getElementById('ar-signal').value,
+    period: document.getElementById('ar-period').value,
+    max_horizon: +document.getElementById('ar-horizon').value,
+  };
+
+  try {
+    const res = await fetch('/api/research/alpha', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+    renderAlphaResult(await res.json(), resultEl);
+  } catch (err) {
+    errEl.textContent = err.message;
+    resultEl.innerHTML = '<div class="empty-state">Alpha research failed.</div>';
+  }
+});
+
+function renderAlphaResult(d, el) {
+  const ic = d.ic_analysis || {};
+  const decay = d.ic_decay || {};
+  const hr = d.hit_rate || {};
+  const quint = d.quintile_analysis || {};
+  const to = d.factor_turnover || {};
+  const qs = d.alpha_quality_score || {};
+
+  // Quality score pill
+  const scoreColor = qs.score >= 75 ? 'var(--up)' : qs.score >= 50 ? '#f59e0b' : qs.score >= 25 ? '#f97316' : 'var(--down)';
+  let html = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+      <div style="width:52px;height:52px;border-radius:50%;background:conic-gradient(${scoreColor} ${qs.score * 3.6}deg,var(--surface-2) 0);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:${scoreColor};">${qs.score || 0}</div>
+      <div>
+        <div style="font-size:16px;font-weight:700;color:${scoreColor};">${qs.rating || 'N/A'} Alpha Quality</div>
+        <div style="font-size:12px;color:var(--text-3);">${d.n_assets} assets · ${d.n_periods} periods · ${d.signal_type} signal</div>
+      </div>
+    </div>`;
+
+  // IC metrics grid
+  html += `<h4 style="margin:0 0 8px;">Information Coefficient</h4>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:14px;">
+      ${metricCard('Mean IC', ic.mean_ic)}
+      ${metricCard('IC Std', ic.ic_std)}
+      ${metricCard('ICIR', ic.icir)}
+      ${metricCard('t-Stat', ic.t_stat)}
+      ${metricCard('p-Value', ic.p_value)}
+      ${metricCard('+IC %', ic.positive_ic_pct, '%')}
+    </div>
+    <div style="margin-bottom:10px;">${signalBadge(ic.significant_5pct, ic.significant_5pct ? 'IC statistically significant (p<5%)' : 'IC not significant — signal may lack predictive power')}</div>
+    <p style="font-size:12px;color:var(--text-2);margin-bottom:14px;">${ic.interpretation || ''}</p>`;
+
+  // IC decay sparkline
+  if (decay.ic_by_horizon && decay.ic_by_horizon.length > 0) {
+    const vals = decay.ic_by_horizon.map(x => x.mean_ic);
+    const mn = Math.min(...vals), mx = Math.max(Math.abs(mn), ...vals.map(Math.abs));
+    const bars = vals.map((v, i) => {
+      const h = mx > 0 ? Math.abs(v) / mx * 36 + 2 : 4;
+      const c = v >= 0 ? 'var(--accent)' : 'var(--down)';
+      return `<div style="display:flex;flex-direction:column;align-items:center;flex:1;"><div style="width:100%;height:${h}px;background:${c};border-radius:2px;"></div><div style="font-size:9px;color:var(--text-3);">${decay.horizons[i]}d</div></div>`;
+    }).join('');
+    html += `<h4 style="margin:0 0 6px;">IC Decay (alpha half-life: ${decay.half_life_days || '> ' + decay.horizons.at(-1)} days)</h4>
+      <div style="display:flex;align-items:flex-end;gap:2px;height:48px;margin-bottom:14px;">${bars}</div>`;
+  }
+
+  // Hit rate + quintile spread
+  html += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
+    <div>
+      <h4 style="margin:0 0 6px;">Hit Rate</h4>
+      ${metricCard('Hit Rate', hr.hit_rate, '%')}
+      <div style="margin-top:6px;">${signalBadge(hr.significant_5pct, hr.significant_5pct ? 'Directionally significant' : 'Not directionally significant')}</div>
+    </div>
+    <div>
+      <h4 style="margin:0 0 6px;">Quintile Spread</h4>
+      ${metricCard('Ann. Spread', quint.annualised_spread, '%')}
+      <div style="margin-top:6px;">${signalBadge(quint.monotonic, quint.monotonic ? 'Monotonic Q1→Q5' : 'Non-monotonic quintiles')}</div>
+    </div>
+  </div>`;
+
+  // Quintile bar chart
+  if (quint.quantile_returns && quint.quantile_returns.length > 0) {
+    const qvals = quint.quantile_returns;
+    const qmax = Math.max(...qvals.map(Math.abs));
+    const qbars = qvals.map((v, i) => {
+      const h = qmax > 0 ? Math.abs(v) / qmax * 32 + 4 : 4;
+      const c = v >= 0 ? 'var(--up)' : 'var(--down)';
+      return `<div style="display:flex;flex-direction:column;align-items:center;gap:2px;flex:1;">
+        <div style="width:80%;height:${h}px;background:${c};border-radius:2px;"></div>
+        <div style="font-size:10px;color:var(--text-3);">Q${i+1}</div>
+      </div>`;
+    }).join('');
+    html += `<h4 style="margin:0 0 6px;">Quintile Returns</h4>
+      <div style="display:flex;align-items:flex-end;gap:4px;height:44px;margin-bottom:12px;">${qbars}</div>`;
+  }
+
+  // Factor turnover
+  html += `<h4 style="margin:0 0 6px;">Factor Turnover</h4>
+    <div style="font-size:13px;">Avg rank correlation: <b>${to.avg_rank_correlation}</b> · Turnover: <b>${to.avg_turnover}</b></div>
+    <div style="font-size:12px;color:var(--text-2);margin-top:4px;">${to.turnover_interpretation || ''}</div>`;
+
+  el.innerHTML = html;
+}
+
+// ── Factor Model (Fama-MacBeth) ───────────────────────────────────
+document.getElementById('factor-model-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('fm-error');
+  const resultEl = document.getElementById('factor-model-result');
+  errEl.textContent = '';
+  resultEl.innerHTML = '<div class="empty-state">Running Fama-MacBeth regression (this may take 30-60s)…</div>';
+
+  const factors = [...document.querySelectorAll('#fm-factors input:checked')].map(c => c.value);
+  if (factors.length === 0) { errEl.textContent = 'Select at least one factor.'; return; }
+
+  const body = {
+    assets: parseAssets(document.getElementById('fm-assets')),
+    period: document.getElementById('fm-period').value,
+    factors,
+    newey_west_lags: +document.getElementById('fm-nw').value,
+  };
+
+  try {
+    const res = await fetch('/api/research/factor-model', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+    renderFactorModelResult(await res.json(), resultEl);
+  } catch (err) {
+    errEl.textContent = err.message;
+    resultEl.innerHTML = '<div class="empty-state">Factor model failed.</div>';
+  }
+});
+
+function renderFactorModelResult(d, el) {
+  const fm = d.fama_macbeth || {};
+  const risk = d.risk_decomposition || {};
+  if (fm.error) { el.innerHTML = `<div class="empty-state">${fm.error}</div>`; return; }
+
+  const premia = fm.factor_premia || {};
+  const ranked = fm.factors_ranked_by_significance || [];
+
+  let html = `<h4 style="margin:0 0 8px;">Factor Risk Premia (${d.asset_names?.length || 0} assets, ${fm.n_cross_sections} cross-sections)</h4>
+    <p style="font-size:12px;color:var(--text-3);margin-bottom:10px;">Cross-sectional R² = ${(fm.mean_cross_sectional_r2 * 100).toFixed(1)}%</p>
+    <div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <thead><tr style="border-bottom:1px solid var(--border);">
+        <th style="padding:5px 8px;text-align:left;">Factor</th>
+        <th style="padding:5px 8px;">λ (daily)</th>
+        <th style="padding:5px 8px;">λ (annual)</th>
+        <th style="padding:5px 8px;">NW t-stat</th>
+        <th style="padding:5px 8px;">p-value</th>
+        <th style="padding:5px 8px;">Significant</th>
+      </tr></thead><tbody>`;
+
+  for (const { factor } of ranked) {
+    const p = premia[factor];
+    if (!p) continue;
+    const sigColor = p.significant_1pct ? 'var(--up)' : p.significant_5pct ? '#f59e0b' : 'var(--text-3)';
+    const sigLabel = p.significant_1pct ? '✓ 1%' : p.significant_5pct ? '✓ 5%' : '✗';
+    html += `<tr style="border-bottom:1px solid var(--border);">
+      <td style="padding:5px 8px;font-weight:600;">${factor}</td>
+      <td style="padding:5px 8px;text-align:center;color:${p.lambda >= 0 ? 'var(--up)' : 'var(--down)'};">${p.lambda?.toFixed(5)}</td>
+      <td style="padding:5px 8px;text-align:center;color:${p.lambda_annualised >= 0 ? 'var(--up)' : 'var(--down)'};">${(p.lambda_annualised * 100)?.toFixed(2)}%</td>
+      <td style="padding:5px 8px;text-align:center;">${p.t_stat?.toFixed(3)}</td>
+      <td style="padding:5px 8px;text-align:center;">${p.p_value?.toFixed(4)}</td>
+      <td style="padding:5px 8px;text-align:center;font-weight:700;color:${sigColor};">${sigLabel}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  // Barra risk decomposition
+  if (!risk.error) {
+    html += `<h4 style="margin:16px 0 8px;">Barra Risk Decomposition</h4>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;">
+        ${metricCard('Factor Risk', (risk.pct_factor_explained * 100)?.toFixed(1) + '%')}
+        ${metricCard('Specific Risk', (risk.pct_specific * 100)?.toFixed(1) + '%')}
+        ${metricCard('Avg Factor Var', risk.avg_factor_variance?.toFixed(4))}
+        ${metricCard('Avg Specific Var', risk.avg_specific_variance?.toFixed(4))}
+        ${metricCard('Valid Assets', risk.n_valid_assets)}
+      </div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+// ── Correlation Engine ───────────────────────────────────────────
+document.getElementById('correlation-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('ce-error');
+  const resultEl = document.getElementById('correlation-result');
+  errEl.textContent = '';
+  resultEl.innerHTML = '<div class="empty-state">Computing correlations across 6 estimators…</div>';
+
+  const body = {
+    assets: parseAssets(document.getElementById('ce-assets')),
+    period: document.getElementById('ce-period').value,
+    ewma_halflife: +document.getElementById('ce-halflife').value,
+  };
+
+  try {
+    const res = await fetch('/api/research/correlation', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+    renderCorrelationResult(await res.json(), resultEl);
+  } catch (err) {
+    errEl.textContent = err.message;
+    resultEl.innerHTML = '<div class="empty-state">Correlation analysis failed.</div>';
+  }
+});
+
+function renderCorrelationResult(d, el) {
+  const diag = d.diagnostics || {};
+  const rec = d.recommended_estimator || {};
+  const lw = d.shrinkage_intensities || {};
+  const pca = d.pca_info || {};
+  const names = d.ticker_names || [];
+
+  let html = `<h4 style="margin:0 0 8px;">Recommendation</h4>
+    <div style="padding:10px;background:var(--surface-2);border-radius:8px;margin-bottom:14px;">
+      <span style="font-weight:700;color:var(--accent);">${rec.estimator?.toUpperCase()}</span>
+      <span style="font-size:12px;color:var(--text-2);margin-left:8px;">${rec.reason || ''}</span>
+    </div>
+    <p style="font-size:12px;color:var(--text-3);margin-bottom:10px;">T=${d.n_periods} · N=${d.n_assets} · T/N=${d.ratio_T_over_N}</p>`;
+
+  // Diagnostics table
+  html += `<h4 style="margin:0 0 6px;">Estimator Diagnostics</h4>
+    <div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <thead><tr style="border-bottom:1px solid var(--border);">
+        <th style="padding:4px 8px;text-align:left;">Method</th>
+        <th style="padding:4px 8px;">Positive Definite</th>
+        <th style="padding:4px 8px;">Condition #</th>
+        <th style="padding:4px 8px;">Avg |Corr|</th>
+        <th style="padding:4px 8px;">Eff. Bets</th>
+      </tr></thead><tbody>`;
+
+  const methodLabels = {
+    pearson: 'Pearson', spearman: 'Spearman', ewma: `EWMA ${d.pca_info ? '' : ''}`,
+    ledoit_wolf: 'Ledoit-Wolf', oas: 'OAS', pca: `PCA (${pca.n_components}f)`,
+  };
+
+  for (const [m, info] of Object.entries(diag)) {
+    const pdColor = info.is_positive_definite ? 'var(--up)' : 'var(--down)';
+    const isRec = m === rec.estimator;
+    html += `<tr style="border-bottom:1px solid var(--border);${isRec ? 'background:rgba(99,102,241,0.07);' : ''}">
+      <td style="padding:4px 8px;font-weight:${isRec ? '700' : 'normal'};">${methodLabels[m] || m}${isRec ? ' ★' : ''}</td>
+      <td style="padding:4px 8px;text-align:center;color:${pdColor};">${info.is_positive_definite ? '✓' : '✗'}</td>
+      <td style="padding:4px 8px;text-align:center;">${info.condition_number?.toLocaleString()}</td>
+      <td style="padding:4px 8px;text-align:center;">${info.avg_abs_correlation?.toFixed(3)}</td>
+      <td style="padding:4px 8px;text-align:center;">${info.effective_uncorrelated_bets?.toFixed(1)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  // Shrinkage info
+  html += `<div style="margin-top:12px;font-size:12px;color:var(--text-2);">
+    Ledoit-Wolf intensity: <b>${lw.ledoit_wolf}</b> &nbsp;|&nbsp; OAS intensity: <b>${lw.oas}</b>
+    &nbsp;|&nbsp; PCA components: <b>${pca.n_components}</b> (${pca.cumulative_explained?.at(-1) * 100 | 0}% var explained)
+  </div>`;
+
+  // Mini correlation heatmap for recommended estimator (text-based)
+  const recCorr = d.correlations?.[rec.estimator];
+  if (recCorr && names.length <= 12) {
+    const N = names.length;
+    html += `<h4 style="margin:14px 0 6px;">${methodLabels[rec.estimator] || rec.estimator} Correlation Matrix</h4>
+      <div style="overflow-x:auto;"><table style="font-size:10px;border-collapse:collapse;">
+        <thead><tr><th></th>${names.map(n => `<th style="padding:2px 4px;transform:rotate(-30deg);min-width:28px;">${n}</th>`).join('')}</tr></thead><tbody>`;
+    for (let i = 0; i < N; i++) {
+      html += `<tr><td style="padding:2px 4px;font-weight:600;">${names[i]}</td>`;
+      for (let j = 0; j < N; j++) {
+        const v = recCorr[i]?.[j] ?? 0;
+        const abs = Math.abs(v);
+        const alpha = i === j ? 0.15 : abs * 0.7;
+        const bg = v > 0 ? `rgba(99,102,241,${alpha})` : `rgba(239,68,68,${alpha})`;
+        html += `<td style="padding:2px 4px;text-align:center;background:${bg};border-radius:2px;">${i === j ? '—' : v.toFixed(2)}</td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+// ── Portfolio Optimisation ───────────────────────────────────────
+document.getElementById('portopt-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const errEl = document.getElementById('po-error');
+  const resultEl = document.getElementById('portopt-result');
+  errEl.textContent = '';
+  resultEl.innerHTML = '<div class="empty-state">Running portfolio optimisation across all methods…</div>';
+
+  const body = {
+    assets: parseAssets(document.getElementById('po-assets')),
+    period: document.getElementById('po-period').value,
+    covariance_method: document.getElementById('po-cov').value,
+    long_only: document.getElementById('po-longonly').checked,
+    max_weight: +document.getElementById('po-maxw').value / 100,
+    min_weight: 0,
+    risk_free_rate: +document.getElementById('po-rf').value / 100,
+    include_sba: document.getElementById('po-sba').checked,
+  };
+
+  try {
+    const res = await fetch('/api/research/optimize', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+    renderPortOptResult(await res.json(), resultEl);
+  } catch (err) {
+    errEl.textContent = err.message;
+    resultEl.innerHTML = '<div class="empty-state">Optimisation failed.</div>';
+  }
+});
+
+function renderPortOptResult(d, el) {
+  const portfolios = d.portfolios || {};
+  const ranked = d.portfolios_ranked_by_sharpe || [];
+  const frontier = d.efficient_frontier || [];
+
+  const methodNames = {
+    equal_weight: 'Equal Weight', min_variance: 'Min Variance',
+    max_sharpe: 'Max Sharpe', risk_parity: 'Risk Parity',
+    max_diversification: 'Max Diversification', sba_signal: 'SBA Signal',
+  };
+
+  let html = `<h4 style="margin:0 0 8px;">Method Comparison (${d.n_assets} assets, ${d.covariance_method})</h4>
+    <div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <thead><tr style="border-bottom:1px solid var(--border);">
+        <th style="padding:5px 8px;text-align:left;">Method</th>
+        <th style="padding:5px 8px;">Ann. Return</th>
+        <th style="padding:5px 8px;">Ann. Vol</th>
+        <th style="padding:5px 8px;">Sharpe</th>
+        <th style="padding:5px 8px;">Div. Ratio</th>
+        <th style="padding:5px 8px;">Eff. N</th>
+        <th style="padding:5px 8px;">Max Wt</th>
+      </tr></thead><tbody>`;
+
+  for (const { method } of ranked) {
+    const p = portfolios[method];
+    if (!p) continue;
+    const isTop = ranked[0]?.method === method;
+    html += `<tr style="border-bottom:1px solid var(--border);${isTop ? 'background:rgba(99,102,241,0.07);' : ''}">
+      <td style="padding:5px 8px;font-weight:${isTop ? '700' : 'normal'};">${methodNames[method] || method}${isTop ? ' ★' : ''}</td>
+      <td style="padding:5px 8px;text-align:center;color:${p.annual_return >= 0 ? 'var(--up)' : 'var(--down)'};">${(p.annual_return * 100).toFixed(2)}%</td>
+      <td style="padding:5px 8px;text-align:center;">${(p.annual_volatility * 100).toFixed(2)}%</td>
+      <td style="padding:5px 8px;text-align:center;color:${p.sharpe_ratio > 0 ? 'var(--up)' : 'var(--down)'};">${p.sharpe_ratio?.toFixed(3)}</td>
+      <td style="padding:5px 8px;text-align:center;">${p.diversification_ratio?.toFixed(2)}</td>
+      <td style="padding:5px 8px;text-align:center;">${p.effective_n?.toFixed(1)}</td>
+      <td style="padding:5px 8px;text-align:center;">${(p.max_weight * 100).toFixed(1)}%</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  // Best method weights as bar chart
+  const bestMethod = ranked[0]?.method;
+  const bestPortfolio = portfolios[bestMethod];
+  if (bestPortfolio?.weights) {
+    const entries = Object.entries(bestPortfolio.weights).sort((a, b) => b[1] - a[1]).slice(0, 12);
+    const maxW = Math.max(...entries.map(x => x[1]));
+    html += `<h4 style="margin:16px 0 8px;">Top Holdings — ${methodNames[bestMethod] || bestMethod}</h4>
+      <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:14px;">`;
+    for (const [ticker, wt] of entries) {
+      const barW = maxW > 0 ? (wt / maxW * 100).toFixed(1) : 0;
+      html += `<div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+        <span style="min-width:48px;color:var(--text-2);">${ticker}</span>
+        <div style="flex:1;height:14px;background:var(--surface-2);border-radius:3px;overflow:hidden;">
+          <div style="width:${barW}%;height:100%;background:var(--accent);border-radius:3px;"></div>
+        </div>
+        <span style="min-width:38px;text-align:right;font-weight:600;">${(wt * 100).toFixed(1)}%</span>
+      </div>`;
+    }
+    html += '</div>';
+  }
+
+  // Efficient frontier mini-chart
+  if (frontier.length > 0) {
+    const vols = frontier.map(p => p.volatility);
+    const rets = frontier.map(p => p.return);
+    const minV = Math.min(...vols), maxV = Math.max(...vols);
+    const minR = Math.min(...rets), maxR = Math.max(...rets);
+
+    html += `<h4 style="margin:0 0 6px;">Efficient Frontier</h4>
+      <div style="position:relative;height:80px;background:var(--surface-2);border-radius:6px;padding:4px;margin-bottom:8px;overflow:hidden;">
+        <svg width="100%" height="100%" viewBox="0 0 300 80" preserveAspectRatio="none">
+          <polyline points="${frontier.map(p => {
+            const x = maxV > minV ? ((p.volatility - minV) / (maxV - minV)) * 290 + 5 : 150;
+            const y = maxR > minR ? 75 - ((p.return - minR) / (maxR - minR)) * 70 : 40;
+            return `${x},${y}`;
+          }).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-3);">
+        <span>Vol: ${(minV * 100).toFixed(1)}%</span><span>← Risk/Return →</span><span>Vol: ${(maxV * 100).toFixed(1)}%</span>
+      </div>`;
+  }
+
+  el.innerHTML = html;
+}

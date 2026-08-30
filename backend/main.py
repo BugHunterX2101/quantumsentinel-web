@@ -35,14 +35,24 @@ from .database import get_db, init_db, SessionLocal
 from .config import CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service
+from .services import walk_forward as walk_forward_service
+from .services import stat_tests as stat_tests_service
 
 
-# Default watchlist for new users (20 blue-chip stocks)
+# Default watchlist for new users — 50 liquid US assets for cross-sectional factor modeling
+# Covers: Mega-cap tech, financials, healthcare, energy, consumer, industrials,
+# materials, REITs, ETFs, and crypto proxies for broad factor coverage.
 DEFAULT_WATCHLIST = [
-    "AAPL","MSFT","NVDA","GOOGL","META",
-    "TSLA","AMZN","JPM","V","JNJ",
-    "XOM","SPY","QQQ","GLD","COIN",
-    "NFLX","AMD","BKNG","LLY","TSM",
+    # Mega-cap tech / growth
+    "AAPL","MSFT","NVDA","GOOGL","META","AMZN","TSLA","AVGO","ORCL","CRM",
+    # Financials
+    "JPM","BAC","GS","MS","BLK","V","MA","PYPL","C","WFC",
+    # Healthcare / biotech
+    "JNJ","LLY","ABBV","MRK","UNH","PFE","AMGN","GILD","BMY","ISRG",
+    # Energy / materials / industrials
+    "XOM","CVX","COP","NEE","CAT","RTX","HON","LIN","FCX","NEM",
+    # Consumer / media / ETFs / crypto
+    "NFLX","AMD","BKNG","DIS","KO","WMT","HD","SPY","QQQ","COIN",
 ]
 
 # ── Exchange Registry ──────────────────────────────────────────────────────────
@@ -1059,6 +1069,648 @@ def export_portfolio(user: models.User = Depends(get_current_user), db: Session 
         "\n".join(rows) + "\n", media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=quantumsentinel-portfolio.csv"},
     )
+
+
+# --------------------------------------------------------------------------
+# Research Engine (Phase 1) — Advanced backtesting, walk-forward, stat tests
+# --------------------------------------------------------------------------
+
+@app.post("/api/research/backtest", status_code=200)
+def advanced_backtest(req: schemas.AdvancedBacktestRequest,
+                      user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """Advanced backtester with realistic execution costs, multiple strategies,
+    and comprehensive risk metrics."""
+    from .services.backtest_service import (
+        BacktestConfig, BacktestEngine, StrategyConfig, StrategyType,
+    )
+    from .services.execution_model import (
+        zero_cost_config, retail_config, institutional_config,
+        PositionSizer, SizingMethod,
+    )
+
+    # Map execution preset
+    exec_map = {"zero_cost": zero_cost_config, "retail": retail_config,
+                "institutional": institutional_config}
+    exec_config = exec_map.get(req.execution_preset, retail_config)()
+    exec_config.allow_short_selling = req.allow_short_selling
+    exec_config.leverage_limit = req.max_leverage
+
+    # Map sizing method
+    sizing_map = {
+        "fixed_fractional": SizingMethod.FIXED_FRACTIONAL,
+        "volatility_target": SizingMethod.VOLATILITY_TARGET,
+        "kelly": SizingMethod.KELLY,
+        "equal_weight": SizingMethod.EQUAL_WEIGHT,
+    }
+    exec_config.sizer = PositionSizer(
+        method=sizing_map.get(req.sizing_method, SizingMethod.FIXED_FRACTIONAL),
+        risk_per_trade=req.risk_per_trade,
+        max_position_pct=req.max_position_pct,
+        max_leverage=req.max_leverage,
+    )
+
+    # Map strategy type
+    strategy_map = {
+        "ma_crossover": StrategyType.MA_CROSSOVER,
+        "sba_signal": StrategyType.SBA_SIGNAL,
+        "momentum": StrategyType.MOMENTUM,
+        "mean_reversion": StrategyType.MEAN_REVERSION,
+    }
+
+    config = BacktestConfig(
+        assets=req.assets,
+        period=req.period,
+        initial_capital=req.initial_capital,
+        strategy=StrategyConfig(
+            strategy_type=strategy_map.get(req.strategy_type, StrategyType.MA_CROSSOVER),
+            fast_window=req.fast_window,
+            slow_window=req.slow_window,
+        ),
+        execution=exec_config,
+        benchmark=req.benchmark,
+    )
+
+    try:
+        engine = BacktestEngine(config)
+        result = engine.run()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Backtest failed: {exc}") from exc
+
+    security_service.write_audit_log(
+        db, user.id, "ADVANCED_BACKTEST", "research", None,
+        {"assets": req.assets, "strategy": req.strategy_type, "period": req.period}
+    )
+    return result
+
+
+@app.post("/api/research/walk-forward", status_code=200)
+def walk_forward_validation(req: schemas.WalkForwardRequest,
+                            user: models.User = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    """Walk-forward validation with rolling/expanding windows and
+    out-of-sample performance aggregation."""
+    from .services.walk_forward import WalkForwardConfig, WalkForwardEngine
+    from .services.backtest_service import StrategyConfig
+    from .services.execution_model import retail_config, institutional_config, zero_cost_config
+
+    exec_map = {"zero_cost": zero_cost_config, "retail": retail_config,
+                "institutional": institutional_config}
+    exec_cfg = exec_map.get(req.execution_preset, retail_config)()
+
+    config = WalkForwardConfig(
+        assets=req.assets,
+        window_type=req.window_type,
+        train_years=req.train_years,
+        test_years=req.test_years,
+        total_years=req.total_years,
+        strategy=StrategyConfig(fast_window=req.fast_window,
+                                slow_window=req.slow_window),
+        execution=exec_cfg,
+        optimize_parameters=req.optimize_parameters,
+    )
+
+    try:
+        engine = WalkForwardEngine(config)
+        result = engine.run()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Walk-forward failed: {exc}") from exc
+
+    security_service.write_audit_log(
+        db, user.id, "WALK_FORWARD", "research", None,
+        {"assets": req.assets, "window_type": req.window_type,
+         "n_folds": result.get("n_folds", 0)}
+    )
+    return result
+
+
+@app.post("/api/research/stat-test", status_code=200)
+def statistical_tests(req: schemas.StatTestRequest,
+                      user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """Run statistical tests on strategy returns: t-test, bootstrap,
+    permutation, Deflated Sharpe Ratio, and multiple-testing corrections."""
+    import numpy as np
+    from .services.stat_tests import run_full_stat_tests
+
+    returns = None
+    if req.returns:
+        returns = np.array(req.returns)
+    elif req.backtest_id:
+        row = db.get(models.Backtest, req.backtest_id)
+        if not row or row.user_id != user.id:
+            raise HTTPException(404, "Backtest not found")
+        # Extract returns from equity curve in result_json
+        rj = row.result_json or {}
+        curve = rj.get("equity_curve_net") or rj.get("equity_curve", [])
+        if len(curve) > 2:
+            returns = np.array([
+                (curve[i] - curve[i - 1]) / curve[i - 1] if curve[i - 1] else 0
+                for i in range(1, len(curve))
+            ])
+    if returns is None or len(returns) < 5:
+        raise HTTPException(422, "Need at least 5 return observations")
+
+    result = run_full_stat_tests(
+        returns,
+        n_strategies_tested=req.n_strategies_tested,
+    )
+
+    security_service.write_audit_log(
+        db, user.id, "STAT_TEST", "research", None,
+        {"n_obs": len(returns), "n_strategies": req.n_strategies_tested}
+    )
+    return result
+
+
+# --------------------------------------------------------------------------
+# Research Engine Phase 2 — Alpha Research, Factor Model, Correlation, Optimisation
+# --------------------------------------------------------------------------
+
+def _fetch_return_matrix(assets: list[str], period: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Fetch and align multi-asset return and price matrices.
+
+    Returns (return_matrix T×N, price_matrix T×N, valid_asset_names).
+    """
+    import numpy as np
+    import yfinance as yf
+    import pandas as pd
+
+    data = yf.download(assets, period=period, interval="1d",
+                       progress=False, auto_adjust=True)
+    if data is None or data.empty:
+        raise ValueError("Failed to download market data")
+
+    close_frames = {}
+    for ticker in assets:
+        try:
+            if isinstance(data.columns, pd.MultiIndex):
+                s = data["Close"][ticker].dropna()
+            else:
+                s = data["Close"].dropna()
+            if len(s) > 50:
+                close_frames[ticker] = s
+        except (KeyError, TypeError):
+            continue
+
+    if len(close_frames) < 4:
+        raise ValueError(f"Only {len(close_frames)} assets had sufficient data")
+
+    # Align on common index
+    df = pd.DataFrame(close_frames).dropna()
+    if len(df) < 60:
+        raise ValueError(f"Only {len(df)} common trading days — need ≥ 60")
+
+    price_matrix = df.to_numpy(dtype=float)
+    return_matrix = np.diff(price_matrix, axis=0) / np.maximum(price_matrix[:-1], 1e-9)
+    valid_names = list(df.columns)
+
+    return return_matrix, price_matrix[1:], valid_names
+
+
+@app.post("/api/research/alpha", status_code=200)
+def alpha_research_endpoint(req: schemas.AlphaResearchRequest,
+                             user: models.User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    """Alpha research: IC, Rank IC, IC decay, hit rate, quintile analysis,
+    factor turnover — measures signal predictive quality before backtesting."""
+    import numpy as np
+    from .services.alpha_research import run_alpha_research
+    from .services.factor_model import compute_factors
+
+    try:
+        return_matrix, price_matrix, names = _fetch_return_matrix(
+            req.assets, req.period
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    T, N = return_matrix.shape
+
+    # Build signal matrix based on requested signal type
+    factor_mats = compute_factors(return_matrix, price_matrix)
+    sig_key_map = {
+        "momentum": "momentum", "reversal": "reversal",
+        "volatility": "volatility", "quality": "quality",
+        "sba": "momentum",  # fallback for SBA to momentum in cross-section
+    }
+    sig_key = sig_key_map.get(req.signal_type, "momentum")
+    signal_matrix = factor_mats.get(sig_key, factor_mats.get("momentum"))
+    if signal_matrix is None:
+        raise HTTPException(422, "Could not compute signal matrix")
+
+    try:
+        result = run_alpha_research(signal_matrix, return_matrix,
+                                    max_horizon=req.max_horizon)
+    except Exception as exc:
+        raise HTTPException(500, f"Alpha research failed: {exc}")
+
+    result["asset_names"] = names
+    result["signal_type"] = req.signal_type
+
+    security_service.write_audit_log(
+        db, user.id, "ALPHA_RESEARCH", "research", None,
+        {"n_assets": N, "signal_type": req.signal_type, "period": req.period}
+    )
+    return result
+
+
+@app.post("/api/research/factor-model", status_code=200)
+def factor_model_endpoint(req: schemas.FactorModelRequest,
+                           user: models.User = Depends(get_current_user),
+                           db: Session = Depends(get_db)):
+    """Fama-MacBeth cross-sectional factor model with Newey-West inference.
+    Estimates factor risk premia and significance across momentum, reversal,
+    volatility, quality, and size factors."""
+    import numpy as np
+    from .services.factor_model import compute_factors, fama_macbeth, barra_risk_decomposition
+
+    try:
+        return_matrix, price_matrix, names = _fetch_return_matrix(
+            req.assets, req.period
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    # Compute requested factors
+    all_factors = compute_factors(return_matrix, price_matrix)
+    requested = {k: v for k, v in all_factors.items() if k in req.factors}
+    if not requested:
+        requested = all_factors  # use all if none match
+
+    try:
+        fm_result = fama_macbeth(return_matrix, requested,
+                                  newey_west_lags=req.newey_west_lags)
+        risk_result = barra_risk_decomposition(return_matrix, requested)
+    except Exception as exc:
+        raise HTTPException(500, f"Factor model failed: {exc}")
+
+    security_service.write_audit_log(
+        db, user.id, "FACTOR_MODEL", "research", None,
+        {"n_assets": len(names), "factors": list(requested.keys())}
+    )
+    return {
+        "fama_macbeth": fm_result,
+        "risk_decomposition": risk_result,
+        "asset_names": names,
+        "factors_computed": list(requested.keys()),
+    }
+
+
+@app.post("/api/research/correlation", status_code=200)
+def correlation_endpoint(req: schemas.CorrelationRequest,
+                          user: models.User = Depends(get_current_user),
+                          db: Session = Depends(get_db)):
+    """Multi-method correlation analysis: Pearson, Spearman, EWMA,
+    Ledoit-Wolf shrinkage, OAS, PCA factor decomposition with diagnostics."""
+    import numpy as np
+    from .services.correlation_engine import run_correlation_engine
+
+    try:
+        return_matrix, _, names = _fetch_return_matrix(req.assets, req.period)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    try:
+        result = run_correlation_engine(
+            return_matrix, names,
+            ewma_halflife=req.ewma_halflife,
+            pca_components=req.pca_components,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Correlation engine failed: {exc}")
+
+    security_service.write_audit_log(
+        db, user.id, "CORRELATION_ANALYSIS", "research", None,
+        {"n_assets": len(names), "period": req.period}
+    )
+    return result
+
+
+@app.post("/api/research/optimize", status_code=200)
+def portfolio_optimize_endpoint(req: schemas.PortfolioOptRequest,
+                                  user: models.User = Depends(get_current_user),
+                                  db: Session = Depends(get_db)):
+    """Multi-method portfolio optimisation: Min-Variance, Max-Sharpe, Risk Parity,
+    Max-Diversification, Equal-Weight, and SBA signal-weighted. Returns weights,
+    analytics, and efficient frontier for each method."""
+    import numpy as np
+    from .services.portfolio_optimization import (
+        run_portfolio_optimization, PortfolioConstraints,
+    )
+
+    try:
+        return_matrix, _, names = _fetch_return_matrix(req.assets, req.period)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    con = PortfolioConstraints(
+        long_only=req.long_only,
+        min_weight=req.min_weight,
+        max_weight=req.max_weight,
+    )
+
+    # SBA signals: use momentum factor as proxy
+    sba_signals = None
+    if req.include_sba:
+        from .services.factor_model import compute_factors
+        factors = compute_factors(return_matrix)
+        mom = factors.get("momentum")
+        if mom is not None:
+            last_valid = mom[-1, :]
+            valid = np.isfinite(last_valid)
+            if valid.sum() > 0:
+                sba_signals = np.where(valid, np.maximum(last_valid, 0), 0)
+
+    try:
+        result = run_portfolio_optimization(
+            return_matrix, names,
+            corr_method=req.covariance_method,
+            rf_rate=req.risk_free_rate / 252,  # convert annual to daily
+            constraints=con,
+            sba_signals=sba_signals,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Optimisation failed: {exc}")
+
+    security_service.write_audit_log(
+        db, user.id, "PORTFOLIO_OPT", "research", None,
+        {"n_assets": len(names), "method": req.covariance_method}
+    )
+    return result
+
+
+
+# --------------------------------------------------------------------------
+# Research Engine Phase 3 — Trading Engine & Microstructure
+# --------------------------------------------------------------------------
+
+def _fetch_single_asset(asset: str, period: str) -> tuple[np.ndarray, np.ndarray]:
+    """Fetch returns and prices for a single asset."""
+    import yfinance as yf
+    data = yf.download(asset, period=period, interval="1d",
+                       progress=False, auto_adjust=True)
+    if data is None or data.empty:
+        raise ValueError(f"Could not fetch data for {asset}")
+    close = data["Close"].dropna()
+    if len(close) < 60:
+        raise ValueError(f"Only {len(close)} trading days for {asset}")
+    prices = close.to_numpy(dtype=float)
+    returns = np.diff(prices) / np.maximum(prices[:-1], 1e-9)
+    return returns, prices
+
+
+@app.post("/api/research/event-backtest", status_code=200)
+def event_backtest_endpoint(req: schemas.EventBacktestRequest,
+                             user: models.User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    """Event-driven backtest with 1-bar execution delay, realistic commissions,
+    bid/ask spread, slippage, and borrow costs. Eliminates vectorised
+    look-ahead bias through strict chronological event processing."""
+    import numpy as np
+    import yfinance as yf
+    import pandas as pd
+    from .services.event_simulator import run_event_backtest
+
+    try:
+        raw = yf.download(req.assets, period=req.period, interval="1d",
+                          progress=False, auto_adjust=True)
+        if raw is None or raw.empty:
+            raise HTTPException(422, "Failed to download market data")
+
+        price_data: dict[str, np.ndarray] = {}
+        for ticker in req.assets:
+            try:
+                s = raw["Close"][ticker] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]
+                s = s.dropna()
+                if len(s) >= 60:
+                    price_data[ticker] = s.to_numpy(dtype=float)
+            except (KeyError, TypeError):
+                continue
+
+        if not price_data:
+            raise HTTPException(422, "No tickers had sufficient data")
+
+        # Align lengths
+        min_len = min(len(v) for v in price_data.values())
+        price_data = {t: v[-min_len:] for t, v in price_data.items()}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, str(exc))
+
+    strategy_params = {
+        "fast": req.fast_window, "slow": req.slow_window,
+        "lookback": 60, "n_long": 3, "n_short": 3,
+    }
+
+    try:
+        result = run_event_backtest(
+            tickers=list(price_data.keys()),
+            price_data=price_data,
+            strategy_name=req.strategy,
+            strategy_params=strategy_params,
+            initial_capital=req.initial_capital,
+            cost_model_name=req.cost_model,
+            allow_short=req.allow_short,
+            sizing_method=req.sizing_method,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Event backtest failed: {exc}")
+
+    security_service.write_audit_log(
+        db, user.id, "EVENT_BACKTEST", "research", None,
+        {"n_assets": len(price_data), "strategy": req.strategy, "cost_model": req.cost_model}
+    )
+    return result
+
+
+@app.post("/api/research/regime", status_code=200)
+def regime_detection_endpoint(req: schemas.RegimeDetectionRequest,
+                               user: models.User = Depends(get_current_user),
+                               db: Session = Depends(get_db)):
+    """Detect market regimes using Gaussian HMM (2-state Baum-Welch/Viterbi),
+    volatility percentile classification, and SMA trend detection.
+    Returns current regime, transition matrix, and per-regime statistics."""
+    import numpy as np
+    from .services.regime_detection import run_regime_detection
+
+    try:
+        returns, prices = _fetch_single_asset(req.asset, req.period)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    try:
+        result = run_regime_detection(returns, prices=prices,
+                                       hmm_iters=req.hmm_iters)
+    except Exception as exc:
+        raise HTTPException(500, f"Regime detection failed: {exc}")
+
+    result["asset"] = req.asset
+    result["period"] = req.period
+
+    security_service.write_audit_log(
+        db, user.id, "REGIME_DETECTION", "research", None,
+        {"asset": req.asset, "period": req.period}
+    )
+    return result
+
+
+@app.post("/api/research/neutral-strategy", status_code=200)
+def neutral_strategy_endpoint(req: schemas.NeutralStrategyRequest,
+                               user: models.User = Depends(get_current_user),
+                               db: Session = Depends(get_db)):
+    """Cross-sectional long/short equity strategy (dollar-neutral) with
+    optional factor neutralisation. Measures alpha generation independent
+    of market beta."""
+    import numpy as np
+    from .services.neutral_strategies import run_neutral_strategies
+    from .services.factor_model import compute_factors
+
+    try:
+        return_matrix, price_matrix, names = _fetch_return_matrix(req.assets, req.period)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    # Compute signal matrix from requested signal type
+    factor_mats = compute_factors(return_matrix, price_matrix)
+    sig_key_map = {
+        "momentum": "momentum", "reversal": "reversal",
+        "volatility": "low_volatility", "quality": "quality",
+    }
+    sig_key = sig_key_map.get(req.signal_type, "momentum")
+    signal_matrix = factor_mats.get(sig_key, factor_mats.get("momentum"))
+    if signal_matrix is None:
+        raise HTTPException(422, "Could not compute signal matrix")
+
+    # Optional factor exposures for neutralisation
+    factor_exposures = None
+    if req.factor_neutral:
+        # Use momentum and low-vol as neutralisation factors
+        mom = factor_mats.get("momentum")
+        lvol = factor_mats.get("low_volatility")
+        if mom is not None and lvol is not None:
+            T = return_matrix.shape[0]
+            # Use time-averaged exposures (cross-sectional mean per asset)
+            valid_t = np.where(np.all(np.isfinite(mom[-min(252, T):, :]), axis=1))[0]
+            if len(valid_t) >= 5:
+                fe_mom = np.nanmean(mom[valid_t, :], axis=0)
+                fe_lvol = np.nanmean(lvol[valid_t, :], axis=0)
+                factor_exposures = np.column_stack([fe_mom, fe_lvol])
+                # Fill NaN with 0
+                factor_exposures = np.where(np.isfinite(factor_exposures),
+                                             factor_exposures, 0.0)
+
+    try:
+        result = run_neutral_strategies(
+            signal_matrix=signal_matrix,
+            return_matrix=return_matrix,
+            asset_names=names,
+            factor_exposures=factor_exposures,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Neutral strategy failed: {exc}")
+
+    result["asset_names"] = names
+    result["signal_type"] = req.signal_type
+
+    security_service.write_audit_log(
+        db, user.id, "NEUTRAL_STRATEGY", "research", None,
+        {"n_assets": len(names), "signal_type": req.signal_type}
+    )
+    return result
+
+
+@app.post("/api/research/pairs-trading", status_code=200)
+def pairs_trading_endpoint(req: schemas.PairsTradingRequest,
+                            user: models.User = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    """Statistical arbitrage pairs trading: Engle-Granger cointegration test,
+    Kalman filter adaptive hedge ratio, and Z-score entry/exit signals."""
+    import numpy as np
+    import yfinance as yf
+    from .services.neutral_strategies import pairs_trading_signals
+
+    if req.asset_y == req.asset_x:
+        raise HTTPException(422, "asset_y and asset_x must be different")
+
+    try:
+        import pandas as pd
+        raw = yf.download([req.asset_y, req.asset_x], period=req.period,
+                          interval="1d", progress=False, auto_adjust=True)
+        if raw is None or raw.empty:
+            raise HTTPException(422, "Failed to download pair data")
+
+        def get_series(ticker: str) -> np.ndarray:
+            s = raw["Close"][ticker] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]
+            s = s.dropna()
+            if len(s) < 60:
+                raise ValueError(f"Only {len(s)} trading days for {ticker}")
+            return s.to_numpy(dtype=float)
+
+        prices_y = get_series(req.asset_y)
+        prices_x = get_series(req.asset_x)
+
+        # Align
+        min_len = min(len(prices_y), len(prices_x))
+        prices_y = prices_y[-min_len:]
+        prices_x = prices_x[-min_len:]
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, str(exc))
+
+    try:
+        result = pairs_trading_signals(
+            y=prices_y, x=prices_x,
+            entry_z=req.entry_z,
+            exit_z=req.exit_z,
+            use_kalman=req.use_kalman,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Pairs trading failed: {exc}")
+
+    result["asset_y"] = req.asset_y
+    result["asset_x"] = req.asset_x
+    result["n_bars"] = min_len
+
+    security_service.write_audit_log(
+        db, user.id, "PAIRS_TRADING", "research", None,
+        {"pair": f"{req.asset_y}/{req.asset_x}"}
+    )
+    return result
+
+
+@app.post("/api/research/latency-benchmark", status_code=200)
+def latency_benchmark_endpoint(req: schemas.LatencyBenchmarkRequest,
+                                user: models.User = Depends(get_current_user),
+                                db: Session = Depends(get_db)):
+    """Benchmark end-to-end pipeline latency across all 7 research stages.
+    Identifies bottlenecks and shows how latency scales with asset count N."""
+    import numpy as np
+    from .services.latency_bench import run_full_benchmark
+
+    try:
+        return_matrix, price_matrix, names = _fetch_return_matrix(req.assets, req.period)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    try:
+        result = run_full_benchmark(return_matrix, price_matrix, tickers=names)
+    except Exception as exc:
+        raise HTTPException(500, f"Benchmark failed: {exc}")
+
+    security_service.write_audit_log(
+        db, user.id, "LATENCY_BENCHMARK", "research", None,
+        {"n_assets": len(names), "total_ms": result.get("total_elapsed_ms")}
+    )
+    return result
 
 
 # --------------------------------------------------------------------------

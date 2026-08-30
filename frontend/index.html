@@ -177,6 +177,7 @@
       <button class="tab-btn active" data-view="dashboard">Dashboard</button>
       <button class="tab-btn" data-view="trading">Order Desk</button>
       <button class="tab-btn" data-view="strategies">Strategies</button>
+      <button class="tab-btn" data-view="research">Research</button>
       <button class="tab-btn" data-view="portfolio">Portfolio</button>
       <button class="tab-btn" data-view="security">Security<span class="tab-badge" id="security-badge"></span></button>
       <button class="tab-btn" data-view="integrations">Integrations</button>
@@ -289,7 +290,472 @@
       </div>
     </section>
 
-    <!-- INTEGRATIONS -->
+    <!-- RESEARCH ENGINE -->
+    <section id="view-research" class="view">
+      <div class="section-header"><h2>Quantitative Research Engine</h2></div>
+      <p class="hint" data-beginner>Run backtests under realistic transaction-cost assumptions, validate strategies with walk-forward analysis, and apply statistical tests to detect overfitting. All results use out-of-sample evaluation.</p>
+
+      <div class="trading-grid">
+        <!-- Advanced Backtest -->
+        <div class="card">
+          <h3>Advanced Backtest</h3>
+          <p class="hint">Full pipeline: Features → Signals → Portfolio → Execution Simulator → Transaction Costs → Risk Analysis</p>
+          <form id="research-backtest-form">
+            <label>Assets (comma-separated)<input id="rb-assets" value="AAPL" maxlength="100" required></label>
+            <div class="row">
+              <label>Strategy<select id="rb-strategy">
+                <option value="ma_crossover">MA Crossover</option>
+                <option value="momentum">Momentum</option>
+                <option value="mean_reversion">Mean Reversion</option>
+                <option value="sba_signal">SBA Signal</option>
+              </select></label>
+              <label>Period<select id="rb-period">
+                <option value="1y">1 year</option>
+                <option value="2y" selected>2 years</option>
+                <option value="3y">3 years</option>
+                <option value="5y">5 years</option>
+              </select></label>
+            </div>
+            <div class="row">
+              <label>Fast Window<input id="rb-fast" type="number" min="2" max="100" value="20"></label>
+              <label>Slow Window<input id="rb-slow" type="number" min="5" max="250" value="50"></label>
+            </div>
+            <div class="row">
+              <label>Execution Model<select id="rb-exec">
+                <option value="zero_cost">Zero Cost (comparison)</option>
+                <option value="retail" selected>Retail Broker</option>
+                <option value="institutional">Institutional</option>
+              </select></label>
+              <label>Position Sizing<select id="rb-sizing">
+                <option value="fixed_fractional" selected>Fixed Fractional (2%)</option>
+                <option value="volatility_target">Volatility Target (15%)</option>
+                <option value="kelly">Half-Kelly</option>
+                <option value="equal_weight">Equal Weight</option>
+              </select></label>
+            </div>
+            <div class="row">
+              <label>Capital<input id="rb-capital" type="number" min="1000" value="100000"></label>
+              <label>Benchmark<input id="rb-benchmark" value="SPY" maxlength="10"></label>
+            </div>
+            <div class="row">
+              <label class="checkbox-item" style="margin-top:8px;"><input type="checkbox" id="rb-short"><span class="checkbox-box"></span>Allow Short Selling</label>
+            </div>
+            <button type="submit" class="btn-primary ripple-btn" id="rb-submit"><span class="btn-label">Run Advanced Backtest</span></button>
+            <div class="auth-error" id="rb-error"></div>
+          </form>
+        </div>
+
+        <!-- Backtest Results -->
+        <div class="card">
+          <h3>Backtest Results</h3>
+          <div id="research-backtest-result" class="empty-state">Configure and run a backtest to see results with realistic execution costs.</div>
+        </div>
+      </div>
+
+      <div class="trading-grid" style="margin-top:20px;">
+        <!-- Walk-Forward Validation -->
+        <div class="card">
+          <h3>Walk-Forward Validation</h3>
+          <p class="hint">Sliding-window out-of-sample evaluation to detect overfitting.</p>
+          <form id="research-wf-form">
+            <label>Asset<input id="wf-asset" value="AAPL" maxlength="20" required></label>
+            <div class="row">
+              <label>Window Type<select id="wf-type">
+                <option value="rolling" selected>Rolling</option>
+                <option value="expanding">Expanding</option>
+              </select></label>
+              <label>Total Years<input id="wf-total" type="number" min="3" max="10" value="5"></label>
+            </div>
+            <div class="row">
+              <label>Train Years<input id="wf-train" type="number" min="1" max="5" value="2"></label>
+              <label>Test Years<input id="wf-test" type="number" min="1" max="3" value="1"></label>
+            </div>
+            <label class="checkbox-item" style="margin-top:8px;"><input type="checkbox" id="wf-optimize" checked><span class="checkbox-box"></span>Optimize Parameters per Fold</label>
+            <button type="submit" class="btn-primary ripple-btn" id="wf-submit"><span class="btn-label">Run Walk-Forward</span></button>
+            <div class="auth-error" id="wf-error"></div>
+          </form>
+        </div>
+
+        <!-- Walk-Forward Results -->
+        <div class="card">
+          <h3>Walk-Forward Results</h3>
+          <div id="research-wf-result" class="empty-state">Run walk-forward validation to see out-of-sample performance across folds.</div>
+        </div>
+      </div>
+
+      <div class="trading-grid" style="margin-top:20px;">
+        <!-- Statistical Testing -->
+        <div class="card">
+          <h3>Statistical Validation</h3>
+          <p class="hint">Test whether strategy performance is statistically significant or the result of data snooping.</p>
+          <form id="research-stat-form">
+            <label># Strategies Tested<input id="st-trials" type="number" min="1" max="10000" value="1"></label>
+            <p class="hint" style="margin-top:4px;font-size:11px;">How many strategy variants were tried before selecting this one? Higher count raises the bar for significance via the Deflated Sharpe Ratio.</p>
+            <button type="submit" class="btn-primary ripple-btn" id="st-submit"><span class="btn-label">Run Statistical Tests</span></button>
+            <div class="auth-error" id="st-error"></div>
+          </form>
+        </div>
+
+        <!-- Stat Test Results -->
+        <div class="card">
+          <h3>Statistical Test Results</h3>
+          <div id="research-stat-result" class="empty-state">Run a backtest first, then apply statistical tests to its returns.</div>
+        </div>
+      </div>
+
+      <!-- ── PHASE 2 SECTION DIVIDER ── -->
+      <div style="border-top:1px solid var(--border);margin:28px 0 20px;padding-top:20px;">
+        <h3 style="margin:0 0 4px;font-size:16px;color:var(--text-1);">Alpha Research &amp; Factor Modeling</h3>
+        <p class="hint" style="margin:0;">Measure signal quality (IC, hit rate, quintile spread) and identify which risk factors carry premia using Fama-MacBeth cross-sectional regression.</p>
+      </div>
+
+      <div class="trading-grid">
+        <!-- Alpha Research Form -->
+        <div class="card">
+          <h3>Alpha Research</h3>
+          <p class="hint">IC, Rank IC, IC decay curve, hit rate, quintile spread — measure whether a signal has genuine predictive power.</p>
+          <form id="alpha-research-form">
+            <label>Assets (comma-separated, min 4)<input id="ar-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM,BAC,XOM,JNJ,AMZN,META" maxlength="200" required></label>
+            <div class="row">
+              <label>Signal<select id="ar-signal">
+                <option value="momentum" selected>Momentum</option>
+                <option value="reversal">Short-term Reversal</option>
+                <option value="volatility">Volatility</option>
+                <option value="quality">Quality (Sharpe)</option>
+                <option value="sba">SBA Signal</option>
+              </select></label>
+              <label>Period<select id="ar-period">
+                <option value="1y">1 year</option>
+                <option value="2y" selected>2 years</option>
+                <option value="3y">3 years</option>
+                <option value="5y">5 years</option>
+              </select></label>
+            </div>
+            <label>Max IC Decay Horizon (days)<input id="ar-horizon" type="number" min="1" max="60" value="20"></label>
+            <button type="submit" class="btn-primary ripple-btn" id="ar-submit"><span class="btn-label">Run Alpha Research</span></button>
+            <div class="auth-error" id="ar-error"></div>
+          </form>
+        </div>
+
+        <!-- Alpha Research Results -->
+        <div class="card">
+          <h3>Alpha Research Results</h3>
+          <div id="alpha-research-result" class="empty-state">Configure and run to see IC, hit rate, and quintile analysis.</div>
+        </div>
+      </div>
+
+      <div class="trading-grid" style="margin-top:20px;">
+        <!-- Factor Model Form -->
+        <div class="card">
+          <h3>Factor Model (Fama-MacBeth)</h3>
+          <p class="hint">Two-pass cross-sectional regression estimating factor risk premia with Newey-West standard errors.</p>
+          <form id="factor-model-form">
+            <label>Assets (min 8)<input id="fm-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM,BAC,XOM,JNJ,AMZN,META,V,MA,LLY,ABBV,CVX" maxlength="200" required></label>
+            <div class="row">
+              <label>Period<select id="fm-period">
+                <option value="2y">2 years</option>
+                <option value="3y" selected>3 years</option>
+                <option value="5y">5 years</option>
+              </select></label>
+              <label>NW Lags<input id="fm-nw" type="number" min="1" max="20" value="4"></label>
+            </div>
+            <div class="form-field">
+              <span class="form-field-label">Factors to Test</span>
+              <div class="checkbox-group" id="fm-factors">
+                <label class="checkbox-item"><input type="checkbox" value="momentum" checked><span class="checkbox-box"></span>Momentum</label>
+                <label class="checkbox-item"><input type="checkbox" value="reversal" checked><span class="checkbox-box"></span>Reversal</label>
+                <label class="checkbox-item"><input type="checkbox" value="volatility" checked><span class="checkbox-box"></span>Volatility</label>
+                <label class="checkbox-item"><input type="checkbox" value="low_volatility" checked><span class="checkbox-box"></span>Low Volatility</label>
+                <label class="checkbox-item"><input type="checkbox" value="quality" checked><span class="checkbox-box"></span>Quality</label>
+              </div>
+            </div>
+            <button type="submit" class="btn-primary ripple-btn" id="fm-submit"><span class="btn-label">Run Factor Model</span></button>
+            <div class="auth-error" id="fm-error"></div>
+          </form>
+        </div>
+
+        <!-- Factor Model Results -->
+        <div class="card">
+          <h3>Factor Model Results</h3>
+          <div id="factor-model-result" class="empty-state">Run the Fama-MacBeth model to see factor risk premia and significance.</div>
+        </div>
+      </div>
+
+      <!-- ── CORRELATION & OPTIMISATION DIVIDER ── -->
+      <div style="border-top:1px solid var(--border);margin:28px 0 20px;padding-top:20px;">
+        <h3 style="margin:0 0 4px;font-size:16px;color:var(--text-1);">Correlation &amp; Portfolio Optimisation</h3>
+        <p class="hint" style="margin:0;">Multi-method correlation estimation (shrinkage, PCA) and institutional-grade portfolio construction (Min-Variance, Risk Parity, Max-Sharpe, Max-Diversification).</p>
+      </div>
+
+      <div class="trading-grid">
+        <!-- Correlation Form -->
+        <div class="card">
+          <h3>Correlation Engine</h3>
+          <p class="hint">Compare Pearson, Spearman, EWMA, Ledoit-Wolf, OAS, and PCA estimators with diagnostics and automatic recommendation.</p>
+          <form id="correlation-form">
+            <label>Assets (min 4)<input id="ce-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM,BAC,XOM,JNJ,AMZN,META" maxlength="200" required></label>
+            <div class="row">
+              <label>Period<select id="ce-period">
+                <option value="1y">1 year</option>
+                <option value="2y" selected>2 years</option>
+                <option value="3y">3 years</option>
+                <option value="5y">5 years</option>
+              </select></label>
+              <label>EWMA Half-life (days)<input id="ce-halflife" type="number" min="5" max="250" value="60"></label>
+            </div>
+            <button type="submit" class="btn-primary ripple-btn" id="ce-submit"><span class="btn-label">Run Correlation Analysis</span></button>
+            <div class="auth-error" id="ce-error"></div>
+          </form>
+        </div>
+
+        <!-- Correlation Results -->
+        <div class="card">
+          <h3>Correlation Results</h3>
+          <div id="correlation-result" class="empty-state">Run correlation analysis to see estimator comparison and diagnostics.</div>
+        </div>
+      </div>
+
+      <div class="trading-grid" style="margin-top:20px;">
+        <!-- Portfolio Optimisation Form -->
+        <div class="card">
+          <h3>Portfolio Optimisation</h3>
+          <p class="hint">Run all methods simultaneously and compare: Min-Variance, Max-Sharpe, Risk Parity, Max-Diversification, Equal Weight.</p>
+          <form id="portopt-form">
+            <label>Assets (min 4)<input id="po-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM,BAC,XOM,JNJ,AMZN,META" maxlength="200" required></label>
+            <div class="row">
+              <label>Period<select id="po-period">
+                <option value="1y">1 year</option>
+                <option value="2y" selected>2 years</option>
+                <option value="3y">3 years</option>
+                <option value="5y">5 years</option>
+              </select></label>
+              <label>Cov Estimator<select id="po-cov">
+                <option value="ledoit_wolf" selected>Ledoit-Wolf</option>
+                <option value="oas">OAS</option>
+                <option value="ewma">EWMA</option>
+                <option value="pearson">Pearson</option>
+              </select></label>
+            </div>
+            <div class="row">
+              <label>Max Weight %<input id="po-maxw" type="number" min="5" max="100" value="40"></label>
+              <label>Risk-Free Rate %<input id="po-rf" type="number" min="0" max="20" value="5" step="0.1"></label>
+            </div>
+            <div class="row">
+              <label class="checkbox-item"><input type="checkbox" id="po-longonly" checked><span class="checkbox-box"></span>Long Only</label>
+              <label class="checkbox-item"><input type="checkbox" id="po-sba"><span class="checkbox-box"></span>Include SBA-Weighted</label>
+            </div>
+            <button type="submit" class="btn-primary ripple-btn" id="po-submit"><span class="btn-label">Run Portfolio Optimisation</span></button>
+            <div class="auth-error" id="po-error"></div>
+          </form>
+        </div>
+
+        <!-- Portfolio Optimisation Results -->
+        <div class="card">
+          <h3>Optimisation Results</h3>
+          <div id="portopt-result" class="empty-state">Run portfolio optimisation to see weights, Sharpe ratios, risk contributions, and the efficient frontier.</div>
+        </div>
+      </div>
+    </section>
+
+
+    <!-- PHASE 3: TRADING ENGINE & MICROSTRUCTURE -->
+    <section id="view-phase3" class="view">
+      <div class="section-header"><h2>Trading Engine &amp; Microstructure</h2></div>
+      <p class="hint" data-beginner>Event-driven backtesting with realistic transaction costs, market regime detection (HMM), market-neutral strategies, pairs trading (cointegration + Kalman), and pipeline latency profiling.</p>
+
+      <div class="trading-grid">
+
+        <!-- ── Event-Driven Backtest ─────────────────────────────── -->
+        <div class="card">
+          <h3>Event-Driven Backtest</h3>
+          <p class="hint" data-beginner>Processes bars chronologically with 1-bar execution delay — eliminating look-ahead bias. Includes bid/ask spread, commission, slippage, and short-selling borrow costs.</p>
+          <form id="eb-form">
+            <label>Assets (comma-separated)
+              <input id="eb-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM" maxlength="200">
+            </label>
+            <div class="form-row">
+              <label>Period
+                <select id="eb-period">
+                  <option value="1y">1 Year</option>
+                  <option value="2y" selected>2 Years</option>
+                  <option value="3y">3 Years</option>
+                  <option value="5y">5 Years</option>
+                </select>
+              </label>
+              <label>Strategy
+                <select id="eb-strategy">
+                  <option value="ma_crossover" selected>MA Crossover</option>
+                  <option value="momentum">Cross-Sectional Momentum</option>
+                  <option value="mean_reversion">Mean Reversion (Bollinger)</option>
+                </select>
+              </label>
+            </div>
+            <div class="form-row">
+              <label>Fast Window
+                <input id="eb-fast" type="number" value="20" min="2" max="200">
+              </label>
+              <label>Slow Window
+                <input id="eb-slow" type="number" value="50" min="5" max="500">
+              </label>
+            </div>
+            <div class="form-row">
+              <label>Cost Model
+                <select id="eb-cost">
+                  <option value="zero_cost">Zero Cost</option>
+                  <option value="retail" selected>Retail (10bps + 5bps spread)</option>
+                  <option value="institutional">Institutional (2bps + 1bps spread)</option>
+                </select>
+              </label>
+              <label>Sizing
+                <select id="eb-sizing">
+                  <option value="fixed_fractional" selected>Fixed Fractional (2%)</option>
+                  <option value="volatility_target">Vol-Target (15%)</option>
+                </select>
+              </label>
+            </div>
+            <label>Initial Capital ($)
+              <input id="eb-capital" type="number" value="100000" min="1000">
+            </label>
+            <label class="checkbox-item"><input id="eb-short" type="checkbox"><span class="checkbox-box"></span>Allow Short Selling</label>
+            <div id="eb-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
+            <button type="submit" class="btn-primary" style="margin-top:10px;width:100%;">Run Event Backtest</button>
+          </form>
+          <div id="eb-result" class="empty-state" style="margin-top:14px;">Configure and run to see realistic P&amp;L, Sharpe, drawdown, and transaction cost breakdown.</div>
+        </div>
+
+        <!-- ── Market Regime Detection ──────────────────────────── -->
+        <div class="card">
+          <h3>Market Regime Detection</h3>
+          <p class="hint" data-beginner>Detects bull/bear regimes using a 2-state Gaussian HMM (Baum-Welch EM + Viterbi decoding), rolling volatility percentiles, and SMA crossover trend classifier.</p>
+          <form id="regime-form">
+            <label>Asset
+              <input id="regime-asset" value="SPY" maxlength="10">
+            </label>
+            <div class="form-row">
+              <label>Period
+                <select id="regime-period">
+                  <option value="1y">1 Year</option>
+                  <option value="2y">2 Years</option>
+                  <option value="3y" selected>3 Years</option>
+                  <option value="5y">5 Years</option>
+                </select>
+              </label>
+              <label>HMM Iterations
+                <input id="regime-iters" type="number" value="100" min="10" max="500">
+              </label>
+            </div>
+            <div id="regime-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
+            <button type="submit" class="btn-primary" style="margin-top:10px;width:100%;">Detect Regimes</button>
+          </form>
+          <div id="regime-result" class="empty-state" style="margin-top:14px;">Run to see current regime, HMM transition matrix, volatility states, and per-regime performance statistics.</div>
+        </div>
+
+        <!-- ── Market-Neutral Long/Short Strategy ──────────────── -->
+        <div class="card">
+          <h3>Market-Neutral L/S Strategy</h3>
+          <p class="hint" data-beginner>Dollar-neutral cross-sectional long/short equity. Ranks assets by signal, longs top N, shorts bottom N. Optional factor neutralisation removes market/factor beta from positions.</p>
+          <form id="neutral-form">
+            <label>Assets (comma-separated, min 6)
+              <input id="neutral-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM,BAC,XOM,JNJ,AMZN,META" maxlength="300">
+            </label>
+            <div class="form-row">
+              <label>Period
+                <select id="neutral-period">
+                  <option value="1y">1 Year</option>
+                  <option value="2y" selected>2 Years</option>
+                  <option value="3y">3 Years</option>
+                </select>
+              </label>
+              <label>Signal
+                <select id="neutral-signal">
+                  <option value="momentum" selected>Momentum</option>
+                  <option value="reversal">Short-Term Reversal</option>
+                  <option value="volatility">Low Volatility</option>
+                  <option value="quality">Quality</option>
+                </select>
+              </label>
+            </div>
+            <div class="form-row">
+              <label>N Long
+                <input id="neutral-nlong" type="number" value="3" min="1" max="20">
+              </label>
+              <label>N Short
+                <input id="neutral-nshort" type="number" value="3" min="1" max="20">
+              </label>
+              <label>Target Vol (%)
+                <input id="neutral-tvol" type="number" value="10" min="1" max="50">
+              </label>
+            </div>
+            <label class="checkbox-item"><input id="neutral-fn" type="checkbox"><span class="checkbox-box"></span>Factor Neutralise (remove market beta)</label>
+            <div id="neutral-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
+            <button type="submit" class="btn-primary" style="margin-top:10px;width:100%;">Run Neutral Strategy</button>
+          </form>
+          <div id="neutral-result" class="empty-state" style="margin-top:14px;">Run to see dollar-neutral Sharpe, drawdown, turnover, and optional factor-neutral comparison.</div>
+        </div>
+
+        <!-- ── Pairs Trading (Stat Arb) ─────────────────────────── -->
+        <div class="card">
+          <h3>Pairs Trading — Statistical Arbitrage</h3>
+          <p class="hint" data-beginner>Engle-Granger cointegration test + Kalman filter adaptive hedge ratio + Z-score entry/exit signals. Tests whether two assets share a common stochastic trend.</p>
+          <form id="pairs-form">
+            <div class="form-row">
+              <label>Asset Y (dependent)
+                <input id="pairs-y" value="GS" maxlength="10">
+              </label>
+              <label>Asset X (independent)
+                <input id="pairs-x" value="MS" maxlength="10">
+              </label>
+            </div>
+            <div class="form-row">
+              <label>Period
+                <select id="pairs-period">
+                  <option value="2y">2 Years</option>
+                  <option value="3y" selected>3 Years</option>
+                  <option value="5y">5 Years</option>
+                </select>
+              </label>
+              <label>Entry Z-Score
+                <input id="pairs-entry" type="number" value="2.0" min="0.5" max="5" step="0.1">
+              </label>
+              <label>Exit Z-Score
+                <input id="pairs-exit" type="number" value="0.5" min="0" max="3" step="0.1">
+              </label>
+            </div>
+            <label class="checkbox-item"><input id="pairs-kalman" type="checkbox" checked><span class="checkbox-box"></span>Kalman Filter Hedge Ratio (adaptive)</label>
+            <div id="pairs-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
+            <button type="submit" class="btn-primary" style="margin-top:10px;width:100%;">Analyse Pair</button>
+          </form>
+          <div id="pairs-result" class="empty-state" style="margin-top:14px;">Run to see cointegration test, ADF statistic, hedge ratio, Z-spread history, and strategy Sharpe.</div>
+        </div>
+
+        <!-- ── Pipeline Latency Benchmark ───────────────────────── -->
+        <div class="card" style="grid-column:1/-1;">
+          <h3>Pipeline Latency Benchmark</h3>
+          <p class="hint" data-beginner>Profiles all 7 research pipeline stages end-to-end: Feature Engineering → Alpha Research → Fama-MacBeth → Correlation → Portfolio Opt → Event Backtest → Regime Detection. Identifies bottlenecks and shows N-asset scaling.</p>
+          <form id="bench-form">
+            <div class="form-row">
+              <label style="flex:3">Assets (4–20)
+                <input id="bench-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM,BAC,XOM,JNJ,AMZN,META" maxlength="300">
+              </label>
+              <label>Period
+                <select id="bench-period">
+                  <option value="1y">1 Year</option>
+                  <option value="2y" selected>2 Years</option>
+                  <option value="3y">3 Years</option>
+                </select>
+              </label>
+            </div>
+            <div id="bench-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
+            <button type="submit" class="btn-primary" style="margin-top:10px;">Run Benchmark</button>
+          </form>
+          <div id="bench-result" class="empty-state" style="margin-top:14px;">Run to profile all pipeline stages, identify the bottleneck, and see latency scaling by asset count.</div>
+        </div>
+
+      </div>
+    </section>
+
+
+
     <section id="view-integrations" class="view">
       <div class="section-header"><h2>Enterprise Integrations</h2></div>
       <p class="hint" data-beginner>Issue least-privilege API credentials and configure signed event webhooks. Secrets are displayed once at creation &mdash; store them in your secret manager immediately.</p>

@@ -123,9 +123,19 @@ def equity_curve_from_trades(
 def risk_metrics(db: Session, user_id: str) -> dict:
     """Compute portfolio risk metrics from the user's trade history.
 
-    Returns Sharpe ratio (annualised, sample-std), max drawdown, win rate,
-    VaR at 95% and 99%, total trades, and the full equity curve.
+    Returns comprehensive risk metrics including:
+      - Sharpe ratio (annualised, sample-std)
+      - Sortino ratio
+      - Calmar ratio
+      - Omega ratio
+      - VaR and CVaR (Expected Shortfall) at 95% and 99%
+      - Downside deviation
+      - Beta, Alpha, Tracking Error vs SPY benchmark
+      - Information Ratio
+      - Max drawdown, win rate, total trades, equity curve
     """
+    import numpy as np
+
     trades = db.execute(
         select(models.Trade).where(
             models.Trade.user_id == user_id, models.Trade.status == "FILLED"
@@ -150,36 +160,43 @@ def risk_metrics(db: Session, user_id: str) -> dict:
         return wins, closed
 
     wins, closed = closed_trade_results()
+    empty_metrics = {
+        "sharpe_ratio": 0.0, "sortino_ratio": 0.0, "calmar_ratio": 0.0,
+        "omega_ratio": 0.0, "max_drawdown": 0.0,
+        "win_rate": round(wins / closed, 3) if closed else 0.0,
+        "total_trades": len(trades),
+        "var_95": 0.0, "var_99": 0.0, "cvar_95": 0.0, "cvar_99": 0.0,
+        "downside_deviation": 0.0, "volatility": 0.0,
+        "beta": 0.0, "alpha": 0.0, "tracking_error": 0.0,
+        "information_ratio": 0.0,
+        "equity_curve": equity_curve_from_trades(db, user_id),
+    }
 
     if len(trades) < 2:
-        return {
-            "sharpe_ratio": 0.0,
-            "max_drawdown": 0.0,
-            "win_rate": round(wins / closed, 3) if closed else 0.0,
-            "total_trades": len(trades),
-            "var_95": 0.0,
-            "var_99": 0.0,
-            "equity_curve": equity_curve_from_trades(db, user_id),
-        }
+        return empty_metrics
 
     curve = equity_curve_from_trades(db, user_id)
-    returns = [
+    returns = np.array([
         (curve[i] - curve[i - 1]) / curve[i - 1] if curve[i - 1] else 0.0
         for i in range(1, len(curve))
-    ]
-    mean_r = sum(returns) / len(returns) if returns else 0.0
+    ])
 
-    # FIX: sample standard deviation (N-1 denominator) — industry standard for
-    # Sharpe ratio.  Population std (N) systematically understates volatility
-    # and inflates Sharpe, especially with short trade histories.
+    if len(returns) < 2:
+        return empty_metrics
+
+    mean_r = float(np.mean(returns))
     n = len(returns)
-    var_r = (
-        sum((r - mean_r) ** 2 for r in returns) / max(1, n - 1)
-        if n > 1 else 0.0
-    )
-    std_r = math.sqrt(var_r)
-    sharpe = (mean_r / (std_r + 1e-9)) * math.sqrt(252) if returns else 0.0
 
+    # ── Sharpe ratio (annualised, sample-std) ──
+    std_r = float(np.std(returns, ddof=1))
+    sharpe = (mean_r / (std_r + 1e-9)) * math.sqrt(252)
+
+    # ── Sortino ratio ──
+    downside = returns[returns < 0]
+    downside_dev = float(np.sqrt(np.mean(downside ** 2))) if len(downside) > 0 else 1e-9
+    sortino = (mean_r / (downside_dev + 1e-9)) * math.sqrt(252)
+
+    # ── Max drawdown ──
     peak = curve[0]
     max_dd = 0.0
     for v in curve:
@@ -187,24 +204,84 @@ def risk_metrics(db: Session, user_id: str) -> dict:
         dd = (peak - v) / peak if peak else 0.0
         max_dd = max(max_dd, dd)
 
+    # ── Calmar ratio ──
+    ann_return = mean_r * 252
+    calmar = ann_return / max_dd if max_dd > 1e-9 else 0.0
+
+    # ── Omega ratio ──
+    gains = np.sum(np.maximum(returns, 0))
+    losses = np.sum(np.maximum(-returns, 0))
+    omega = float(gains / losses) if losses > 1e-9 else 0.0
+
+    # ── VaR and CVaR (Expected Shortfall) ──
+    sorted_returns = np.sort(returns)
+    var_idx_95 = min(max(0, int(0.05 * n)), n - 1)
+    var_idx_99 = min(max(0, int(0.01 * n)), n - 1)
+    var_95 = max(0.0, -float(sorted_returns[var_idx_95]))
+    var_99 = max(0.0, -float(sorted_returns[var_idx_99]))
+    # CVaR = average of losses beyond VaR threshold
+    tail_95 = sorted_returns[:var_idx_95 + 1]
+    cvar_95 = max(0.0, -float(np.mean(tail_95))) if len(tail_95) > 0 else var_95
+    tail_99 = sorted_returns[:var_idx_99 + 1]
+    cvar_99 = max(0.0, -float(np.mean(tail_99))) if len(tail_99) > 0 else var_99
+
+    # ── Annualised volatility ──
+    volatility = std_r * math.sqrt(252)
+
+    # ── Win rate ──
     total_trades = len(trades)
     win_rate = wins / closed if closed else 0.0
 
-    sorted_returns = sorted(returns)
-    # FIX: Empirical VaR percentile — int(0.05 * N) is the correct index.
-    # The previous code used int(0.05 * N) - 1 which was off by one and
-    # produced a less conservative (understated) risk estimate.
-    var_idx_95 = min(max(0, int(0.05 * len(sorted_returns))), len(sorted_returns) - 1)
-    var_idx_99 = min(max(0, int(0.01 * len(sorted_returns))), len(sorted_returns) - 1)
-    var_95 = max(0.0, -sorted_returns[var_idx_95]) if sorted_returns else 0.0
-    var_99 = max(0.0, -sorted_returns[var_idx_99]) if sorted_returns else 0.0
+    # ── Beta, Alpha, Tracking Error vs SPY ──
+    beta = 0.0
+    alpha = 0.0
+    tracking_error = 0.0
+    information_ratio = 0.0
+
+    try:
+        import yfinance as yf_bench
+        spy_data = yf_bench.Ticker("SPY").history(period="1y", auto_adjust=True)
+        if not spy_data.empty and len(spy_data) > 10:
+            spy_close = spy_data["Close"].to_numpy(dtype=float)
+            spy_returns = np.diff(spy_close) / spy_close[:-1]
+            # Align lengths
+            min_len = min(len(returns), len(spy_returns))
+            if min_len > 5:
+                port_r = returns[-min_len:]
+                bench_r = spy_returns[-min_len:]
+                # Beta = Cov(Rp, Rm) / Var(Rm)
+                cov_matrix = np.cov(port_r, bench_r)
+                var_bench = cov_matrix[1, 1]
+                if var_bench > 1e-12:
+                    beta = float(cov_matrix[0, 1] / var_bench)
+                # Alpha = Rp - β * Rm (annualised)
+                alpha = float((np.mean(port_r) - beta * np.mean(bench_r)) * 252)
+                # Tracking error
+                diff = port_r - bench_r
+                tracking_error = float(np.std(diff, ddof=1) * math.sqrt(252))
+                # Information ratio
+                if tracking_error > 1e-9:
+                    information_ratio = float(np.mean(diff) * 252 / tracking_error)
+    except Exception:
+        pass  # Benchmark data unavailable — metrics default to 0
 
     return {
         "sharpe_ratio": round(sharpe, 3),
+        "sortino_ratio": round(sortino, 3),
+        "calmar_ratio": round(calmar, 3),
+        "omega_ratio": round(omega, 3),
         "max_drawdown": round(max_dd, 4),
         "win_rate": round(win_rate, 3),
         "total_trades": total_trades,
         "var_95": round(var_95, 4),
         "var_99": round(var_99, 4),
+        "cvar_95": round(cvar_95, 4),
+        "cvar_99": round(cvar_99, 4),
+        "downside_deviation": round(downside_dev, 6),
+        "volatility": round(volatility, 4),
+        "beta": round(beta, 4),
+        "alpha": round(alpha, 4),
+        "tracking_error": round(tracking_error, 4),
+        "information_ratio": round(information_ratio, 3),
         "equity_curve": [round(v, 2) for v in curve],
     }

@@ -409,6 +409,189 @@ class BacktestRequest(BaseModel):
         return value
 
 
+# ---------------------------------------------------------------------------
+# Advanced Research Schemas (Phase 1)
+# ---------------------------------------------------------------------------
+
+class AdvancedBacktestRequest(BaseModel):
+    """Request for the advanced backtesting engine with execution costs."""
+    assets: list[str] = Field(default=["AAPL"], min_length=1, max_length=10)
+    period: str = Field(default="2y")
+    initial_capital: float = Field(default=100_000, ge=1_000, le=100_000_000)
+    strategy_type: str = Field(default="ma_crossover")
+    fast_window: int = Field(default=20, ge=2, le=100)
+    slow_window: int = Field(default=50, ge=5, le=250)
+    # Execution model
+    execution_preset: Literal["zero_cost", "retail", "institutional"] = "retail"
+    allow_short_selling: bool = False
+    # Position sizing
+    sizing_method: str = Field(default="fixed_fractional")
+    risk_per_trade: float = Field(default=0.02, ge=0.001, le=0.5)
+    max_position_pct: float = Field(default=0.20, ge=0.01, le=1.0)
+    max_leverage: float = Field(default=1.0, ge=0.1, le=5.0)
+    benchmark: str = Field(default="SPY", max_length=20)
+
+    @field_validator("assets")
+    @classmethod
+    def normalized_assets(cls, value: list[str]) -> list[str]:
+        return [v.strip().upper() for v in value]
+
+    @field_validator("period")
+    @classmethod
+    def valid_adv_period(cls, value: str) -> str:
+        if value not in {"6mo", "1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 6mo, 1y, 2y, 3y, 5y")
+        return value
+
+    @field_validator("strategy_type")
+    @classmethod
+    def valid_strategy(cls, value: str) -> str:
+        allowed = {"ma_crossover", "sba_signal", "momentum", "mean_reversion"}
+        if value not in allowed:
+            raise ValueError(f"strategy_type must be one of {allowed}")
+        return value
+
+    @field_validator("sizing_method")
+    @classmethod
+    def valid_sizing(cls, value: str) -> str:
+        allowed = {"fixed_fractional", "volatility_target", "kelly", "equal_weight"}
+        if value not in allowed:
+            raise ValueError(f"sizing_method must be one of {allowed}")
+        return value
+
+
+class WalkForwardRequest(BaseModel):
+    """Request for walk-forward validation."""
+    assets: list[str] = Field(default=["AAPL"], min_length=1, max_length=5)
+    window_type: Literal["rolling", "expanding"] = "rolling"
+    train_years: int = Field(default=2, ge=1, le=5)
+    test_years: int = Field(default=1, ge=1, le=3)
+    total_years: int = Field(default=5, ge=3, le=10)
+    fast_window: int = Field(default=20, ge=2, le=100)
+    slow_window: int = Field(default=50, ge=5, le=250)
+    optimize_parameters: bool = True
+    execution_preset: Literal["zero_cost", "retail", "institutional"] = "retail"
+
+    @field_validator("assets")
+    @classmethod
+    def normalized_wf_assets(cls, value: list[str]) -> list[str]:
+        return [v.strip().upper() for v in value]
+
+
+class StatTestRequest(BaseModel):
+    """Request for statistical testing on strategy returns."""
+    # Can provide returns directly or reference a backtest ID
+    backtest_id: str | None = None
+    # Or provide raw returns
+    returns: list[float] | None = None
+    n_strategies_tested: int = Field(default=1, ge=1, le=10_000)
+    n_bootstrap: int = Field(default=10_000, ge=100, le=100_000)
+    n_permutations: int = Field(default=10_000, ge=100, le=100_000)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Alpha Research & Factor Modeling Schemas
+# ---------------------------------------------------------------------------
+
+class AlphaResearchRequest(BaseModel):
+    """Request for the alpha research pipeline."""
+    assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM"],
+                               min_length=4, max_length=50)
+    period: str = Field(default="2y")
+    signal_type: str = Field(default="momentum")
+    max_horizon: int = Field(default=20, ge=1, le=60)
+
+    @field_validator("assets")
+    @classmethod
+    def norm_alpha_assets(cls, v: list[str]) -> list[str]:
+        return [x.strip().upper() for x in v]
+
+    @field_validator("period")
+    @classmethod
+    def valid_alpha_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y, 5y")
+        return v
+
+    @field_validator("signal_type")
+    @classmethod
+    def valid_signal(cls, v: str) -> str:
+        if v not in {"momentum", "reversal", "volatility", "quality", "sba"}:
+            raise ValueError("signal_type must be one of momentum, reversal, volatility, quality, sba")
+        return v
+
+
+class FactorModelRequest(BaseModel):
+    """Request for Fama-MacBeth factor model."""
+    assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
+                                        "BAC", "XOM", "JNJ", "AMZN", "META"],
+                               min_length=8, max_length=50)
+    period: str = Field(default="3y")
+    factors: list[str] = Field(default=["momentum", "reversal", "volatility",
+                                          "low_volatility", "quality"])
+    newey_west_lags: int = Field(default=4, ge=1, le=20)
+
+    @field_validator("assets")
+    @classmethod
+    def norm_fm_assets(cls, v: list[str]) -> list[str]:
+        return [x.strip().upper() for x in v]
+
+    @field_validator("period")
+    @classmethod
+    def valid_fm_period(cls, v: str) -> str:
+        if v not in {"2y", "3y", "5y"}:
+            raise ValueError("period must be one of 2y, 3y, 5y")
+        return v
+
+
+class CorrelationRequest(BaseModel):
+    """Request for multi-method correlation analysis."""
+    assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
+                                        "BAC", "XOM", "JNJ", "AMZN", "META"],
+                               min_length=4, max_length=50)
+    period: str = Field(default="2y")
+    ewma_halflife: float = Field(default=60.0, ge=5.0, le=250.0)
+    pca_components: int | None = Field(default=None, ge=1, le=20)
+
+    @field_validator("assets")
+    @classmethod
+    def norm_corr_assets(cls, v: list[str]) -> list[str]:
+        return [x.strip().upper() for x in v]
+
+    @field_validator("period")
+    @classmethod
+    def valid_corr_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y, 5y")
+        return v
+
+
+class PortfolioOptRequest(BaseModel):
+    """Request for multi-method portfolio optimisation."""
+    assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
+                                        "BAC", "XOM", "JNJ", "AMZN", "META"],
+                               min_length=4, max_length=50)
+    period: str = Field(default="2y")
+    covariance_method: Literal["pearson", "ledoit_wolf", "oas", "ewma"] = "ledoit_wolf"
+    long_only: bool = True
+    max_weight: float = Field(default=0.40, ge=0.01, le=1.0)
+    min_weight: float = Field(default=0.0, ge=0.0, le=0.20)
+    risk_free_rate: float = Field(default=0.05, ge=0.0, le=0.20)
+    include_sba: bool = False
+
+    @field_validator("assets")
+    @classmethod
+    def norm_opt_assets(cls, v: list[str]) -> list[str]:
+        return [x.strip().upper() for x in v]
+
+    @field_validator("period")
+    @classmethod
+    def valid_opt_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y, 5y")
+        return v
+
+
 class ApiKeyRequest(BaseModel):
     name: str = Field(min_length=3, max_length=80)
     scopes: list[str] = Field(default_factory=lambda: ["read"])
@@ -444,3 +627,119 @@ class WebhookRequest(BaseModel):
         if not events or not set(events).issubset(allowed):
             raise ValueError("unsupported webhook event type")
         return events
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Trading Engine & Microstructure Schemas
+# ---------------------------------------------------------------------------
+
+class EventBacktestRequest(BaseModel):
+    """Event-driven backtest with realistic execution."""
+    assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL"], min_length=1, max_length=10)
+    period: str = Field(default="2y")
+    strategy: Literal["ma_crossover", "momentum", "mean_reversion"] = "ma_crossover"
+    cost_model: Literal["zero_cost", "retail", "institutional"] = "retail"
+    sizing_method: Literal["fixed_fractional", "volatility_target"] = "fixed_fractional"
+    allow_short: bool = False
+    initial_capital: float = Field(default=100_000.0, ge=1000.0, le=100_000_000.0)
+    fast_window: int = Field(default=20, ge=2, le=200)
+    slow_window: int = Field(default=50, ge=5, le=500)
+
+    @field_validator("assets")
+    @classmethod
+    def norm_eb_assets(cls, v: list[str]) -> list[str]:
+        return [x.strip().upper() for x in v]
+
+    @field_validator("period")
+    @classmethod
+    def valid_eb_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y, 5y")
+        return v
+
+
+class RegimeDetectionRequest(BaseModel):
+    """Market regime detection (HMM + vol + trend)."""
+    asset: str = Field(default="SPY", min_length=1, max_length=10)
+    period: str = Field(default="3y")
+    hmm_iters: int = Field(default=100, ge=10, le=500)
+
+    @field_validator("asset")
+    @classmethod
+    def norm_regime_asset(cls, v: str) -> str:
+        return v.strip().upper()
+
+    @field_validator("period")
+    @classmethod
+    def valid_regime_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y, 5y")
+        return v
+
+
+class NeutralStrategyRequest(BaseModel):
+    """Long/short equity and factor-neutral strategy."""
+    assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
+                                        "BAC", "XOM", "JNJ", "AMZN", "META"],
+                               min_length=6, max_length=50)
+    period: str = Field(default="2y")
+    signal_type: str = Field(default="momentum")
+    n_long: int = Field(default=3, ge=1, le=20)
+    n_short: int = Field(default=3, ge=1, le=20)
+    vol_scale: bool = True
+    target_vol: float = Field(default=0.10, ge=0.01, le=0.50)
+    factor_neutral: bool = False
+
+    @field_validator("assets")
+    @classmethod
+    def norm_ns_assets(cls, v: list[str]) -> list[str]:
+        return [x.strip().upper() for x in v]
+
+    @field_validator("period")
+    @classmethod
+    def valid_ns_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y, 5y")
+        return v
+
+
+class PairsTradingRequest(BaseModel):
+    """Statistical arbitrage — pairs trading with cointegration."""
+    asset_y: str = Field(default="GS", min_length=1, max_length=10)
+    asset_x: str = Field(default="MS", min_length=1, max_length=10)
+    period: str = Field(default="3y")
+    entry_z: float = Field(default=2.0, ge=0.5, le=5.0)
+    exit_z: float = Field(default=0.5, ge=0.0, le=3.0)
+    use_kalman: bool = True
+
+    @field_validator("asset_y", "asset_x")
+    @classmethod
+    def norm_pair_assets(cls, v: str) -> str:
+        return v.strip().upper()
+
+    @field_validator("period")
+    @classmethod
+    def valid_pair_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y, 5y")
+        return v
+
+
+class LatencyBenchmarkRequest(BaseModel):
+    """Pipeline latency benchmark."""
+    assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
+                                        "BAC", "XOM", "JNJ", "AMZN", "META"],
+                               min_length=4, max_length=20)
+    period: str = Field(default="2y")
+
+    @field_validator("assets")
+    @classmethod
+    def norm_bench_assets(cls, v: list[str]) -> list[str]:
+        return [x.strip().upper() for x in v]
+
+    @field_validator("period")
+    @classmethod
+    def valid_bench_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y")
+        return v

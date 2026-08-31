@@ -21,7 +21,7 @@
 
 ---
 
-> **⚠️ Safety boundary:** QuantumSentinel is paper-trading and research software. It is not a live brokerage, custodian, financial adviser, or production-certified cryptographic service. Never connect production financial credentials without completing the hardening steps in [SECURITY.md](SECURITY.md).
+> **Safety boundary:** QuantumSentinel is paper-trading and research software. It is not a live brokerage, custodian, financial adviser, or production-certified cryptographic service. Never connect production financial credentials without completing the hardening steps in [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -48,18 +48,18 @@ Two things that rarely appear together — in one open-source codebase:
 
 ```mermaid
 flowchart TB
-    subgraph Client["🌐 Browser Client"]
+    subgraph Client["Browser Client"]
         FE["Vanilla JS SPA\nWeb Crypto API · No build step required"]
     end
 
-    subgraph Gateway["⚡ FastAPI Gateway"]
+    subgraph Gateway["FastAPI Gateway"]
         MW["Security Middleware\nCORS · Rate Limiter · CSP · Security Headers"]
         AUTH_MW["JWT Bearer Auth\nDepends(get_current_user)"]
         WS["WebSocket Stream\n/api/signals/stream"]
         SPA["SPA Catch-all\n/{path:path} → index.html"]
     end
 
-    subgraph PQC["🔐 PQC Crypto Layer (pqc.py)"]
+    subgraph PQC["PQC Crypto Layer (pqc.py)"]
         KEM["ML-KEM-768\nFIPS 203\n1184B pk · 1088B ct · 32B ss"]
         DSA["ML-DSA-65\nFIPS 204\n1952B pk · 3309B sig"]
         X25519["X25519\nRFC 7748\nClassical hybrid leg"]
@@ -68,7 +68,7 @@ flowchart TB
         X25519 --- HKDF
     end
 
-    subgraph CoreSvcs["⚙️ Core Services"]
+    subgraph CoreSvcs["Core Services"]
         AUTH["auth_service\nJWT · PBKDF2 · PQC Handshake\nNonce TTL · Session store"]
         SIG["signal_engine\nSBA · RSI-14 · MACD 12/26/9\nLive price · 20s/15s cache"]
         TRADE["trading_service\nOrder lifecycle · Alpaca SDK\nMarket simulator · Fill logic"]
@@ -77,7 +77,7 @@ flowchart TB
         INTG["integration_service\nScoped API keys\nHMAC-signed webhooks"]
     end
 
-    subgraph Research["📊 Quant Research Engine"]
+    subgraph Research["Quant Research Engine"]
         BACK["backtest_service\nEvent-driven · Execution model\nCommission · spread · slippage"]
         WF["walk_forward\nRolling/Expanding windows\nOOS Sharpe · Overfitting flag"]
         ALPHA["alpha_research\nIC · Rank IC · ICIR\nDecay analysis · Quintile returns"]
@@ -92,12 +92,12 @@ flowchart TB
         REPORT["report_generator\n7-section JSON report\nExecutive → Frontier"]
     end
 
-    subgraph Persistence["💾 Persistence"]
+    subgraph Persistence["Persistence"]
         DB[("SQLite / PostgreSQL\nSQLAlchemy 2.0")]
         REDIS[("Redis\nRate limiting · Sessions\nIn-memory fallback in dev")]
     end
 
-    subgraph External["🌍 External APIs"]
+    subgraph External["External APIs"]
         YF["Yahoo Finance\n3-month OHLCV · fast_info"]
         ALPACA["Alpaca Paper API\npaper-api.alpaca.markets"]
     end
@@ -128,7 +128,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    YF["📈 Yahoo Finance\nOHLCV · fast_info\nAny world ticker"]
+    YF["Yahoo Finance\nOHLCV · fast_info\nAny world ticker"]
 
     subgraph FE["Feature Engineering"]
         F1["Momentum · Reversal\n20-day / cross-sectional"]
@@ -178,7 +178,7 @@ flowchart LR
 
     YF --> FE --> EXEC --> WF --> FACTOR --> STAT --> RISK --> RPT
 
-    RPT["📋 7-Section\nResearch Report\nJSON output"]
+    RPT["7-Section\nResearch Report\nJSON output"]
 ```
 
 ---
@@ -210,7 +210,7 @@ sequenceDiagram
     GW-->>BR: ServerHello {kem_ciphertext, server_x25519_pub, ml_dsa_signature, ...}
     BR->>BR: Verify ML-DSA-65 signature against server public key
     BR->>BR: Derive session_key locally via HKDF-SHA256
-    Note over BR: ✅ Quantum-safe encrypted session established
+    Note over BR: Quantum-safe encrypted session established
 ```
 
 ---
@@ -295,7 +295,7 @@ erDiagram
 
 ## Capabilities at a Glance
 
-### 🔐 Post-Quantum Cryptography
+### Post-Quantum Cryptography
 
 | What | How | Standard |
 |---|---|---|
@@ -307,7 +307,7 @@ erDiagram
 | JWT auth | RS256, 15-min TTL, nonce replay protection | RFC 7518 |
 | Key rotation | 90-day policy enforced on ML-KEM + ML-DSA keypairs | FIPS 203/204 |
 
-### 📊 Research Engine
+### Research Engine
 
 | Module | Capabilities |
 |---|---|
@@ -324,7 +324,7 @@ erDiagram
 | **Latency Profiler** | `TimerStats` dataclass · per-stage repeated runs · p50/p95/p99/p99.9 percentiles · C++ vs Python speedup benchmark with numerical equivalence check |
 | **Research Report** | 7-section structured JSON output covering the full pipeline from executive summary to efficient frontier |
 
-### 🖥️ Trading Terminal
+### Trading Terminal
 
 - **Signal Engine** — SBA + RSI-14 + MACD 12/26/9 + 20-day momentum + Bollinger Band Width + AI-generated insight text
 - **Live Prices** — 5s micro-cached `fast_info` prices for any world ticker via Yahoo Finance
@@ -730,26 +730,62 @@ docker compose up --build -d && curl http://localhost:8000/health/ready
 
 | Phase | Status | Key Deliverables |
 |---|---|---|
-| **Phase 1** — Research Engine | ✅ Complete | Event-driven backtest · execution simulator · commission/spread/slippage/borrow/leverage |
-| **Phase 2** — Walk-Forward & Alpha | ✅ Complete | Rolling/expanding WF · IC/Rank IC/ICIR · decay analysis · quintile returns · signal turnover |
-| **Phase 3** — Factor & Statistics | ✅ Complete | Fama-MacBeth · DSR · ADF/cointegration · pairs trading · portfolio optimisation |
-| **Phase 4** — Performance & Reporting | ✅ Complete | C++ kernels (pybind11) · p50/p99 latency profiler · 7-section JSON report generator |
+| **Phase 1** — Research Engine | Complete | Event-driven backtest · execution simulator · commission/spread/slippage/borrow/leverage |
+| **Phase 2** — Walk-Forward & Alpha | Complete | Rolling/expanding WF · IC/Rank IC/ICIR · decay analysis · quintile returns · signal turnover |
+| **Phase 3** — Factor & Statistics | Complete | Fama-MacBeth · DSR · ADF/cointegration · pairs trading · portfolio optimisation |
+| **Phase 4** — Performance & Reporting | Complete | C++ kernels (pybind11) · p50/p99 latency profiler · 7-section JSON report generator |
 
 ---
 
 ## Contributing
 
-```bash
-git checkout -b feature/your-feature
-# make your changes
-pytest tests/ -q         # all 241 must still pass
-git commit -m "feat: describe your change"
-git push origin feature/your-feature
-# → open a Pull Request
-```
+Contributions of all sizes are welcome — from bug fixes and documentation improvements to new research modules and cryptographic integrations.
 
-- Good first issues: [GitHub Issues — good first issue](https://github.com/BugHunterX2101/quantumsentinel-web/issues?q=label%3A%22good+first+issue%22)
-- Read [SECURITY.md](SECURITY.md) before reporting any vulnerabilities
+### Workflow
+
+1. **Fork** the repository and clone your fork locally.
+2. **Create a feature branch** from `main` using a descriptive name:
+   ```bash
+   git checkout -b fix/walk-forward-expanding-window
+   git checkout -b feat/add-kalman-filter-regime
+   git checkout -b docs/update-api-reference
+   ```
+3. **Make your changes.** Keep commits atomic and focused on a single concern.
+4. **Run the full test suite** before pushing — all 241 tests must pass:
+   ```bash
+   pytest tests/ -v
+   ```
+5. **Add tests** for any new functionality. New research modules should have corresponding tests in `tests/` following the pattern established in `test_phase3.py` and `test_phase4.py`.
+6. **Commit** using the [Conventional Commits](https://www.conventionalcommits.org/) format:
+   ```
+   feat: add Kalman-filter-based regime transition model
+   fix: correct Newey-West lag selection for short time series
+   docs: document DSR formula and assumptions in stat_tests.py
+   test: add walk-forward parity tests for expanding window mode
+   refactor: extract execution cost model into execution_model.py
+   ```
+7. **Push** and open a Pull Request against `main`. Describe *what* changed, *why*, and any design trade-offs you considered.
+
+### Code Standards
+
+- **Python style:** PEP 8. Type annotations on all public functions and class methods. Docstrings on every module, class, and non-trivial function.
+- **Pydantic schemas:** Any new API endpoint must have a corresponding request schema in `schemas.py` with field validators and a descriptive docstring.
+- **No breaking changes to existing API contracts** without a deprecation path documented in the PR description.
+- **Research modules** must return plain Python types (no raw NumPy scalars or arrays) so all API responses are JSON-serialisable.
+- **Cryptographic code** must not introduce new dependencies without explicit justification and review against the threat model in [SECURITY.md](SECURITY.md).
+
+### Pull Request Checklist
+
+- [ ] All 241 existing tests pass: `pytest tests/ -v`
+- [ ] New functionality is covered by at least one new test
+- [ ] Public functions have type annotations and docstrings
+- [ ] No raw NumPy types leak into API response payloads
+- [ ] `python -m py_compile` passes on all modified modules
+- [ ] PR description explains the change and links to any relevant issues
+
+### Security Issues
+
+Do **not** open a public GitHub issue to report security vulnerabilities. Follow the responsible disclosure process documented in [SECURITY.md](SECURITY.md).
 
 ---
 

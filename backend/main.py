@@ -1691,26 +1691,130 @@ def pairs_trading_endpoint(req: schemas.PairsTradingRequest,
 def latency_benchmark_endpoint(req: schemas.LatencyBenchmarkRequest,
                                 user: models.User = Depends(get_current_user),
                                 db: Session = Depends(get_db)):
-    """Benchmark end-to-end pipeline latency across all 7 research stages.
-    Identifies bottlenecks and shows how latency scales with asset count N."""
+    """Benchmark end-to-end pipeline latency across all research stages.
+
+    Phase 4 enhancements:
+      - percentile_mode=True: runs each stage n_runs times and returns
+        p50/p95/p99/p99.9 latencies (more rigorous than single-shot)
+      - cpp_vs_python=True: benchmark C++ kernels vs NumPy fallback,
+        reporting speedup ratios and numerical equivalence checks
+    """
     import numpy as np
-    from .services.latency_bench import run_full_benchmark
+    from .services.latency_bench import (
+        run_full_benchmark, run_percentile_benchmark, bench_cpp_vs_python
+    )
 
     try:
         return_matrix, price_matrix, names = _fetch_return_matrix(req.assets, req.period)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
+    results: dict = {}
+
     try:
-        result = run_full_benchmark(return_matrix, price_matrix, tickers=names)
+        if req.percentile_mode:
+            results["percentile_profile"] = run_percentile_benchmark(
+                return_matrix, price_matrix,
+                tickers=names,
+                n_runs=req.n_runs,
+            )
+        else:
+            results = run_full_benchmark(return_matrix, price_matrix, tickers=names)
     except Exception as exc:
         raise HTTPException(500, f"Benchmark failed: {exc}")
 
+    if req.cpp_vs_python:
+        try:
+            T, N = return_matrix.shape
+            results["cpp_vs_python"] = bench_cpp_vs_python(
+                T=min(T, 500), N=min(N, 10), n_runs=min(req.n_runs, 20)
+            )
+        except Exception as exc:
+            results["cpp_vs_python"] = {"error": str(exc)}
+
     security_service.write_audit_log(
         db, user.id, "LATENCY_BENCHMARK", "research", None,
-        {"n_assets": len(names), "total_ms": result.get("total_elapsed_ms")}
+        {
+            "n_assets": len(names),
+            "percentile_mode": req.percentile_mode,
+            "n_runs": req.n_runs,
+        }
     )
-    return result
+    return results
+
+
+@app.post("/api/research/report", status_code=200)
+def research_report_endpoint(req: schemas.ReportRequest,
+                              user: models.User = Depends(get_current_user),
+                              db: Session = Depends(get_db)):
+    """Generate a full, 7-section quant research report.
+
+    Runs the complete pipeline:
+      1. Executive summary (Sharpe, alpha, IR, drawdown, turnover)
+      2. Walk-forward validation table + OOS degradation flag
+      3. Fama-MacBeth factor premia (t-stats, significance)
+      4. HMM regime statistics (bull/bear distribution)
+      5. Statistical validation (Newey-West, bootstrap, permutation, DSR)
+      6. Risk decomposition (CVaR, Sortino, Calmar, Omega)
+      7. Efficient frontier (risk/return pairs)
+
+    All results are JSON-serialisable with no numpy types.
+    """
+    from .services.report_generator import run_full_report_pipeline
+
+    try:
+        report = run_full_report_pipeline(
+            tickers=req.assets,
+            period=req.period,
+            strategy_type=req.strategy_type,
+            run_wf=req.include_walk_forward,
+            run_factor=req.include_factor_model,
+            run_regime=req.include_regime,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Report generation failed: {exc}")
+
+    if "error" in report:
+        raise HTTPException(422, report["error"])
+
+    security_service.write_audit_log(
+        db, user.id, "RESEARCH_REPORT", "research", None,
+        {
+            "n_assets": len(req.assets),
+            "period": req.period,
+            "strategy": req.strategy_type,
+        }
+    )
+    return report
+
+
+@app.get("/api/research/cpp-status", status_code=200)
+def cpp_status_endpoint(user: models.User = Depends(get_current_user)):
+    """Return whether the C++ performance extension is loaded.
+
+    Reports: CPP_AVAILABLE bool, version, and kernel names.
+    If CPP_AVAILABLE is False, all kernels fall back to NumPy.
+    """
+    from .services.cpp_ext import CPP_AVAILABLE
+    status = {
+        "cpp_available": CPP_AVAILABLE,
+        "kernels": ["rolling_corr", "hmm_forward", "backtest_loop"],
+        "description": (
+            "C++ kernels active (hardware-accelerated)"
+            if CPP_AVAILABLE
+            else "NumPy fallback active — build cpp/ extension to enable C++ kernels"
+        ),
+    }
+    if CPP_AVAILABLE:
+        try:
+            import _qs_fast  # type: ignore[import]
+            status["extension_file"] = getattr(_qs_fast, "__file__", "unknown")
+        except Exception:
+            pass
+    return status
+
+
+
 
 
 # --------------------------------------------------------------------------

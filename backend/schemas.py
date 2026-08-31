@@ -743,3 +743,56 @@ class LatencyBenchmarkRequest(BaseModel):
         if v not in {"1y", "2y", "3y"}:
             raise ValueError("period must be one of 1y, 2y, 3y")
         return v
+
+    # Phase 4B: repeated-run percentile profiling
+    n_runs: int = Field(default=20, ge=5, le=100,
+                        description="Number of timed repetitions per stage for p50/p99 profiling")
+    percentile_mode: bool = Field(default=False,
+                                  description="If True, run percentile benchmark instead of single-shot")
+    cpp_vs_python: bool = Field(default=True,
+                                description="If True, include C++ vs Python kernel speedup comparison")
+
+
+class ReportRequest(BaseModel):
+    """Phase 4D: Full research report generator.
+
+    Runs the entire quant research pipeline and returns a structured
+    7-section JSON report suitable for exporting or displaying in the UI.
+    """
+    assets: list[str] = Field(
+        default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
+                 "BAC", "XOM", "JNJ", "AMZN", "META"],
+        min_length=1, max_length=20,
+        description="Asset universe for the report"
+    )
+    period: str = Field(default="2y",
+                        description="Historical data period")
+    strategy_type: str = Field(default="momentum",
+                               description="Signal type: momentum, reversal, volatility, quality, sba")
+    include_walk_forward: bool = Field(default=True,
+                                      description="Run walk-forward validation")
+    include_factor_model: bool = Field(default=True,
+                                      description="Run Fama-MacBeth factor model")
+    include_regime: bool = Field(default=True,
+                                description="Run HMM regime detection")
+
+    @field_validator("assets")
+    @classmethod
+    def norm_report_assets(cls, v: list[str]) -> list[str]:
+        return [x.strip().upper() for x in v]
+
+    @field_validator("period")
+    @classmethod
+    def valid_report_period(cls, v: str) -> str:
+        if v not in {"1y", "2y", "3y", "5y"}:
+            raise ValueError("period must be one of 1y, 2y, 3y, 5y")
+        return v
+
+    @field_validator("strategy_type")
+    @classmethod
+    def valid_strategy_type(cls, v: str) -> str:
+        valid = {"momentum", "reversal", "volatility", "quality", "sba"}
+        if v not in valid:
+            raise ValueError(f"strategy_type must be one of {valid}")
+        return v
+

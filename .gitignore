@@ -5,4 +5,15 @@ __pycache__/
 server.log
 run.log
 .venv/
+.venv313/
 node_modules/
+
+# C++ build artefacts — keep source (.cpp, .py) and pre-built .pyd
+cpp/build/
+cpp/*.a
+cpp/*.def
+cpp/*.o
+
+# Platform DLLs shipped alongside the .pyd (re-copied on rebuild)
+backend/services/libwinpthread-1.dll
+backend/services/python313.dll

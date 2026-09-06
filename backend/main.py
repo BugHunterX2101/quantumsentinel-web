@@ -16,6 +16,7 @@ import time
 import secrets
 import asyncio
 import hashlib
+import numpy as np
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -34,7 +35,7 @@ from . import models, schemas
 from .database import get_db, init_db, SessionLocal
 from .config import CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS
 from .crypto import pqc
-from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service
+from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service, order_security
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 
@@ -663,7 +664,8 @@ def remove_from_watchlist(
 # --------------------------------------------------------------------------
 @app.post("/api/trading/orders", status_code=201)
 def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_current_user),
-                 db: Session = Depends(get_db)):
+                 db: Session = Depends(get_db),
+                 idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     # Pydantic Literal types in schemas.py already enforce: quantity>0,
     # side in (buy/sell), order_type in (market/limit/stop/stop_limit),
     # time_in_force in (day/gtc/ioc) — these checks are now redundant.
@@ -719,45 +721,70 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
             f"(${position_cap:,.0f} based on current account equity)",
         )
 
+    current_gross_exposure = sum(
+        abs(float(ft.quantity)) * float(ft.filled_price or 0)
+        for ft in filled_trades
+    )
+    # Mandatory boundary between order construction and paper/broker execution.
+    order_security.assert_risk_gate(
+        user_id=user.id, asset=req.asset, side=req.side, quantity=req.quantity,
+        price=price_for_risk, held_quantity=held, account_equity=account_equity,
+        current_gross_exposure=current_gross_exposure,
+    )
+
     # FIX: 30-second duplicate window (was 15s) — Alpaca round-trips can take
     # 5-10s and a 15s window caused legitimate retry orders to be blocked.
-    duplicate_cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=30)
-    duplicate = db.execute(select(models.Trade).where(
-        models.Trade.user_id == user.id, models.Trade.asset == req.asset,
-        models.Trade.side == req.side, models.Trade.quantity == req.quantity,
-        models.Trade.status.in_(("PENDING", "ACCEPTED", "SUBMITTED")),
-        models.Trade.submitted_at >= duplicate_cutoff,
-    )).scalars().first()
-    if duplicate:
-        raise HTTPException(409, "duplicate pending order blocked")
-
     # ML-DSA-65 signs the order payload before it is accepted — persisted for audit.
     # NOTE: renamed from 'payload' to 'order_payload' to avoid shadowing the JWT
     # payload dict used earlier in the WebSocket handler and auth dependency.
-    user_dsa_key = db.execute(
-        select(models.KeyPair).where(
-            models.KeyPair.user_id == user.id, models.KeyPair.algorithm == "ML-DSA-65",
-            models.KeyPair.is_active.is_(True),
-        )
-    ).scalars().first()
-    order_payload = (
-        f"{req.side}:{req.asset}:{req.quantity}:{req.order_type}"
-        f":{req.limit_price}:{req.stop_price}:{req.time_in_force}"
-    ).encode()
-    signature = None
-    if user_dsa_key and user_dsa_key.private_key:
-        private_key = security_service.unprotect_private_key(user_dsa_key.private_key)
-        sig_bytes, _ = pqc.dsa_sign(pqc.unb64(private_key), order_payload)
-        signature = pqc.b64(sig_bytes)
+    supplied_envelope = [req.order_id, req.timestamp, req.expires_at, req.nonce]
+    if any(value is not None for value in supplied_envelope) and not all(value is not None for value in supplied_envelope):
+        raise HTTPException(400, "order_id, timestamp, expires_at, and nonce must be supplied together")
+    if all(value is not None for value in supplied_envelope):
+        order_id, timestamp, expires_at, nonce = req.order_id, req.timestamp, req.expires_at, req.nonce
+    else:
+        order_id = models.gen_uuid()
+        timestamp, expires_at, nonce = order_security.make_development_envelope(order_id)
+    order_security.validate_envelope(timestamp, expires_at, nonce)
+    canonical = order_security.canonical_order(
+        order_id=order_id, user_id=user.id, asset=req.asset, side=req.side,
+        quantity=req.quantity, order_type=req.order_type, limit_price=req.limit_price,
+        stop_price=req.stop_price, time_in_force=req.time_in_force,
+        timestamp=timestamp, expires_at=expires_at, nonce=nonce,
+    )
+    # Idempotency binds the caller's business payload. In development the
+    # server creates envelope fields, so hashing the generated nonce/order ID
+    # would make an otherwise identical retry look different.
+    payload_hash = order_security.request_hash(req.model_dump(exclude={"signature"}))
+    signer_key_id, signature, signature_mode = order_security.verify_or_attest(
+        db, user.id, canonical, req.key_id, req.signature,
+    )
+    # Verify first: invalid signatures must not consume a retry key.
+    cached_response = order_security.reserve_idempotency(db, user.id, idempotency_key, payload_hash)
+    if cached_response is not None:
+        return cached_response
+    if db.get(models.Trade, order_id):
+        raise HTTPException(409, "order_id was already used")
 
     trade = models.Trade(
+        id=order_id,
         user_id=user.id, asset=req.asset.upper(), side=req.side, quantity=req.quantity,
         order_type=req.order_type, limit_price=req.limit_price, time_in_force=req.time_in_force,
         stop_price=req.stop_price,
         status="PENDING", pqc_signature=signature,
     )
     db.add(trade)
-    db.commit()
+    db.add(models.OrderSecurityRecord(
+        trade_id=order_id, user_id=user.id, canonical_order=canonical,
+        request_hash=payload_hash, nonce=nonce,
+        expires_at=dt.datetime.fromtimestamp(expires_at, tz=dt.timezone.utc),
+        signer_key_id=signer_key_id, signature=signature, signature_mode=signature_mode,
+    ))
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(409, "order nonce has already been used") from exc
     db.refresh(trade)
 
     if trading_service.alpaca_enabled():
@@ -808,7 +835,9 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     if event:
         integration_service.emit_webhooks(db, user.id, event, _serialize_trade(trade))
 
-    return _serialize_trade(trade)
+    response = _serialize_trade(trade)
+    order_security.complete_idempotency(db, user.id, idempotency_key, response)
+    return response
 
 
 def _serialize_trade(t: models.Trade) -> dict:
@@ -905,11 +934,12 @@ def sdk_portfolio(key: models.ApiKey = Depends(require_api_scope("read")), db: S
 
 @app.post("/api/sdk/orders", status_code=201)
 def sdk_order(req: schemas.OrderRequest, key: models.ApiKey = Depends(require_api_scope("trade")),
-              db: Session = Depends(get_db)):
+              db: Session = Depends(get_db),
+              idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
     user = db.get(models.User, key.user_id)
     if not user or not user.is_active:
         raise HTTPException(401, "API-key user is inactive")
-    return place_order(req, user, db)
+    return place_order(req, user, db, idempotency_key)
 
 
 @app.get("/api/integrations/api-keys")

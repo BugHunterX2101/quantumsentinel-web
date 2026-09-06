@@ -134,7 +134,10 @@ def ledoit_wolf_shrinkage(returns: np.ndarray) -> tuple[np.ndarray, float]:
     phi_hat = 0.0
     for t in range(T):
         x = X[t:t+1, :].T  # (N, 1)
-        phi_hat += float((x @ x.T - S @ (mu * np.eye(N))).ravel() ** 2 @ np.ones(N**2))
+        # phi estimates variation of each outer product around the *sample
+        # covariance*. Multiplying S by the target (the old expression) is
+        # dimensionally and statistically incorrect.
+        phi_hat += float(np.sum((x @ x.T - S) ** 2))
     phi_hat /= T ** 2
 
     # Analytical shrinkage coefficient

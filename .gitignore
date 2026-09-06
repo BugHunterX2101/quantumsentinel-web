@@ -17,3 +17,10 @@ cpp/*.o
 # Platform DLLs shipped alongside the .pyd (re-copied on rebuild)
 backend/services/libwinpthread-1.dll
 backend/services/python313.dll
+
+# Platform-specific extension modules are produced by CI/Docker, never tracked.
+cpp/_qs_fast*.pyd
+cpp/_qs_fast*.so
+cpp/*.egg-info/
+backend/services/_qs_fast*.pyd
+backend/services/_qs_fast*.so

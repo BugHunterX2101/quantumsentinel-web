@@ -347,6 +347,14 @@ class OrderRequest(BaseModel):
     limit_price: float | None = Field(default=None, gt=0)
     stop_price: float | None = Field(default=None, gt=0)
     time_in_force: Literal["day", "gtc", "ioc"] = "day"
+    # Client-provided values are mandatory in production. Development may use
+    # server attestation so the paper-trading UI remains usable.
+    order_id: str | None = Field(default=None, min_length=8, max_length=128)
+    timestamp: int | None = None
+    expires_at: int | None = None
+    nonce: str | None = Field(default=None, min_length=16, max_length=128)
+    key_id: str | None = Field(default=None, min_length=8, max_length=128)
+    signature: str | None = Field(default=None, min_length=16, max_length=8192)
 
     @field_validator("asset")
     @classmethod

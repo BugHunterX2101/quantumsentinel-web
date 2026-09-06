@@ -3,7 +3,8 @@ import uuid
 import datetime as dt
 
 from sqlalchemy import (
-    Column, String, Boolean, DateTime, Numeric, Integer, ForeignKey, Text, JSON
+    Column, String, Boolean, DateTime, Numeric, Integer, ForeignKey, Text, JSON,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 
@@ -162,4 +163,48 @@ class AuditLog(Base):
     resource_id = Column(String, nullable=True)
     metadata_json = Column(JSON, default=dict)
     pqc_signature = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class OrderSecurityRecord(Base):
+    """Immutable security envelope retained separately from broker state."""
+    __tablename__ = "order_security_records"
+    __table_args__ = (UniqueConstraint("user_id", "nonce", name="uq_order_security_user_nonce"),)
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    trade_id = Column(String, ForeignKey("trades.id"), nullable=False, unique=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    canonical_order = Column(Text, nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    nonce = Column(String(128), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    signer_key_id = Column(String, nullable=True)
+    signature = Column(Text, nullable=False)
+    signature_mode = Column(String(32), nullable=False)  # client_mldsa | development_server
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class IdempotencyRecord(Base):
+    """Stores the first response for a caller supplied idempotency key."""
+    __tablename__ = "idempotency_records"
+    __table_args__ = (UniqueConstraint("user_id", "idempotency_key", name="uq_idempotency_user_key"),)
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    idempotency_key = Column(String(128), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    response_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class AuditChainLink(Base):
+    """Hash-chain link for tamper-evident audit history."""
+    __tablename__ = "audit_chain_links"
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    sequence = Column(Integer, nullable=False, unique=True)
+    audit_log_id = Column(String, ForeignKey("audit_logs.id"), nullable=False, unique=True, index=True)
+    previous_hash = Column(String(64), nullable=False)
+    entry_hash = Column(String(64), nullable=False, unique=True)
+    checkpoint_signature = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), default=utcnow)

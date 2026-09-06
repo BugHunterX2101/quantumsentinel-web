@@ -450,7 +450,10 @@ _ONDEMAND_TTL = 15           # seconds before on-demand signal expires
 
 
 def compute_single_asset(ticker: str) -> dict | None:
-    """Fetch a single asset from Yahoo Finance and compute its SBA signal.
+    """Fetch a single asset and compute a momentum-feature signal.
+
+    SBA requires a cross-asset coupling matrix and is only used by the basket
+    pipeline. This endpoint deliberately exposes its feature model instead.
 
     Results are cached for _ONDEMAND_TTL seconds so rapid user typing
     doesn't hammer the Yahoo Finance API.  Returns None if the ticker
@@ -492,7 +495,7 @@ def compute_single_asset(ticker: str) -> dict | None:
         return None
 
     feats = extract_features(close)
-    # Single-asset: spin = tanh(momentum z-score) as simplified SBA proxy
+    # A single asset has no coupling matrix; use a bounded momentum feature.
     mom = feats["momentum"]
     spin = float(np.tanh(mom * 5.0))  # scale momentum → spin range [-1, 1]
     signal_type, confidence = score_signal(spin, feats["rsi"])
@@ -507,8 +510,9 @@ def compute_single_asset(ticker: str) -> dict | None:
         "high_3mo": round(float(np.max(close)), 2),
         "low_3mo":  round(float(np.min(close)), 2),
         "features": {k: round(v, 4) for k, v in feats.items()},
-        "sba_iterations": 1,
-        "engine_version": "1.1.0-python-sba",
+        "signal_method": "single_asset_momentum_feature_model",
+        "sba_applied": False,
+        "engine_version": "1.2.0-python-feature-model",
         "on_demand": True,
         "exchange": ASSET_EXCHANGE_MAP.get(ticker, infer_exchange(ticker)),
         # Intelligence fields
@@ -569,11 +573,11 @@ def _generate_insight(signal_type: str, feats: dict, spin: float, ticker: str) -
     elif bb_w < 0.02:
         parts.append("Bollinger bands narrow - potential breakout approaching")
 
-    # SBA spin context
+    # This score is a single-asset feature-model output, not an SBA spin.
     if abs(spin) > 0.7:
-        parts.append(f"SBA spin {spin:+.2f} shows strong cross-asset consensus")
+        parts.append(f"momentum score {spin:+.2f} is strong")
     elif abs(spin) < 0.2:
-        parts.append("SBA spin near zero - mixed cross-asset signals")
+        parts.append("momentum score near zero is mixed")
 
     return ". ".join(parts[:4]) + "."  # keep top 4 most informative parts
 

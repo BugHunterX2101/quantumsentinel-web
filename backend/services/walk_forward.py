@@ -207,8 +207,7 @@ class WalkForwardEngine:
 
         # ── Aggregate OOS results ──
         all_oos = np.array(all_oos_returns) if all_oos_returns else np.array([0.0])
-        agg_equity = [self.config.execution.sizer.risk_per_trade]  # placeholder
-        # Build aggregated equity from OOS returns
+        # Build aggregated equity from OOS returns.
         agg_equity = [100_000.0]
         for r in all_oos:
             agg_equity.append(agg_equity[-1] * (1 + r))

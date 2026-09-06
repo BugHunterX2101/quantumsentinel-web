@@ -510,8 +510,8 @@ class TestPortfolio:
         fill = FillEvent(ticker="A", quantity=10.0, fill_price=100.0,
                          commission=1.0, slippage=0.5)
         pf.process_fill(fill)
-        # Cash should decrease by (10 * 100 + 1 + 0.5) = 1001.5
-        assert pf.cash == pytest.approx(100_000.0 - 1001.5)
+        # Implementation shortfall is already embedded in fill_price.
+        assert pf.cash == pytest.approx(100_000.0 - 1001.0)
 
     def test_position_updated_after_fill(self):
         pf = Portfolio(initial_capital=100_000.0)
@@ -539,6 +539,14 @@ class TestPortfolio:
             fill = FillEvent(ticker="X", quantity=10.0, fill_price=100.0, commission=2.5)
             pf.process_fill(fill)
         assert pf.total_commission == pytest.approx(12.5)
+
+    def test_borrow_cost_reduces_cash(self):
+        pf = Portfolio(initial_capital=10_000.0, allow_short=True)
+        fill = FillEvent(ticker="X", quantity=-10.0, fill_price=100.0,
+                         commission=1.0, borrow_cost=0.5)
+        pf.process_fill(fill)
+        # Short-sale proceeds increase cash; commission and borrow reduce it.
+        assert pf.cash == pytest.approx(10_998.5)
 
 
 class TestStrategies:

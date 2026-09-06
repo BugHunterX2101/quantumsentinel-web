@@ -125,7 +125,8 @@ class TransactionCostModel:
         notional = abs(qty) * fill_price
         commission = max(notional * self.commission_pct, self.min_commission)
 
-        # Slippage (total cost of spread + impact)
+        # Implementation shortfall is reported for analytics only. It is
+        # already embedded in fill_price and must not be deducted twice.
         slippage = abs(qty) * (spread_cost + impact_cost)
 
         # Borrow cost for short positions (daily)
@@ -192,8 +193,9 @@ class Portfolio:
         else:
             self.avg_costs[ticker] = self.avg_costs.get(ticker, price)
 
-        # Cash impact
-        self.cash -= qty * price + fill.commission + fill.slippage
+        # Execution impact is embedded in fill_price. Borrow is a genuine cash
+        # expense and must be debited as well as reported.
+        self.cash -= qty * price + fill.commission + fill.borrow_cost
 
         # Accumulators
         self.total_commission += fill.commission
@@ -234,6 +236,16 @@ class Portfolio:
             for t in self.positions
         )
         return gross / equity
+
+    def accrue_borrow(self, prices: dict[str, float], annual_rate: float) -> float:
+        """Accrue one day's borrow on every open short position."""
+        daily_cost = sum(
+            abs(qty) * prices.get(ticker, 0.0) * annual_rate / 252
+            for ticker, qty in self.positions.items() if qty < 0
+        )
+        self.cash -= daily_cost
+        self.total_borrow += daily_cost
+        return daily_cost
 
     def position_size_for_target(self, ticker: str, target_pct: float,
                                    price: float) -> float:
@@ -478,6 +490,10 @@ def run_event_backtest(
         current_prices = {t: float(price_data[t][bar]) for t in tickers
                           if bar < len(price_data[t])}
 
+        # Existing short positions accrue borrow before any new fills. A new
+        # short's first day is charged by its FillEvent below.
+        portfolio.accrue_borrow(current_prices, cost_model.borrow_rate_annual)
+
         # ── 1. Fill pending orders at this bar's open ──
         if bar > 0 and pending_orders:
             for order in pending_orders:
@@ -500,8 +516,18 @@ def run_event_backtest(
                 fill = cost_model.compute_fill(order, mkt, daily_vol)
 
                 # Check leverage constraint
-                gross_exp = portfolio.current_gross_exposure(current_prices)
-                if gross_exp > portfolio.leverage_limit * 1.1:
+                # Enforce the post-trade gross exposure, not merely the
+                # pre-trade account state.
+                equity = max(portfolio.equity_curve[-1], 1e-9)
+                projected_notional = sum(
+                    abs(position + (fill.quantity if ticker == order.ticker else 0.0))
+                    * current_prices.get(ticker, 0.0)
+                    for ticker, position in portfolio.positions.items()
+                )
+                if order.ticker not in portfolio.positions:
+                    projected_notional += abs(fill.quantity) * current_prices.get(order.ticker, 0.0)
+                projected_gross = projected_notional / equity
+                if projected_gross > portfolio.leverage_limit + 1e-9:
                     continue  # skip order — over leverage limit
 
                 # Check short selling constraint

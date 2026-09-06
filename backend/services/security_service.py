@@ -1,9 +1,10 @@
 """QuantumSentinel — Security service: server PQC identity, audit logging, key rotation."""
 import json
+import hashlib
 import datetime as dt
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .. import models
 from ..crypto import pqc
@@ -103,6 +104,25 @@ def write_audit_log(db: Session, user_id: str | None, action: str,
     db.add(entry)
     db.commit()
     db.refresh(entry)
+    # The regular ML-DSA signature protects an individual event. The hash
+    # chain below additionally makes deletion, modification, and reordering
+    # observable when the history is verified.
+    sequence = (db.execute(select(func.max(models.AuditChainLink.sequence))).scalar() or 0) + 1
+    previous = db.execute(
+        select(models.AuditChainLink).order_by(models.AuditChainLink.sequence.desc())
+    ).scalars().first()
+    previous_hash = previous.entry_hash if previous else "0" * 64
+    chain_payload = json.dumps({
+        "audit_log_id": entry.id,
+        "created_at": entry.created_at.isoformat() if entry.created_at else "",
+        "payload": json.loads(payload.decode()),
+        "previous_hash": previous_hash,
+    }, sort_keys=True, separators=(",", ":")).encode()
+    entry_hash = hashlib.sha256(chain_payload).hexdigest()
+    checkpoint = pqc.b64(server_identity.sign(entry_hash.encode()))
+    db.add(models.AuditChainLink(sequence=sequence, audit_log_id=entry.id, previous_hash=previous_hash,
+                                 entry_hash=entry_hash, checkpoint_signature=checkpoint))
+    db.commit()
     return entry
 
 
@@ -121,6 +141,35 @@ def verify_audit_log(db: Session, log_id: str) -> bool:
         "metadata": entry.metadata_json or {},
     }, sort_keys=True).encode()
     return pqc.dsa_verify(server_identity.dsa_pk, payload, pqc.unb64(entry.pqc_signature))
+
+
+def verify_audit_chain(db: Session) -> bool:
+    """Verify link ordering, hashes, and ML-DSA checkpoint signatures."""
+    if server_identity.dsa_pk is None:
+        return False
+    links = db.execute(select(models.AuditChainLink).order_by(models.AuditChainLink.sequence)).scalars().all()
+    previous_hash = "0" * 64
+    for link in links:
+        entry = db.get(models.AuditLog, link.audit_log_id)
+        if not entry or link.previous_hash != previous_hash:
+            return False
+        event_payload = {
+            "action": entry.action, "user_id": entry.user_id,
+            "resource_type": entry.resource_type, "resource_id": entry.resource_id,
+            "metadata": entry.metadata_json or {},
+        }
+        chain_payload = json.dumps({
+            "audit_log_id": entry.id,
+            "created_at": entry.created_at.isoformat() if entry.created_at else "",
+            "payload": event_payload, "previous_hash": previous_hash,
+        }, sort_keys=True, separators=(",", ":")).encode()
+        calculated = hashlib.sha256(chain_payload).hexdigest()
+        if calculated != link.entry_hash or not pqc.dsa_verify(
+            server_identity.dsa_pk, link.entry_hash.encode(), pqc.unb64(link.checkpoint_signature)
+        ):
+            return False
+        previous_hash = link.entry_hash
+    return True
 
 
 def key_health(db: Session, user_id: str) -> dict:

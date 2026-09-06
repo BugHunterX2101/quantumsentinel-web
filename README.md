@@ -4,18 +4,18 @@
 
 # QuantumSentinel
 
-**The World's First Open-Source Post-Quantum Secure Trading Terminal with an Institutional-Grade Quant Research Engine**
+**Open-source quantitative research and paper-trading platform with post-quantum security primitives**
 
-[![Python](https://img.shields.io/badge/Python-3.13%2B-blue?logo=python&logoColor=white)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![Tests](https://img.shields.io/badge/Tests-241%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-pytest-blue)](tests/)
 [![FIPS 203](https://img.shields.io/badge/FIPS_203-ML--KEM--768-cyan)](https://csrc.nist.gov/pubs/fips/203/final)
 [![FIPS 204](https://img.shields.io/badge/FIPS_204-ML--DSA--65-purple)](https://csrc.nist.gov/pubs/fips/204/final)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](docker-compose.yml)
 [![Paper Trading](https://img.shields.io/badge/Trading-Paper_Only-orange)](SECURITY.md)
 
-*Quantum-safe cryptography · Realistic backtesting engine · Walk-forward validation · Factor modeling · C++ accelerated kernels*
+*Post-quantum security primitives · realistic backtesting · walk-forward validation · factor modelling · optional C++ kernels*
 
 </div>
 
@@ -29,18 +29,18 @@
 
 Two things that rarely appear together — in one open-source codebase:
 
-**Post-Quantum Cryptography (production-grade)**
+**Post-Quantum Cryptography (research / integration-ready)**
 - Every session begins with a **hybrid X25519 + ML-KEM-768** key exchange — combining classical and post-quantum cryptography per FIPS 203
-- Every order is signed with **ML-DSA-65** (FIPS 204) — quantum-safe lattice signatures
-- Every audit log entry is server-signed and **browser-verifiable** in real time
-- Passwords hashed with PBKDF2-SHA256 at 200,000 rounds; keys encrypted at rest with AES-256-GCM
+- Production orders use a canonical `QS-ORDER-V1` payload, client ML-DSA-65 signature, bounded expiry, nonce, and idempotency key
+- Audit records are server-signed and protected by a SHA-256 hash chain with ML-DSA checkpoints
+- Passwords use Argon2id; locally stored private-key and webhook material uses Fernet authenticated encryption
 
-**Serious Quant Research Engine (institutional-grade)**
+**Quantitative Research Engine**
 - Backtested systematic strategies **under realistic transaction-cost and execution assumptions** — not toy MA crossovers with perfect fills
 - Walk-forward validation that actually catches overfitting — not just in-sample Sharpe
 - Fama-MacBeth cross-sectional factor regressions with Newey-West corrected t-statistics
 - Deflated Sharpe Ratio, block bootstrap, permutation testing — statistical guard rails that quant desks actually use
-- C++ kernels (pybind11) for rolling correlation, HMM forward pass, and backtest loop — with transparent NumPy fallback
+- Optional C++ kernels (pybind11) for rolling correlation, HMM forward pass, and backtest loop — with transparent NumPy fallback
 
 ---
 
@@ -69,9 +69,9 @@ flowchart TB
     end
 
     subgraph CoreSvcs["Core Services"]
-        AUTH["auth_service\nJWT · PBKDF2 · PQC Handshake\nNonce TTL · Session store"]
+        AUTH["auth_service\nJWT · Argon2id · PQC Handshake\nNonce TTL · Session store"]
         SIG["signal_engine\nSBA · RSI-14 · MACD 12/26/9\nLive price · 20s/15s cache"]
-        TRADE["trading_service\nOrder lifecycle · Alpaca SDK\nMarket simulator · Fill logic"]
+        TRADE["trading_service\nOrder lifecycle · Alpaca Paper API\nMarket simulator · Fill logic"]
         PORT["portfolio_service\nPositions · Equity curve\nSharpe · VaR · Drawdown"]
         SEC["security_service\nServer ML-DSA identity\nAudit log · 90-day rotation"]
         INTG["integration_service\nScoped API keys\nHMAC-signed webhooks"]
@@ -83,7 +83,7 @@ flowchart TB
         ALPHA["alpha_research\nIC · Rank IC · ICIR\nDecay analysis · Quintile returns"]
         FACTOR["factor_model\nFama-MacBeth regression\nNewey-West t-statistics"]
         CORR["correlation_engine\nShrinkage (Ledoit-Wolf)\nPCA denoising"]
-        OPT["portfolio_optimization\nMean-Variance · Black-Litterman\nRisk-Parity · Efficient Frontier"]
+        OPT["portfolio_optimization\nMean-Variance · turnover-aware MVO\nRisk-Parity · Efficient Frontier"]
         REGIME["regime_detection\n2-state HMM · Viterbi\nVol/Trend regime"]
         STAT["stat_tests\nDSR · Bootstrap CI\nPermutation · ADF · Cointegration"]
         NEUTRAL["neutral_strategies\nPairs trading · Kalman filter\nOU half-life"]
@@ -194,7 +194,7 @@ sequenceDiagram
 
     Note over BR,DB: Phase 1 — Password Authentication
     BR->>GW: POST /api/auth/login {email, password}
-    GW->>DB: PBKDF2-SHA256 verify (200,000 rounds)
+    GW->>DB: Argon2id password verification
     DB-->>GW: User record
     GW-->>BR: RS256 JWT (15 min TTL) + expires_in
 
@@ -206,7 +206,7 @@ sequenceDiagram
     GW->>PQC: x25519_exchange(server_priv, client_x25519_pub) → X25519_secret
     GW->>PQC: HKDF-SHA256(X25519_secret ‖ KEM_secret ‖ nonces) → session_key
     GW->>PQC: dsa_sign(server_dsa_sk, ServerHello_payload) → ML-DSA-65 signature
-    GW->>DB: Persist session + KEM keypair
+    GW->>GW: Store short-lived session state
     GW-->>BR: ServerHello {kem_ciphertext, server_x25519_pub, ml_dsa_signature, ...}
     BR->>BR: Verify ML-DSA-65 signature against server public key
     BR->>BR: Derive session_key locally via HKDF-SHA256
@@ -223,7 +223,7 @@ erDiagram
         string id PK
         string email UK
         string password_hash
-        boolean is_admin
+        string tier
         boolean is_active
         datetime created_at
     }
@@ -265,6 +265,25 @@ erDiagram
         string pqc_signature
         datetime created_at
     }
+    order_security_records {
+        string trade_id FK
+        string nonce UK
+        string request_hash
+        string signature_mode
+        datetime expires_at
+    }
+    idempotency_records {
+        string user_id FK
+        string idempotency_key UK
+        string request_hash
+        json response_json
+    }
+    audit_chain_links {
+        int sequence UK
+        string audit_log_id FK
+        string previous_hash
+        string entry_hash
+    }
     api_keys {
         string id PK
         string user_id FK
@@ -287,6 +306,9 @@ erDiagram
     users ||--o{ positions : "holds"
     users ||--o{ key_pairs : "owns"
     users ||--o{ audit_logs : "generates"
+    users ||--o{ order_security_records : "authorises"
+    users ||--o{ idempotency_records : "retries"
+    audit_logs ||--|| audit_chain_links : "chains"
     users ||--o{ api_keys : "manages"
     users ||--o{ webhooks : "configures"
 ```
@@ -300,12 +322,38 @@ erDiagram
 | What | How | Standard |
 |---|---|---|
 | Session key exchange | Hybrid X25519 + ML-KEM-768 → HKDF-SHA256 | FIPS 203, RFC 7748 |
-| Order signing | ML-DSA-65 lattice signature on every order | FIPS 204 |
-| Audit trail | Server-signed, browser-verifiable entries | FIPS 204 |
-| Password hashing | PBKDF2-SHA256, 200,000 rounds | NIST SP 800-132 |
-| Keys at rest | AES-256-GCM (Fernet) encryption | NIST SP 800-38D |
+| Order authorisation | Canonical `QS-ORDER-V1` payload · ML-DSA-65 client signature in production · nonce/expiry/idempotency | FIPS 204 |
+| Audit trail | Server-signed entries · SHA-256 hash chain · ML-DSA checkpoints | FIPS 204 |
+| Password hashing | Argon2id with OWASP-oriented parameters; legacy PBKDF2 upgrades on login | Argon2 |
+| Keys at rest | Fernet authenticated encryption for local development storage | Fernet specification |
 | JWT auth | RS256, 15-min TTL, nonce replay protection | RFC 7518 |
 | Key rotation | 90-day policy enforced on ML-KEM + ML-DSA keypairs | FIPS 203/204 |
+
+### Order Security and Execution Boundary
+
+Orders pass through a security/risk boundary before the paper broker or an
+external paper-trading adapter is called:
+
+```text
+Order request → risk gate → canonical QS-ORDER-V1 payload → signature check
+              → nonce/replay check → idempotency check → execution → audit chain
+```
+
+- Production requests must include a client-held ML-DSA-65 signature, `order_id`,
+  timestamp, expiry, nonce, and `Idempotency-Key`.
+- Reusing a nonce is rejected; reusing an idempotency key with the same payload
+  returns the initial result, while a changed payload is rejected.
+- The risk gate checks kill switches, order notional, position availability, and
+  projected gross leverage. Development paper trading uses visibly labelled
+  server attestation for compatibility; it is not client order authorisation.
+
+### Research Reproducibility
+
+`research_metadata.py` provides versioned experiment records and dataset
+lineage fields: assets, date range, source, adjustment policy, retrieval time,
+feature version, parameters, execution model, random seed, Git commit hash,
+data hash, IS/OOS metrics, and statistical results. Yahoo Finance daily-bar
+data is explicitly labelled as not survivorship-free or point-in-time validated.
 
 ### Research Engine
 
@@ -316,7 +364,7 @@ erDiagram
 | **Alpha Research** | IC · Rank IC · ICIR · hit rate · decay analysis (1–20 bar horizon) · quintile/decile returns · signal turnover · long-short spread |
 | **Fama-MacBeth Factor Model** | Cross-sectional regression · Newey-West autocorrelation-corrected t-statistics · factor premia per asset · per-period R² · factor significance testing |
 | **Correlation Engine** | Sample covariance · Ledoit-Wolf shrinkage · PCA denoising · shrinkage intensity optimisation · rolling 252-day window |
-| **Portfolio Optimisation** | Mean-variance (Markowitz) · Black-Litterman · Risk-Parity · Min-Volatility · Equal-Weight · efficient frontier computation |
+| **Portfolio Optimisation** | Mean-variance (Markowitz) · turnover-aware MVO · Risk-Parity · Min-Volatility · Equal-Weight · efficient frontier computation |
 | **HMM Regime Detection** | 2-state Gaussian HMM (bull/bear) · Viterbi sequence decoding · volatility regime · trend regime · transition probability matrix |
 | **Statistical Testing** | Newey-West t-test · Deflated Sharpe Ratio (DSR) · block bootstrap CI · permutation p-value · Ljung-Box autocorrelation · ADF unit-root · Durbin-Watson · Engle-Granger cointegration |
 | **Stat Arb / Pairs Trading** | Engle-Granger cointegration · Kalman filter hedge ratio · z-score entry/exit signals · Ornstein-Uhlenbeck half-life · spread mean-reversion test |
@@ -356,11 +404,13 @@ quantumsentinel-web/
 │   │
 │   └── services/
 │       │   ── Core Services ─────────────────────────────────────────────
-│       ├── auth_service.py              ← JWT · PBKDF2 · PQC handshake · nonce TTL store
+│       ├── auth_service.py              ← JWT · Argon2id · PQC handshake · nonce TTL store
 │       ├── signal_engine.py             ← SBA · RSI · MACD · live price · asset info · caching
-│       ├── trading_service.py           ← Order lifecycle · Alpaca SDK · local simulator
+│       ├── trading_service.py           ← Order lifecycle · Alpaca Paper API · local simulator
 │       ├── portfolio_service.py         ← Positions · mark-to-market · equity curve · Sharpe · VaR
-│       ├── security_service.py          ← Server ML-DSA identity · audit log · key health
+│       ├── order_security.py            ← canonical orders · nonce/idempotency · risk gate
+│       ├── research_metadata.py         ← experiment manifests · data lineage
+│       ├── security_service.py          ← server identity · signed audit hash chain · key health
 │       ├── integration_service.py       ← Scoped API keys · SSRF-guarded signed webhooks
 │       │
 │       │   ── Research Engine ─────────────────────────────────────────
@@ -370,7 +420,7 @@ quantumsentinel-web/
 │       ├── alpha_research.py            ← IC · Rank IC · ICIR · decay analysis · quintile returns
 │       ├── factor_model.py              ← Fama-MacBeth cross-sectional regression · Newey-West
 │       ├── correlation_engine.py        ← Shrinkage (Ledoit-Wolf) · PCA denoising
-│       ├── portfolio_optimization.py    ← Mean-variance · Black-Litterman · Risk-Parity · frontier
+│       ├── portfolio_optimization.py    ← Mean-variance · turnover-aware MVO · Risk-Parity · frontier
 │       ├── regime_detection.py          ← 2-state HMM · Viterbi · vol/trend regime
 │       ├── stat_tests.py                ← DSR · bootstrap · permutation · ADF · cointegration
 │       ├── neutral_strategies.py        ← Pairs trading · Kalman filter · OU half-life
@@ -381,7 +431,7 @@ quantumsentinel-web/
 ├── cpp/                                 ← C++ performance kernels (pybind11)
 │   ├── qs_fast.cpp                      ← rolling_corr · hmm_forward · backtest_loop
 │   ├── setup.py                         ← Cross-platform build: MinGW (Windows) / GCC / Clang
-│   └── _qs_fast.cp313-win_amd64.pyd    ← Pre-built Windows extension (Python 3.13)
+│   └── target-platform extension built in CI/Docker (not committed)
 │
 ├── frontend/                            ← Vanilla JS SPA (zero build step)
 │   ├── index.html                       ← App shell · 7-tab navigation · all forms
@@ -390,7 +440,7 @@ quantumsentinel-web/
 │   ├── styles.css                       ← Glassmorphism · micro-animations · mobile-first
 │   └── favicon.ico                      ← Quantum diamond icon
 │
-├── tests/                               ← Pytest suite — 241 tests · 100% pass rate
+├── tests/                               ← Pytest suite validated by CI
 │   ├── test_auth.py                     ← Authentication & PQC handshake
 │   ├── test_trading.py                  ← Order lifecycle & fills
 │   ├── test_portfolio.py                ← Risk metrics
@@ -403,7 +453,7 @@ quantumsentinel-web/
 │   ├── nginx.conf                       ← TLS 1.3 reverse proxy with HSTS
 │   └── tls/                             ← Certificate mount point
 │
-├── .env.example                         ← All environment variables documented
+├── .env.example                         ← Development environment template
 ├── Dockerfile                           ← Multi-stage Python image
 ├── docker-compose.yml                   ← Dev/demo: SQLite, single container
 ├── docker-compose.production.yml        ← Prod: PostgreSQL + Redis + Nginx + Gunicorn
@@ -420,7 +470,7 @@ quantumsentinel-web/
 
 | Requirement | Notes |
 |---|---|
-| **Python 3.13+** | Official CPython from [python.org](https://python.org) — required for C++ extension ABI compatibility |
+| **Python 3.12** | Official CPython from [python.org](https://python.org) — used locally, in CI, and in Docker |
 | **Git** | Any recent version |
 | **C++ compiler** *(optional)* | MinGW-W64 GCC 16+ (Windows) · GCC 11+ (Linux) · Clang 14+ (macOS) — only needed for C++ kernel speedup |
 
@@ -451,7 +501,7 @@ copy .env.example .env
 cp .env.example .env
 ```
 
-- Set `ALPACA_API_KEY` + `ALPACA_SECRET_KEY` for live paper execution via Alpaca
+- Set `ALPACA_API_KEY` + `ALPACA_SECRET_KEY` for Alpaca paper execution
 - Without them, orders settle against the latest Yahoo Finance price in the built-in simulator
 
 ### 3 — Run
@@ -504,11 +554,11 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 | `POST` | `/api/research/alpha` | IC · Rank IC · ICIR · hit rate · decay analysis · quintile/decile returns |
 | `POST` | `/api/research/factor-model` | Fama-MacBeth cross-sectional regression with Newey-West t-statistics |
 | `POST` | `/api/research/correlation` | Shrinkage (Ledoit-Wolf) and PCA-denoised correlation matrix estimation |
-| `POST` | `/api/research/portfolio-optimization` | Mean-variance · Black-Litterman · Risk-Parity · Min-Vol · efficient frontier |
-| `POST` | `/api/research/regime-detection` | 2-state Gaussian HMM · Viterbi decoding · volatility and trend regime |
-| `POST` | `/api/research/stat-tests` | Newey-West · DSR · block bootstrap CI · permutation p-value · ADF · cointegration |
+| `POST` | `/api/research/optimize` | Mean-variance · turnover-aware MVO · Risk-Parity · Min-Vol · efficient frontier |
+| `POST` | `/api/research/regime` | 2-state Gaussian HMM · Viterbi decoding · volatility and trend regime |
+| `POST` | `/api/research/stat-test` | Newey-West · DSR · block bootstrap CI · permutation p-value · ADF · cointegration |
 | `POST` | `/api/research/pairs-trading` | Engle-Granger cointegration · Kalman filter hedge ratio · z-score signal · OU half-life |
-| `POST` | `/api/research/sba-backtest` | SBA quantum-inspired combinatorial optimizer backtest |
+| `POST` | `/api/research/event-backtest` | Event-driven backtest with execution costs, leverage, and short-borrow accounting |
 | **`POST`** | **`/api/research/report`** | **Full 7-section research report across all pipeline stages** |
 | `POST` | `/api/research/latency-benchmark` | Per-stage p50/p99 latency profile + C++ vs Python speedup benchmark |
 | `GET`  | `/api/research/cpp-status` | C++ extension load status · kernel names · active mode |
@@ -557,7 +607,7 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 
 | Area | Method | Endpoint | Auth | Notes |
 |---|---|---|---|---|
-| **Auth** | `POST` | `/api/auth/register` | — | PBKDF2-SHA256, 200k rounds |
+| **Auth** | `POST` | `/api/auth/register` | — | Argon2id password hashing |
 | | `POST` | `/api/auth/login` | — | Returns RS256 JWT |
 | | `POST` | `/api/auth/pqc-handshake` | JWT | Hybrid X25519 + ML-KEM-768 |
 | **Signals** | `GET` | `/api/signals/latest` | JWT | 20 preloaded assets, 20s cache |
@@ -565,7 +615,7 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 | | `WS` | `/api/signals/stream` | JWT | Live push with exponential backoff |
 | **Live Market** | `GET` | `/api/price/{ticker}` | JWT | Always-fresh 5s micro-cache |
 | | `GET` | `/api/asset/info/{ticker}` | JWT | Instrument type, exchange, market open/closed |
-| **Trading** | `POST` | `/api/trading/orders` | JWT | ML-DSA-65 signed order |
+| **Trading** | `POST` | `/api/trading/orders` | JWT | canonical order · production client signature · nonce/idempotency/risk gate |
 | | `GET` | `/api/trading/orders` | JWT | Full order history |
 | | `DELETE` | `/api/trading/orders/{id}` | JWT | Cancel pending order |
 | **Watchlist** | `GET/PUT` | `/api/watchlist` | JWT | Get / replace full list |
@@ -598,8 +648,8 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 | **X25519** | Classical hybrid KEM leg | pk: 32B · ss: 32B | RFC 7748 |
 | **HKDF-SHA256** | Session key derivation | 32B output | RFC 5869 |
 | **RS256 (RSA-2048)** | JWT signing | 2048-bit | RFC 7518 |
-| **PBKDF2-SHA256** | Password hashing | 200,000 rounds | NIST SP 800-132 |
-| **AES-256-GCM** (Fernet) | Key/secret encryption at rest | 256-bit | NIST SP 800-38D |
+| **Argon2id** | Password hashing | memory-hard KDF | Argon2 |
+| **Fernet** | Local private-key / webhook-secret encryption | authenticated symmetric encryption | Fernet specification |
 
 ### Production Hardening Checklist
 
@@ -619,7 +669,7 @@ Read [SECURITY.md](SECURITY.md) for the full threat model and responsible disclo
 
 ## Configuration Reference
 
-All variables are documented in [`.env.example`](.env.example):
+Configuration defaults and production checks live in [`backend/config.py`](backend/config.py).
 
 | Variable | Required | Description |
 |---|---|---|
@@ -692,27 +742,11 @@ docker compose -f docker-compose.production.yml --env-file .env.production up -d
 ## Verification
 
 ```bash
-# Run the full test suite — 241 must pass
+# Run the full test suite (CI is the source of truth for the test count)
 pytest tests/ -v
 
-# Python syntax check — all research modules
-python -m py_compile \
-    backend/main.py backend/schemas.py backend/models.py \
-    backend/crypto/pqc.py \
-    backend/services/auth_service.py \
-    backend/services/signal_engine.py \
-    backend/services/backtest_service.py \
-    backend/services/walk_forward.py \
-    backend/services/alpha_research.py \
-    backend/services/factor_model.py \
-    backend/services/correlation_engine.py \
-    backend/services/portfolio_optimization.py \
-    backend/services/regime_detection.py \
-    backend/services/stat_tests.py \
-    backend/services/neutral_strategies.py \
-    backend/services/report_generator.py \
-    backend/services/cpp_ext.py \
-    backend/services/latency_bench.py
+# Compile every backend module and test
+python -m compileall -q backend tests
 
 # JavaScript syntax check
 node --check frontend/app.js
@@ -751,7 +785,7 @@ Contributions of all sizes are welcome — from bug fixes and documentation impr
    git checkout -b docs/update-api-reference
    ```
 3. **Make your changes.** Keep commits atomic and focused on a single concern.
-4. **Run the full test suite** before pushing — all 241 tests must pass:
+4. **Run the full test suite** before pushing — CI is the source of truth for the current test count:
    ```bash
    pytest tests/ -v
    ```
@@ -776,7 +810,7 @@ Contributions of all sizes are welcome — from bug fixes and documentation impr
 
 ### Pull Request Checklist
 
-- [ ] All 241 existing tests pass: `pytest tests/ -v`
+- [ ] Full test suite passes: `pytest tests/ -v`
 - [ ] New functionality is covered by at least one new test
 - [ ] Public functions have type annotations and docstrings
 - [ ] No raw NumPy types leak into API response payloads

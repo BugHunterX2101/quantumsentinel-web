@@ -11,8 +11,13 @@
 - The hybrid handshake combines a classical X25519 ECDH exchange with
   ML-KEM-768 via HKDF-SHA256, so an attacker must break **both** primitives
   to recover a session key (defense against Harvest-Now-Decrypt-Later).
-- Every trade order and every audit-log entry is signed with ML-DSA-65 and
-  independently re-verified on read.
+- Production trade orders use a deterministic `QS-ORDER-V1` canonical payload,
+  client-held ML-DSA-65 signing key, bounded expiry, and one-time nonce. The
+  reference development UI uses clearly labelled server attestation only, so
+  it is never confused with client authorisation.
+- Order retries use `Idempotency-Key`; reusing a key with a different payload
+  is rejected. Audit entries are ML-DSA signed and linked in a signed SHA-256
+  hash chain to make modification, deletion, or reordering detectable.
 
 ## Known simplifications vs. the full architecture spec
 
@@ -29,6 +34,9 @@
 - The reference deployment rate limiter is process-local. Deployments with
   more than one application process must replace it with a shared, atomic
   Redis-backed limiter before being exposed to the internet.
+- The development replay/kill-switch store is process-local. Production
+  deployments should implement the same semantics using Redis `SET NX EX` and
+  persist administrative kill-switch events in the audit store.
 - The server audit-signing identity is generated at process start in this
   demo. Persist it in an HSM/KMS (and retain public-key history) before
   relying on audit verification across restarts.

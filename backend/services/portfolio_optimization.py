@@ -45,6 +45,46 @@ class PortfolioConstraints:
     target_volatility: float | None = None  # scale portfolio to hit target vol
 
 
+def turnover_aware_mean_variance(expected_returns: np.ndarray,
+                                 cov_matrix: np.ndarray,
+                                 previous_weights: np.ndarray,
+                                 risk_aversion: float = 1.0,
+                                 turnover_penalty: float = 0.0,
+                                 constraints: PortfolioConstraints | None = None,
+                                 n_iter: int = 800,
+                                 lr: float = 0.02) -> np.ndarray:
+    """Optimise expected return net of risk and implementation turnover.
+
+    Maximises ``mu'w - lambda*w'Sigma*w - gamma*||w-w_prev||_1`` using a
+    proximal-gradient update.  ``turnover_penalty`` is in return units per
+    unit of one-way turnover, so callers can calibrate it to their execution
+    model rather than treating turnover as an after-the-fact diagnostic.
+    """
+    mu = np.asarray(expected_returns, dtype=float)
+    prev = np.asarray(previous_weights, dtype=float)
+    cov = np.asarray(cov_matrix, dtype=float)
+    if mu.ndim != 1 or cov.shape != (len(mu), len(mu)) or prev.shape != mu.shape:
+        raise ValueError("expected_returns, covariance matrix, and previous_weights have incompatible shapes")
+    if risk_aversion < 0 or turnover_penalty < 0:
+        raise ValueError("risk_aversion and turnover_penalty must be non-negative")
+
+    con = constraints or PortfolioConstraints()
+    w = _project_simplex(prev.copy(), con)
+    threshold = lr * turnover_penalty
+    for _ in range(n_iter):
+        # Smooth part: mu'w - lambda*w'Sigma*w.
+        candidate = w + lr * (mu - 2.0 * risk_aversion * (cov @ w))
+        # Proximal operator for gamma * ||w - previous_weights||_1.
+        delta = candidate - prev
+        w_next = prev + np.sign(delta) * np.maximum(np.abs(delta) - threshold, 0.0)
+        w_next = _project_simplex(w_next, con)
+        if np.max(np.abs(w_next - w)) < 1e-9:
+            w = w_next
+            break
+        w = w_next
+    return w
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -64,7 +104,10 @@ class OptMethod(str, Enum):
 def equal_weight(n_assets: int,
                  constraints: PortfolioConstraints | None = None) -> np.ndarray:
     """1/N portfolio."""
-    return np.ones(n_assets) / n_assets
+    if n_assets < 1:
+        raise ValueError("n_assets must be positive")
+    return _project_simplex(np.ones(n_assets) / n_assets,
+                            constraints or PortfolioConstraints())
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +148,7 @@ def minimum_variance(cov_matrix: np.ndarray,
         w = w - lr * grad
         w = _project_simplex(w, con)
 
-    return w / w.sum()
+    return _project_simplex(w, con)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +193,7 @@ def maximum_sharpe(expected_returns: np.ndarray,
         w = w + 0.01 * grad_sharpe  # gradient ascent
         w = _project_simplex(w, con)
 
-    return w / max(w.sum(), 1e-9)
+    return _project_simplex(w, con)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +233,7 @@ def risk_parity(cov_matrix: np.ndarray,
             break
         w = w_new
 
-    return w / max(w.sum(), 1e-9)
+    return _project_simplex(w, con)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +267,7 @@ def maximum_diversification(cov_matrix: np.ndarray,
         w = w + lr * grad_dr
         w = _project_simplex(w, con)
 
-    return w / max(w.sum(), 1e-9)
+    return _project_simplex(w, con)
 
 
 # ---------------------------------------------------------------------------
@@ -233,15 +276,29 @@ def maximum_diversification(cov_matrix: np.ndarray,
 
 def _project_simplex(w: np.ndarray,
                      con: PortfolioConstraints) -> np.ndarray:
-    """Project onto the simplex with box constraints."""
-    w = _project_box(w, con)
-    # Rescale to sum to 1 (simplex projection)
-    s = w.sum()
-    if s > 1e-9:
-        w = w / s
-    else:
-        w = np.ones(len(w)) / len(w)
-    return w
+    """Project onto sum(w)=1 while preserving every box constraint.
+
+    Clipping then normalising is not a valid projection: normalising can push
+    an already-clipped weight above its maximum. The solution has the form
+    ``clip(w - theta, lower, upper)``; bisection finds theta.
+    """
+    w = np.asarray(w, dtype=float)
+    if w.ndim != 1 or len(w) == 0:
+        raise ValueError("weights must be a non-empty vector")
+    if not con.long_only:
+        raise ValueError("short portfolio projection is not implemented; use long_only constraints")
+    lower = max(0.0, con.min_weight)
+    upper = con.max_weight
+    if lower > upper or lower * len(w) > 1 + 1e-12 or upper * len(w) < 1 - 1e-12:
+        raise ValueError("infeasible portfolio box constraints")
+    lo, hi = float(np.min(w) - upper), float(np.max(w) - lower)
+    for _ in range(80):
+        theta = (lo + hi) / 2.0
+        if np.clip(w - theta, lower, upper).sum() > 1.0:
+            lo = theta
+        else:
+            hi = theta
+    return np.clip(w - (lo + hi) / 2.0, lower, upper)
 
 
 def _project_box(w: np.ndarray,
@@ -306,7 +363,10 @@ def run_portfolio_optimization(returns: np.ndarray,
                                corr_method: str = "ledoit_wolf",
                                rf_rate: float = 0.0,
                                constraints: PortfolioConstraints | None = None,
-                               sba_signals: np.ndarray | None = None) -> dict:
+                               sba_signals: np.ndarray | None = None,
+                               previous_weights: np.ndarray | None = None,
+                               turnover_penalty: float = 0.0,
+                               risk_aversion: float = 1.0) -> dict:
     """Run all portfolio optimisation methods and compare.
 
     Parameters
@@ -317,6 +377,9 @@ def run_portfolio_optimization(returns: np.ndarray,
     rf_rate : daily risk-free rate
     constraints : portfolio constraints
     sba_signals : optional (N,) SBA signal vector for signal-weighted portfolio
+    previous_weights : optional (N,) portfolio from the prior rebalance
+    turnover_penalty : implementation-cost penalty for the turnover-aware MVO
+    risk_aversion : covariance penalty for the turnover-aware MVO
 
     Returns
     -------
@@ -375,6 +438,14 @@ def run_portfolio_optimization(returns: np.ndarray,
         except Exception as exc:
             errors[method.value] = str(exc)
             methods[method.value] = equal_weight(N, con)
+
+    if previous_weights is not None:
+        try:
+            methods["turnover_aware_mean_variance"] = turnover_aware_mean_variance(
+                exp_ret, cov, previous_weights, risk_aversion, turnover_penalty, con,
+            )
+        except Exception as exc:
+            errors["turnover_aware_mean_variance"] = str(exc)
 
     # ── SBA signal-weighted portfolio ──
     if sba_signals is not None and len(sba_signals) == N:

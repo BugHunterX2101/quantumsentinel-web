@@ -289,71 +289,68 @@ class TestTimerStats:
 # Track 4C: scipy/statsmodels upgrades
 # ===========================================================================
 
+# Module-level importorskip — silences IDE "Cannot find module" errors
+# and gracefully skips the entire class if packages are missing.
+scipy_stats = pytest.importorskip("scipy.stats", reason="scipy required for stat tests")
+sm_tsa = pytest.importorskip("statsmodels.tsa.stattools", reason="statsmodels required for stat tests")
+sm_stats = pytest.importorskip("statsmodels.stats.stattools", reason="statsmodels required for stat tests")
+
+
 class TestScipyStatTests:
     def test_scipy_available(self):
-        import scipy.stats
-        assert hasattr(scipy.stats, "norm")
+        assert hasattr(scipy_stats, "norm")
 
     def test_statsmodels_available(self):
-        import statsmodels.tsa.stattools as tsa
-        assert hasattr(tsa, "adfuller")
+        assert hasattr(sm_tsa, "adfuller")
 
     def test_adf_nonstationary(self, nonstationary_series):
         """Random walk should NOT reject unit root (p > 0.05)."""
-        from statsmodels.tsa.stattools import adfuller
-        result = adfuller(nonstationary_series, autolag="AIC", result_object=False)
+        result = sm_tsa.adfuller(nonstationary_series, autolag="AIC", result_object=False)
         p_value = float(result[1])
         # High p-value expected — don't reject H0 of unit root
         assert p_value > 0.01, f"Random walk p-value too low: {p_value}"
 
     def test_adf_stationary(self, stationary_series):
         """IID noise should REJECT unit root (p < 0.05)."""
-        from statsmodels.tsa.stattools import adfuller
-        result = adfuller(stationary_series, autolag="AIC", result_object=False)
+        result = sm_tsa.adfuller(stationary_series, autolag="AIC", result_object=False)
         p_value = float(result[1])
         assert p_value < 0.05, f"Stationary series p-value too high: {p_value}"
 
     def test_durbin_watson_in_range(self, strategy_returns):
         """Durbin-Watson statistic must always be in [0, 4]."""
-        from statsmodels.stats.stattools import durbin_watson
-        dw = float(durbin_watson(strategy_returns))
+        dw = float(sm_stats.durbin_watson(strategy_returns))
         assert 0.0 <= dw <= 4.0
 
     def test_durbin_watson_uncorrelated_near_2(self, rng):
         """IID residuals should give DW close to 2."""
-        from statsmodels.stats.stattools import durbin_watson
         iid = rng.normal(0, 1, 500)
-        dw = float(durbin_watson(iid))
+        dw = float(sm_stats.durbin_watson(iid))
         assert 1.5 < dw < 2.5
 
     def test_cointegration_detects_cointegrated(self, cointegrated_pair):
         """statsmodels coint test should find cointegration in cointegrated pair."""
-        from statsmodels.tsa.stattools import coint
         y, x = cointegrated_pair
-        _, p_value, _ = coint(y, x)
+        _, p_value, _ = sm_tsa.coint(y, x)
         assert float(p_value) < 0.05, f"Expected cointegration, got p={p_value:.4f}"
 
     def test_cointegration_no_false_positive(self, rng):
         """Two independent random walks should not be flagged as cointegrated."""
-        from statsmodels.tsa.stattools import coint
         T = 300
         x = np.cumsum(rng.normal(0, 1, T))
         y = np.cumsum(rng.normal(0, 1, T))
-        _, p_value, _ = coint(y, x)
+        _, p_value, _ = sm_tsa.coint(y, x)
         # p > 0.05 for independence (with high probability — not guaranteed)
         # Use a generous threshold to avoid flaky tests
         assert float(p_value) > 0.001, "Unexpectedly strong spurious cointegration"
 
     def test_scipy_norm_cdf_exact(self):
         """scipy.stats.norm.cdf should give exact values, not approximations."""
-        from scipy.stats import norm
-        assert abs(float(norm.cdf(0)) - 0.5) < 1e-15
-        assert abs(float(norm.cdf(1.96)) - 0.975) < 0.001
+        assert abs(float(scipy_stats.norm.cdf(0)) - 0.5) < 1e-15
+        assert abs(float(scipy_stats.norm.cdf(1.96)) - 0.975) < 0.001
 
     def test_scipy_chi2_sf(self):
-        from scipy.stats import chi2
         # chi2(df=1) survival at 3.84 ≈ 0.05
-        sf = float(chi2.sf(3.841, df=1))
+        sf = float(scipy_stats.chi2.sf(3.841, df=1))
         assert abs(sf - 0.05) < 0.005
 
 

@@ -16,9 +16,20 @@
  * falls back to pure-NumPy implementations automatically.
  */
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 #include <stdexcept>
 
@@ -27,6 +38,7 @@ static constexpr double M_PI = 3.14159265358979323846;
 #endif
 
 namespace py = pybind11;
+using pybind11::ssize_t;
 using arr_d = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
 // ---------------------------------------------------------------------------
@@ -44,59 +56,90 @@ py::array_t<double> rolling_corr(arr_d X, int window) {
     const int N = static_cast<int>(buf.shape[1]);
     const double* x = static_cast<double*>(buf.ptr);
 
+    if (T < 2)
+        throw std::invalid_argument("T must be >= 2");
+    if (N < 1)
+        throw std::invalid_argument("N must be >= 1");
     if (window < 2 || window > T)
         throw std::invalid_argument("window must satisfy 2 <= window <= T");
 
     // Output: (T, N, N) — result[t] is the N×N correlation matrix at bar t
-    std::vector<ssize_t> shape = {T, N, N};
+    std::vector<py::ssize_t> shape = {
+        static_cast<py::ssize_t>(T),
+        static_cast<py::ssize_t>(N),
+        static_cast<py::ssize_t>(N)
+    };
     py::array_t<double> result(shape);
     auto rbuf = result.request();
     double* r = static_cast<double*>(rbuf.ptr);
 
-    // Initialise all to identity
-    for (int t = 0; t < T; ++t)
-        for (int i = 0; i < N; ++i)
-            for (int j = 0; j < N; ++j)
-                r[t * N * N + i * N + j] = (i == j) ? 1.0 : 0.0;
+    const size_t NN = static_cast<size_t>(N) * static_cast<size_t>(N);
 
-    // Rolling Pearson correlation using incremental updates
+    // Initialise all to identity
+    for (int t = 0; t < T; ++t) {
+        size_t t_offset = static_cast<size_t>(t) * NN;
+        for (int i = 0; i < N; ++i) {
+            for (int j = 0; j < N; ++j) {
+                r[t_offset + static_cast<size_t>(i) * N + j] = (i == j) ? 1.0 : 0.0;
+            }
+        }
+    }
+
+    std::vector<double> means(N, 0.0);
+    std::vector<double> cov(NN, 0.0);
+    std::vector<double> stds(N, 0.0);
+
+    // Rolling Pearson correlation
     for (int t = window - 1; t < T; ++t) {
+        size_t t_offset = static_cast<size_t>(t) * NN;
+
         // Compute means for columns in window [t-window+1 .. t]
-        std::vector<double> means(N, 0.0);
-        for (int k = t - window + 1; k <= t; ++k)
-            for (int j = 0; j < N; ++j)
-                means[j] += x[k * N + j];
-        for (int j = 0; j < N; ++j) means[j] /= window;
+        std::fill(means.begin(), means.end(), 0.0);
+        for (int k = t - window + 1; k <= t; ++k) {
+            size_t k_offset = static_cast<size_t>(k) * N;
+            for (int j = 0; j < N; ++j) {
+                means[j] += x[k_offset + j];
+            }
+        }
+        for (int j = 0; j < N; ++j) {
+            means[j] /= window;
+        }
 
         // Covariance matrix
-        std::vector<double> cov(N * N, 0.0);
+        std::fill(cov.begin(), cov.end(), 0.0);
         for (int k = t - window + 1; k <= t; ++k) {
+            size_t k_offset = static_cast<size_t>(k) * N;
             for (int i = 0; i < N; ++i) {
-                double di = x[k * N + i] - means[i];
+                double di = x[k_offset + i] - means[i];
                 for (int j = i; j < N; ++j) {
-                    double dj = x[k * N + j] - means[j];
-                    cov[i * N + j] += di * dj;
+                    double dj = x[k_offset + j] - means[j];
+                    cov[static_cast<size_t>(i) * N + j] += di * dj;
                 }
             }
         }
         // Scale and fill lower triangle
-        for (int i = 0; i < N; ++i)
+        double denom_scale = std::max(static_cast<double>(window - 1), 1.0);
+        for (int i = 0; i < N; ++i) {
             for (int j = i; j < N; ++j) {
-                cov[i * N + j] /= (window - 1);
-                cov[j * N + i] = cov[i * N + j];
+                cov[static_cast<size_t>(i) * N + j] /= denom_scale;
+                cov[static_cast<size_t>(j) * N + i] = cov[static_cast<size_t>(i) * N + j];
             }
+        }
 
         // Convert covariance → correlation
-        std::vector<double> stds(N);
-        for (int i = 0; i < N; ++i)
-            stds[i] = std::sqrt(std::max(cov[i * N + i], 1e-12));
+        for (int i = 0; i < N; ++i) {
+            stds[i] = std::sqrt(std::max(cov[static_cast<size_t>(i) * N + i], 1e-12));
+        }
 
         for (int i = 0; i < N; ++i) {
             for (int j = 0; j < N; ++j) {
-                double denom = stds[i] * stds[j];
-                r[t * N * N + i * N + j] = (denom > 1e-14)
-                    ? std::min(std::max(cov[i * N + j] / denom, -1.0), 1.0)
-                    : (i == j ? 1.0 : 0.0);
+                if (i == j) {
+                    r[t_offset + static_cast<size_t>(i) * N + j] = 1.0;
+                } else {
+                    double denom = stds[i] * stds[j];
+                    double val = (denom > 1e-14) ? (cov[static_cast<size_t>(i) * N + j] / denom) : 0.0;
+                    r[t_offset + static_cast<size_t>(i) * N + j] = std::min(std::max(val, -1.0), 1.0);
+                }
             }
         }
     }
@@ -118,15 +161,37 @@ py::array_t<double> rolling_corr(arr_d X, int window) {
 //      log_likelihood: scalar
 // ---------------------------------------------------------------------------
 py::tuple hmm_forward(arr_d obs_in, arr_d pi_in, arr_d A_in,
-                       arr_d means_in, arr_d stds_in) {
+                      arr_d means_in, arr_d stds_in) {
     auto obs_buf  = obs_in.request();
     auto pi_buf   = pi_in.request();
     auto A_buf    = A_in.request();
     auto mu_buf   = means_in.request();
     auto sig_buf  = stds_in.request();
 
+    if (obs_buf.ndim != 1)
+        throw std::invalid_argument("obs must be 1-D (T,)");
+    if (pi_buf.ndim != 1)
+        throw std::invalid_argument("pi must be 1-D (K,)");
+    if (A_buf.ndim != 2)
+        throw std::invalid_argument("A must be 2-D (K, K)");
+    if (mu_buf.ndim != 1)
+        throw std::invalid_argument("means must be 1-D (K,)");
+    if (sig_buf.ndim != 1)
+        throw std::invalid_argument("stds must be 1-D (K,)");
+
     const int T = static_cast<int>(obs_buf.shape[0]);
     const int K = static_cast<int>(pi_buf.shape[0]);
+
+    if (T <= 0)
+        throw std::invalid_argument("obs must not be empty");
+    if (K <= 0)
+        throw std::invalid_argument("pi must not be empty");
+    if (static_cast<int>(A_buf.shape[0]) != K || static_cast<int>(A_buf.shape[1]) != K)
+        throw std::invalid_argument("A must have shape (K, K)");
+    if (static_cast<int>(mu_buf.shape[0]) != K)
+        throw std::invalid_argument("means must have shape (K,)");
+    if (static_cast<int>(sig_buf.shape[0]) != K)
+        throw std::invalid_argument("stds must have shape (K,)");
 
     const double* obs   = static_cast<double*>(obs_buf.ptr);
     const double* pi    = static_cast<double*>(pi_buf.ptr);
@@ -136,11 +201,16 @@ py::tuple hmm_forward(arr_d obs_in, arr_d pi_in, arr_d A_in,
 
     // Gaussian emission probability
     auto emit = [&](int t, int k) -> double {
-        double z = (obs[t] - mu[k]) / std::max(sigma[k], 1e-9);
-        return std::exp(-0.5 * z * z) / (sigma[k] * std::sqrt(2.0 * M_PI));
+        double s = std::max(sigma[k], 1e-9);
+        double z = (obs[t] - mu[k]) / s;
+        return std::exp(-0.5 * z * z) / (s * std::sqrt(2.0 * M_PI));
     };
 
-    py::array_t<double> alpha_arr({T, K});
+    std::vector<py::ssize_t> alpha_shape = {
+        static_cast<py::ssize_t>(T),
+        static_cast<py::ssize_t>(K)
+    };
+    py::array_t<double> alpha_arr(alpha_shape);
     auto alpha_buf = alpha_arr.request();
     double* alpha = static_cast<double*>(alpha_buf.ptr);
 
@@ -194,18 +264,29 @@ py::tuple hmm_forward(arr_d obs_in, arr_d pi_in, arr_d A_in,
 //      total_cost: total transaction cost fraction
 // ---------------------------------------------------------------------------
 py::dict backtest_loop(arr_d prices_in, arr_d signals_in,
-                        double commission, double spread_bps) {
+                       double commission, double spread_bps) {
     auto p_buf = prices_in.request();
     auto s_buf = signals_in.request();
 
+    if (p_buf.ndim != 1 || s_buf.ndim != 1)
+        throw std::invalid_argument("prices and signals must be 1-D arrays");
+    if (p_buf.shape[0] != s_buf.shape[0])
+        throw std::invalid_argument("prices and signals must have the same length");
+
     const int T = static_cast<int>(p_buf.shape[0]);
+    if (T <= 0)
+        throw std::invalid_argument("prices series must not be empty");
+
     const double* prices  = static_cast<double*>(p_buf.ptr);
     const double* signals = static_cast<double*>(s_buf.ptr);
 
     const double half_spread = spread_bps / 1e4;
 
-    py::array_t<double> equity_arr(T);
-    py::array_t<double> returns_arr(T > 1 ? T - 1 : 1);
+    std::vector<py::ssize_t> eq_shape = {static_cast<py::ssize_t>(T)};
+    std::vector<py::ssize_t> ret_shape = {static_cast<py::ssize_t>(T > 1 ? T - 1 : 1)};
+
+    py::array_t<double> equity_arr(eq_shape);
+    py::array_t<double> returns_arr(ret_shape);
 
     double* equity  = static_cast<double*>(equity_arr.request().ptr);
     double* returns = static_cast<double*>(returns_arr.request().ptr);
@@ -220,8 +301,8 @@ py::dict backtest_loop(arr_d prices_in, arr_d signals_in,
         double price_prev = prices[t - 1];
         double price_curr = prices[t];
 
-        // Price return
-        double price_ret = (price_curr - price_prev) / std::max(price_prev, 1e-9);
+        // Price return (use std::abs on denominator to match Python fallback)
+        double price_ret = (price_curr - price_prev) / std::max(std::abs(price_prev), 1e-9);
 
         // Position change: execute at bar t (1-bar delay from signal)
         double target = sig_prev;  // target from prior signal

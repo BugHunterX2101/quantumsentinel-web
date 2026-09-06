@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY requirements.txt ./
 COPY cpp ./cpp
 RUN pip install --no-cache-dir "pybind11>=2.12" setuptools wheel \
-    && pip wheel --no-cache-dir --no-deps --wheel-dir /wheels ./cpp
+    && pip wheel --no-build-isolation --no-cache-dir --no-deps --wheel-dir /wheels ./cpp
 
 FROM python:3.12-slim
 # Security: run as non-root, no new privileges

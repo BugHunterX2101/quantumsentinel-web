@@ -26,12 +26,15 @@ import os
 
 try:
     import pybind11
-    PYBIND_INC = pybind11.get_include()
+    PYBIND_INCS = [pybind11.get_include(), pybind11.get_include(user=True)]
 except ImportError:
     raise RuntimeError(
         "pybind11 is required to build _qs_fast. "
         "Run: pip install pybind11"
     )
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sources = [os.path.join(_HERE, "qs_fast.cpp")]
 
 # C++ standard: C++17 for std::optional etc.
 extra_compile_args = []
@@ -46,15 +49,18 @@ if sys.platform == "win32":
     else:
         # MSVC
         extra_compile_args = ["/O2", "/std:c++17", "/W3", "/EHsc"]
+elif sys.platform == "darwin":
+    # macOS (Clang / Apple Silicon) — Apple Clang does not support -march=native on ARM64
+    extra_compile_args = ["-O3", "-std=c++17", "-ffast-math", "-Wall", "-fvisibility=hidden"]
 else:
-    # Linux / macOS (GCC or Clang)
+    # Linux (GCC or Clang)
     extra_compile_args = ["-O3", "-std=c++17", "-march=native",
                           "-ffast-math", "-Wall", "-fvisibility=hidden"]
 
 ext = Extension(
     name="_qs_fast",
-    sources=["qs_fast.cpp"],
-    include_dirs=[PYBIND_INC],
+    sources=sources,
+    include_dirs=PYBIND_INCS,
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
     language="c++",

@@ -28,3 +28,84 @@ jobs:
         run: python -m pytest -q
       - name: Verify compiled extension imports
         run: python -c "import _qs_fast; print(_qs_fast.__file__)"
+
+  # --------------------------------------------------------------------------
+  # Security scanning stages
+  # --------------------------------------------------------------------------
+  security-bandit:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Bandit
+        run: pip install bandit[toml]
+      - name: Run Bandit (Python SAST)
+        run: bandit -r backend -f json -o bandit-report.json --severity-level medium || true
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  security-pip-audit:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Run pip-audit (dependency CVE scan)
+        run: pip-audit --format json --output pip-audit-report.json || true
+      - name: Upload pip-audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
+
+  security-gitleaks:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks (secret detection)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  security-semgrep:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep (SAST)
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/python
+            p/security-audit
+            p/owasp-top-ten
+
+  security-trivy:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t quantumsentinel:ci .
+      - name: Run Trivy (container scan)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: quantumsentinel:ci
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 0

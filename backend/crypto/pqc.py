@@ -29,6 +29,7 @@ from dilithium_py.ml_dsa import ML_DSA_65
 from ..config import ENVIRONMENT, PQC_PROVIDER, PQC_PROVIDER_URL
 
 HKDF_SALT_CONTEXT = b"QuantumSentinel-v1"
+HANDSHAKE_PROTOCOL_VERSION = "QS-HANDSHAKE-V2"
 
 
 def _assert_pqc_backend():

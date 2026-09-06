@@ -1,7 +1,13 @@
 // QuantumSentinel — frontend application logic (vanilla JS, no build step).
+// Security hardening v2:
+// - JWT moved to HttpOnly cookies; no token stored in localStorage or state.token
+// - CSRF double-submit pattern: X-CSRF-Token header sent on all state-changing requests
+// - Silent refresh: /api/auth/refresh called 60s before access token expires
+// - Full DOM API rewrite: zero innerHTML with unsanitized data
+// - Server DSA fingerprint pinning on handshake
 const state = {
-  token: localStorage.getItem('qs_token') || null,
-  user: JSON.parse(localStorage.getItem('qs_user') || 'null'),
+  csrfToken: null,                  // populated by login/refresh; sent as X-CSRF-Token
+  user: null,
   beginner: localStorage.getItem('qs_beginner') !== 'false',
   meta: null,
   exchanges: {},           // key -> exchange info+status from /api/exchanges
@@ -20,7 +26,9 @@ const state = {
     try { return JSON.parse(localStorage.getItem('qs_signal_cache') || 'null'); } catch { return null; }
   })(),
   _lastEtag: null,         // ETag from last /api/signals/latest response
+  _sessionExpireAt: 0,     // epoch ms when current access token expires
 };
+
 
 // ===========================================================================
 // Loading bar
@@ -67,17 +75,23 @@ function toast(title, body, type = 'info', duration = 3800) {
 
 // ===========================================================================
 // API helper (wired to loading bar + toast on error)
+// Uses credentials:'include' so HttpOnly cookies are sent automatically.
+// Adds X-CSRF-Token header for all state-changing requests.
 // ===========================================================================
 function api(path, opts = {}, opts2 = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
   const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
-  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  // CSRF double-submit: send token for all non-safe methods
+  if (state.csrfToken && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    headers['X-CSRF-Token'] = state.csrfToken;
+  }
   // ETag optimization: send If-None-Match only on GET signal requests (never on POST/refresh)
-  const isGet = !opts.method || opts.method.toUpperCase() === 'GET';
+  const isGet = method === 'GET';
   if (isGet && path === '/api/signals/latest' && state._lastEtag) {
     headers['If-None-Match'] = state._lastEtag;
   }
   loadingBar.start();
-  return fetch(path, Object.assign({}, opts, { headers })).then(async (r) => {
+  return fetch(path, Object.assign({}, opts, { headers, credentials: 'include' })).then(async (r) => {
     // 304 Not Modified — return cached data immediately (zero payload)
     if (r.status === 304 && state._signalCache) {
       loadingBar.done();
@@ -96,36 +110,77 @@ function api(path, opts = {}, opts2 = {}) {
   }).finally(() => loadingBar.done());
 }
 
+
 function handleTokenExpiry() {
   if (state.tokenExpireTimer) { clearTimeout(state.tokenExpireTimer); state.tokenExpireTimer = null; }
   if (state.signalSocket) { state.signalSocket.close(); state.signalSocket = null; }
   setLiveIndicator('disconnected');
-  localStorage.removeItem('qs_token');
-  localStorage.removeItem('qs_user');
-  localStorage.removeItem('qs_login_at');
-  localStorage.removeItem('qs_expires_in');
-  state.token = null;
+  // No localStorage cleanup needed — token is in HttpOnly cookie, cleared by logout endpoint
+  state.csrfToken = null;
   state.user = null;
+  state._sessionExpireAt = 0;
   document.getElementById('app').classList.add('hidden');
   document.getElementById('auth-screen').classList.remove('hidden');
-  toast('Session expired', 'Please log in again.', 'error', 5000);
+  toast('Session expired', 'Please log in again.', 'info');
 }
 
 function scheduleTokenExpiry(expiresInSeconds) {
   if (state.tokenExpireTimer) clearTimeout(state.tokenExpireTimer);
-  // Refresh warning 60 seconds before expiry (or immediately if < 60s left)
-  const warnIn = Math.max(0, (expiresInSeconds - 60) * 1000);
-  state.tokenExpireTimer = setTimeout(() => {
-    toast('Session expiring soon', 'Your session will expire in 60 seconds. Please log out and log back in.', 'info', 8000);
-    // Force logout at actual expiry
-    setTimeout(handleTokenExpiry, 60000);
-  }, warnIn);
+  state._sessionExpireAt = Date.now() + expiresInSeconds * 1000;
+  // Silent refresh 60 seconds before expiry — rotates both cookies server-side
+  const refreshIn = Math.max(0, (expiresInSeconds - 60) * 1000);
+  state.tokenExpireTimer = setTimeout(async () => {
+    try {
+      const refreshData = await fetch('/api/auth/refresh', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+      }).then(r => r.ok ? r.json() : null);
+      if (refreshData && refreshData.csrf_token) {
+        state.csrfToken = refreshData.csrf_token;
+        scheduleTokenExpiry(refreshData.expires_in || 900);
+      } else {
+        handleTokenExpiry();
+      }
+    } catch {
+      handleTokenExpiry();
+    }
+  }, refreshIn);
 }
+
 
 const b64encode = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
 const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (char) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
 }[char]));
+
+/**
+ * safeSetHTML — Full DOM API rewrite helper.
+ * Builds child elements from an array of descriptors; zero innerHTML.
+ * desc: { tag, cls, text, attrs, style, children }[]
+ */
+function makeEl(tag, opts = {}) {
+  const el = document.createElement(tag);
+  if (opts.cls) el.className = opts.cls;
+  if (opts.text !== undefined) el.textContent = String(opts.text);
+  if (opts.html !== undefined) el.textContent = String(opts.html); // alias, always textContent
+  if (opts.style) Object.assign(el.style, opts.style);
+  if (opts.attrs) Object.entries(opts.attrs).forEach(([k, v]) => el.setAttribute(k, v));
+  if (opts.data) Object.entries(opts.data).forEach(([k, v]) => (el.dataset[k] = v));
+  if (opts.children) opts.children.forEach(c => c && el.appendChild(c));
+  return el;
+}
+
+/** Clear a container and append new children. */
+function setChildren(container, children) {
+  if (!container) return;
+  container.replaceChildren(...children.filter(Boolean));
+}
+
+/** Build a status badge span */
+function makeBadge(text, cls) {
+  return makeEl('span', { cls: `badge ${cls || ''}`, text });
+}
+
 
 // ===========================================================================
 // Ripple effect on all buttons
@@ -321,14 +376,10 @@ document.getElementById('register-form').addEventListener('submit', async (e) =>
 
 
 async function afterLogin(data) {
-  state.token = data.access_token;
+  // Item 1: Token is now in HttpOnly cookie — do NOT store in localStorage or state
+  state.csrfToken = data.csrf_token || null;
   state.user = data.user;
-  localStorage.setItem('qs_token', state.token);
-  localStorage.setItem('qs_user', JSON.stringify(state.user));
-  // Store login timestamp and TTL so page-reload can compute actual remaining time
-  localStorage.setItem('qs_login_at', Date.now().toString());
-  localStorage.setItem('qs_expires_in', String(data.expires_in || 900));
-  // Schedule a warning before the JWT expires based on actual TTL from server
+  // Schedule silent refresh based on server-provided TTL
   scheduleTokenExpiry(data.expires_in || 900);
   document.getElementById('auth-screen').classList.add('hidden');
   // Switch 3D background: auth canvas out, app canvas in
@@ -337,8 +388,6 @@ async function afterLogin(data) {
   if (authCanvas) { authCanvas.style.opacity = '0'; setTimeout(() => { authCanvas.style.display = 'none'; }, 600); }
   if (appCanvas)  {
     appCanvas.style.display = '';
-    // Use window.QS3D?.init to gracefully handle the case where bg3d.js hasn't
-    // fully executed yet (e.g. slow network, script load race with defer attribute).
     setTimeout(() => window.QS3D?.init('app-bg-canvas', 'dashboard'), 100);
   }
   await performHandshake({ showOverlay: true });
@@ -347,6 +396,7 @@ async function afterLogin(data) {
   toast('Welcome', `Signed in as ${state.user.email}`, 'success');
   await bootstrapApp();
 }
+
 
 // ===========================================================================
 // PQC hybrid handshake (real server-side ML-KEM-768 + ML-DSA-65 + X25519)
@@ -401,26 +451,55 @@ async function performHandshake({ showOverlay = false } = {}) {
   }
 
   state.handshake = Object.assign({}, result, { usedRealWebCrypto });
+
+  // Item 4: Server DSA fingerprint pinning
+  const receivedFp = result.server_dsa_fingerprint;
+  const pinnedFp = state._pinnedServerFingerprint;
+  if (pinnedFp && receivedFp && pinnedFp !== receivedFp) {
+    toast('⚠️ Server identity changed', 'Server DSA fingerprint mismatch — key rotation occurred. Verify with your administrator.', 'info', 10000);
+  }
+  if (receivedFp) {
+    state._pinnedServerFingerprint = receivedFp;
+    try { sessionStorage.setItem('qs_server_fp', receivedFp); } catch {}
+  }
+
   renderHandshakeTrace();
 }
+
 
 function renderHandshakeTrace() {
   const el = document.getElementById('handshake-trace');
   if (!el || !state.handshake) return;
   const h = state.handshake;
   const rows = [
+    ['Protocol version', String(h.protocol_version || 'QS-HANDSHAKE-V1')],
     ['Classical leg', h.usedRealWebCrypto ? 'Browser Web Crypto X25519 (real ECDH)' : 'X25519 fallback (browser lacks Web Crypto X25519)'],
     ['ML-KEM-768 encapsulation', h.kem_encapsulate_ms + ' ms (server, FIPS 203)'],
-    ['ML-KEM-768 ciphertext size', h.algorithm_sizes.ml_kem_ciphertext_bytes + ' bytes (spec: 1088)'],
-    ['ML-KEM-768 shared secret size', h.algorithm_sizes.ml_kem_shared_secret_bytes + ' bytes (spec: 32)'],
-    ['ML-DSA-65 ServerHello signature', h.algorithm_sizes.ml_dsa_signature_bytes + ' bytes (spec: 3309)'],
-    ['Derived session key', 'HKDF-SHA256 → ' + h.algorithm_sizes.session_key_bytes + ' bytes'],
-    ['Session ID', h.session_id],
+    ['ML-KEM-768 ciphertext size', (h.algorithm_sizes?.ml_kem_ciphertext_bytes ?? '?') + ' bytes (spec: 1088)'],
+    ['ML-KEM-768 shared secret size', (h.algorithm_sizes?.ml_kem_shared_secret_bytes ?? '?') + ' bytes (spec: 32)'],
+    ['ML-DSA-65 ServerHello signature', (h.algorithm_sizes?.ml_dsa_signature_bytes ?? '?') + ' bytes (spec: 3309)'],
+    ['Derived session key', 'HKDF-SHA256 → ' + (h.algorithm_sizes?.session_key_bytes ?? '?') + ' bytes'],
+    ['Session ID', String(h.session_id || '')],
     ['Client ML-KEM keypair', h.simulated_client_kem_keypair ? 'server-generated demo keypair (browser has no ML-KEM)' : 'client-supplied'],
+    ['Server DSA fingerprint', String(h.server_dsa_fingerprint || 'N/A')],
+    ['Transcript hash', String(h.transcript_hash || 'N/A')],
   ];
-  el.innerHTML = rows.map(([label, val], i) =>
-    `<div class="handshake-step" style="animation-delay:${i * 70}ms"><span class="label">${escapeHtml(String(label))}:</span><br><span class="val">${escapeHtml(String(val))}</span></div>`
-  ).join('');
+  // Full DOM API — zero innerHTML
+  el.replaceChildren();
+  rows.forEach(([label, val], i) => {
+    const div = document.createElement('div');
+    div.className = 'handshake-step';
+    div.style.animationDelay = (i * 70) + 'ms';
+    const labelSpan = document.createElement('span');
+    labelSpan.className = 'label';
+    labelSpan.textContent = label + ':';
+    const br = document.createElement('br');
+    const valSpan = document.createElement('span');
+    valSpan.className = 'val';
+    valSpan.textContent = val;
+    div.append(labelSpan, br, valSpan);
+    el.appendChild(div);
+  });
 }
 
 // ===========================================================================
@@ -540,6 +619,8 @@ function restartPolling() {
 
 function applyBeginnerMode() {
   document.querySelectorAll('[data-beginner]').forEach((el) => el.classList.toggle('hidden', !state.beginner));
+  localStorage.setItem('qs_beginner', state.beginner);
+  api('/api/user/settings', { method: 'PATCH', body: JSON.stringify({ beginner_mode: state.beginner }) }, { silent: true });
   document.getElementById('beginner-state').textContent = state.beginner ? 'On' : 'Off';
 }
 
@@ -550,16 +631,22 @@ document.getElementById('beginner-toggle').addEventListener('click', () => {
   switchView(document.querySelector('.tab-btn.active').dataset.view);
 });
 
-document.getElementById('logout-btn').addEventListener('click', () => {
+document.getElementById('logout-btn').addEventListener('click', async () => {
   if (state.signalSocket) state.signalSocket.close();
   if (state.tokenExpireTimer) clearTimeout(state.tokenExpireTimer);
   setLiveIndicator('disconnected');
-  localStorage.removeItem('qs_token');
-  localStorage.removeItem('qs_user');
-  localStorage.removeItem('qs_login_at');
-  localStorage.removeItem('qs_expires_in');
+  // Server-side logout: revoke refresh token + clear HttpOnly cookies
+  await fetch('/api/auth/logout', {
+    method: 'POST', credentials: 'include',
+    headers: { 'Content-Type': 'application/json',
+               ...(state.csrfToken ? { 'X-CSRF-Token': state.csrfToken } : {}) },
+  }).catch(() => {});
+  state.csrfToken = null;
+  state.user = null;
+  state._sessionExpireAt = 0;
   location.reload();
 });
+
 
 // -- 20 preloaded assets — always available without a search -------------------
 // Any OTHER ticker (e.g. RELIANCE.NS, BTC-USD, SAP.DE) can be searched in
@@ -1489,18 +1576,22 @@ function _renderSignalGrid(grid, signals, fromCache) {
   const sigList = signals.signals || [];
 
   if (!sigList.length && !fromCache) {
-    // Show empty watchlist state with CTA
-    grid.innerHTML = `<div class="watchlist-empty">
-      <h3>Your watchlist is empty</h3>
-      <p>Add assets to your watchlist to see live signals. Start with our curated blue-chip selection.</p>
-      <button class="btn-primary ripple-btn" onclick="openWatchlistModal()" style="display:inline-block;width:auto;padding:10px 24px;">&#9733; Manage Watchlist</button>
-    </div>`;
+    // DOM API — empty state
+    const emptyDiv = makeEl('div', { cls: 'watchlist-empty' });
+    emptyDiv.appendChild(makeEl('h3', { text: 'Your watchlist is empty' }));
+    emptyDiv.appendChild(makeEl('p', { text: 'Add assets to your watchlist to see live signals. Start with our curated blue-chip selection.' }));
+    const btn = makeEl('button', { cls: 'btn-primary ripple-btn', text: '\u2605 Manage Watchlist' });
+    btn.style.cssText = 'display:inline-block;width:auto;padding:10px 24px;';
+    btn.addEventListener('click', () => openWatchlistModal());
+    emptyDiv.appendChild(btn);
+    setChildren(grid, [emptyDiv]);
     return;
   }
 
-  grid.innerHTML = sigList.map((s, i) => {
-    const asset     = escapeHtml(String(s.asset));
-    const sigType   = escapeHtml(String(s.signal_type));
+  // DOM API rewrite — zero innerHTML for signal cards
+  const cards = sigList.map((s, i) => {
+    const asset     = String(s.asset);
+    const sigType   = String(s.signal_type);
     const rsi       = s.features?.rsi != null ? Number(s.features.rsi).toFixed(1) : 'N/A';
     const mom       = s.features?.momentum != null ? (Number(s.features.momentum) * 100).toFixed(1) : 'N/A';
     const macd      = s.features?.macd_histogram != null ? Number(s.features.macd_histogram).toFixed(3) : 'N/A';
@@ -1510,33 +1601,57 @@ function _renderSignalGrid(grid, signals, fromCache) {
     const price     = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawP < 1 ? 6 : 2 });
     const exchCodes = { US:'[US]',NSE:'[NSE]',LSE:'[LSE]',XETRA:'[XETRA]',TSE:'[TSE]',HKEX:'[HKEX]',ASX:'[ASX]',TSX:'[TSX]',CRYPTO:'[CRYPTO]' };
     const flag      = exchCodes[s.exchange || 'US'] || '[INTL]';
-    const companyName = escapeHtml(s.company_name || String(s.asset));
-    const sector    = escapeHtml(s.sector || '');
-    const insight   = escapeHtml(s.insight || '');
-    return `
-    <div class="signal-card sig-${sigType}" id="signal-${asset}" style="animation-delay:${i * 40}ms">
-      <div class="sig-header">
-        <div>
-          <div class="sig-company-name">${companyName}</div>
-          <div class="asset">${asset} <span class="sig-exch-code">${flag}</span>${sector ? ` <span class="sig-sector-pill">${sector}</span>` : ''}</div>
-          <div class="price">${price}</div>
-        </div>
-        <div style="display:flex;align-items:flex-start;gap:8px">
-          <span class="badge ${sigType}">${sigType}</span>
-          <button class="bookmark-btn bookmarked" data-ticker="${asset}" title="Remove ${asset} from watchlist">&#9733;</button>
-        </div>
-      </div>
-      <div class="confidence-bar"><div class="confidence-fill" data-target="${confPct}"></div></div>
-      <div class="confidence-label"><span>Confidence</span><span><b>${confPct}%</b></span></div>
-      ${insight ? `<div class="sig-insight">Insight: ${insight}</div>` : ''}
-      <div class="features-row">
-        <span title="Relative Strength Index">RSI <b>${rsi}</b></span>
-        <span title="20-day Momentum">Mom <b>${mom}%</b></span>
-        <span title="MACD Histogram">MACD <b>${macd}</b></span>
-        <span title="Bollinger Width">BBW <b>${bbw}</b></span>
-      </div>
-    </div>`;
-  }).join('') || '<div class="empty-state">Signals loading — engine is warming up for your watchlist&hellip;</div>';
+
+    const card = makeEl('div', { cls: `signal-card sig-${sigType}`, attrs: { id: `signal-${asset}` }, style: { animationDelay: (i * 40) + 'ms' } });
+
+    // Header
+    const headerLeft = makeEl('div');
+    headerLeft.appendChild(makeEl('div', { cls: 'sig-company-name', text: s.company_name || asset }));
+    const assetLine = makeEl('div', { cls: 'asset' });
+    assetLine.appendChild(document.createTextNode(asset + ' '));
+    assetLine.appendChild(makeEl('span', { cls: 'sig-exch-code', text: flag }));
+    if (s.sector) { assetLine.appendChild(document.createTextNode(' ')); assetLine.appendChild(makeEl('span', { cls: 'sig-sector-pill', text: String(s.sector) })); }
+    headerLeft.appendChild(assetLine);
+    headerLeft.appendChild(makeEl('div', { cls: 'price', text: price }));
+
+    const headerRight = makeEl('div', { style: { display: 'flex', alignItems: 'flex-start', gap: '8px' } });
+    headerRight.appendChild(makeEl('span', { cls: `badge ${sigType}`, text: sigType }));
+    const bookmarkBtn = makeEl('button', { cls: 'bookmark-btn bookmarked', text: '\u2605', data: { ticker: asset }, attrs: { title: `Remove ${asset} from watchlist` } });
+    headerRight.appendChild(bookmarkBtn);
+
+    const header = makeEl('div', { cls: 'sig-header', children: [headerLeft, headerRight] });
+    card.appendChild(header);
+
+    // Confidence bar
+    const confFill = makeEl('div', { cls: 'confidence-fill', data: { target: String(confPct) } });
+    card.appendChild(makeEl('div', { cls: 'confidence-bar', children: [confFill] }));
+    const confLabel = makeEl('div', { cls: 'confidence-label', children: [
+      makeEl('span', { text: 'Confidence' }),
+      makeEl('span', { children: [makeEl('b', { text: confPct + '%' })] }),
+    ]});
+    card.appendChild(confLabel);
+
+    // Insight
+    if (s.insight) card.appendChild(makeEl('div', { cls: 'sig-insight', text: 'Insight: ' + String(s.insight) }));
+
+    // Features row
+    const featRow = makeEl('div', { cls: 'features-row', children: [
+      makeEl('span', { attrs: { title: 'Relative Strength Index' }, children: [document.createTextNode('RSI '), makeEl('b', { text: rsi })] }),
+      makeEl('span', { attrs: { title: '20-day Momentum' }, children: [document.createTextNode('Mom '), makeEl('b', { text: mom + '%' })] }),
+      makeEl('span', { attrs: { title: 'MACD Histogram' }, children: [document.createTextNode('MACD '), makeEl('b', { text: macd })] }),
+      makeEl('span', { attrs: { title: 'Bollinger Width' }, children: [document.createTextNode('BBW '), makeEl('b', { text: bbw })] }),
+    ]});
+    card.appendChild(featRow);
+
+    return card;
+  });
+
+  if (!cards.length) {
+    setChildren(grid, [makeEl('div', { cls: 'empty-state', text: 'Signals loading \u2014 engine is warming up for your watchlist\u2026' })]);
+  } else {
+    setChildren(grid, cards);
+  }
+
 
   // Animate confidence bars
   requestAnimationFrame(() => {
@@ -1618,11 +1733,17 @@ async function updateOrderPricePreview() {
     const price = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD',
                     maximumFractionDigits: rawP < 1 ? 6 : 2 });
     const chg   = data.change_pct != null ? Number(data.change_pct) : null;
-    const chgHtml = chg != null && isFinite(chg)
-      ? ` <span class="sig-change ${chg >= 0 ? 'positive' : 'negative'}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>`
-      : '';
     const age   = Math.round(Date.now() / 1000 - (data.fetched_at || 0));
-    valEl.innerHTML = price + chgHtml;
+    // DOM API rewrite — zero innerHTML for price display
+    valEl.replaceChildren();
+    valEl.appendChild(document.createTextNode(price));
+    if (chg != null && isFinite(chg)) {
+      const chgSpan = makeEl('span', {
+        cls: `sig-change ${chg >= 0 ? 'positive' : 'negative'}`,
+        text: ` ${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%`,
+      });
+      valEl.appendChild(chgSpan);
+    }
     labelEl.textContent = `Live price (${curr})${age < 10 ? '' : ' · ' + age + 's ago'}`;
     preview.classList.remove('hidden');
     if (!state.lastSignalPrices) state.lastSignalPrices = {};
@@ -1983,34 +2104,48 @@ async function loadSecurity(isPoll) {
   const badge = document.getElementById('security-badge');
   if (badge) badge.textContent = agingKeys.length > 0 ? String(agingKeys.length) : '';
 
-  keyEl.innerHTML = health.keys.map((k, i) => {
-    const status = escapeHtml(String(k.status));
-    const algo   = escapeHtml(String(k.algorithm));
-    const urgent = k.rotation_due_in_days < 15 ? ` <span style="color:var(--amber);font-size:10px;font-weight:700">[ROTATE SOON]</span>` : '';
-    return `
-    <div class="key-row" style="animation-delay:${i * 60}ms">
-      <span><span class="dot dot-${status}"></span>${algo} &middot; rotation #${Number(k.rotation_count)}${urgent}</span>
-      <span>${Number(k.age_days)}d old &middot; due in ${Number(k.rotation_due_in_days)}d</span>
-    </div>`;
-  }).join('') || '<div class="empty-state">No keys issued yet.</div>';
+  // DOM API rewrite — zero innerHTML for key health
+  if (!health.keys.length) {
+    setChildren(keyEl, [makeEl('div', { cls: 'empty-state', text: 'No keys issued yet.' })]);
+  } else {
+    setChildren(keyEl, health.keys.map((k, i) => {
+      const urgentChildren = [];
+      if (k.rotation_due_in_days < 15) {
+        urgentChildren.push(makeEl('span', { text: ' [ROTATE SOON]', style: { color: 'var(--amber)', fontSize: '10px', fontWeight: '700' } }));
+      }
+      const left = makeEl('span', { children: [
+        makeEl('span', { cls: `dot dot-${String(k.status)}` }),
+        document.createTextNode(` ${String(k.algorithm)} \u00b7 rotation #${Number(k.rotation_count)}`),
+        ...urgentChildren,
+      ]});
+      const right = makeEl('span', { text: `${Number(k.age_days)}d old \u00b7 due in ${Number(k.rotation_due_in_days)}d` });
+      return makeEl('div', { cls: 'key-row', style: { animationDelay: (i * 60) + 'ms' }, children: [left, right] });
+    }));
+  }
 
   renderHandshakeTrace();
 
+  // DOM API rewrite — zero innerHTML for audit log
   const logs = await api('/api/security/audit-log', {}, { silent: isPoll });
-  document.getElementById('audit-log').innerHTML = logs.map((l, i) => {
-    const action   = escapeHtml(String(l.action));
-    const resType  = l.resource_type ? ' &middot; ' + escapeHtml(String(l.resource_type)) : '';
-    const verified = l.verified
-      ? `<span class="verified-badge">✓ ML-DSA</span>`
-      : `<span style="color:var(--text-muted);font-size:10px">&mdash;</span>`;
+  const auditEl = document.getElementById('audit-log');
+  setChildren(auditEl, logs.map((l, i) => {
     const ts = l.created_at ? new Date(l.created_at).toLocaleString() : '';
-    return `
-    <div class="audit-row" style="animation-delay:${i * 30}ms">
-      <div class="audit-meta"><span>${escapeHtml(String(l.user_email || ''))}</span><span>${ts}</span></div>
-      <div class="audit-action">${action}${resType}</div>
-      ${l.signature_preview ? `<div class="audit-sig">${verified} ${escapeHtml(String(l.signature_preview).slice(0,80))}…</div>` : ''}
-    </div>`;
-  }).join('') || '';
+    const metaRow = makeEl('div', { cls: 'audit-meta', children: [
+      makeEl('span', { text: String(l.user_email || '') }),
+      makeEl('span', { text: ts }),
+    ]});
+    const actionText = String(l.action) + (l.resource_type ? ' \u00b7 ' + String(l.resource_type) : '');
+    const actionRow = makeEl('div', { cls: 'audit-action', text: actionText });
+    const children = [metaRow, actionRow];
+    if (l.signature_preview) {
+      const badge = l.verified
+        ? makeEl('span', { cls: 'verified-badge', text: '\u2713 ML-DSA' })
+        : makeEl('span', { text: '\u2014', style: { color: 'var(--text-muted)', fontSize: '10px' } });
+      const sigText = document.createTextNode(' ' + String(l.signature_preview).slice(0, 80) + '\u2026');
+      children.push(makeEl('div', { cls: 'audit-sig', children: [badge, sigText] }));
+    }
+    return makeEl('div', { cls: 'audit-row', style: { animationDelay: (i * 30) + 'ms' }, children });
+  }));
 }
 
 async function rotateKeys(algorithm, btn) {

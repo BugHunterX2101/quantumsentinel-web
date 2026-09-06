@@ -29,11 +29,28 @@ else:
         serialization.PublicFormat.SubjectPublicKeyInfo)
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "900"))
 REFRESH_SESSION_SECONDS = int(os.getenv("REFRESH_SESSION_SECONDS", "3600"))
+
+# --- Refresh-token rotation ---------------------------------------------------
+REFRESH_TOKEN_SECRET = _setting("REFRESH_TOKEN_SECRET") or secrets.token_hex(32)
+REFRESH_TOKEN_SECONDS = int(os.getenv("REFRESH_TOKEN_SECONDS", "86400"))
+
+# --- HttpOnly cookie settings -------------------------------------------------
+COOKIE_DOMAIN = _setting("COOKIE_DOMAIN")          # None = browser infers from origin
+COOKIE_SECURE = ENVIRONMENT == "production"         # always True in prod
+COOKIE_SAMESITE = _setting("COOKIE_SAMESITE", "strict")
+
+# --- CSRF double-submit -------------------------------------------------------
+CSRF_SECRET = _setting("CSRF_SECRET") or secrets.token_hex(32)
+
 WEBHOOK_ENCRYPTION_KEY = _setting("WEBHOOK_ENCRYPTION_KEY")
 PRIVATE_KEY_ENCRYPTION_KEY = _setting("PRIVATE_KEY_ENCRYPTION_KEY")
 SERVER_DSA_PRIVATE_KEY = _setting("SERVER_DSA_PRIVATE_KEY")
 SERVER_DSA_PUBLIC_KEY = _setting("SERVER_DSA_PUBLIC_KEY")
 SERVER_DSA_CREATED_AT = _setting("SERVER_DSA_CREATED_AT")
+
+# --- Server identity pinning (Item 4) ----------------------------------------
+TRUSTED_SERVER_DSA_FINGERPRINT = _setting("TRUSTED_SERVER_DSA_FINGERPRINT")
+
 DATABASE_URL = _setting("DATABASE_URL", "sqlite:///./quantumsentinel.db")
 REDIS_URL = _setting("REDIS_URL")
 PQC_PROVIDER = _setting("PQC_PROVIDER", "reference")
@@ -65,3 +82,7 @@ if ENVIRONMENT == "production":
         raise RuntimeError("REDIS_URL is required in production")
     if PQC_PROVIDER == "reference" or not PQC_PROVIDER_URL:
         raise RuntimeError("Production requires a configured external liboqs/HSM PQC provider")
+    if not _setting("REFRESH_TOKEN_SECRET"):
+        raise RuntimeError("REFRESH_TOKEN_SECRET is required in production")
+    if not _setting("CSRF_SECRET"):
+        raise RuntimeError("CSRF_SECRET is required in production")

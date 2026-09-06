@@ -31,9 +31,14 @@ Two things that rarely appear together — in one open-source codebase:
 
 **Post-Quantum Cryptography (research / integration-ready)**
 - Every session begins with a **hybrid X25519 + ML-KEM-768** key exchange — combining classical and post-quantum cryptography per FIPS 203
+- **Handshake V2**: full-transcript ML-DSA-65 signing, atomic nonce replay protection (Redis `SET NX`), server identity fingerprint pinning
+- **HttpOnly cookie auth**: access + refresh tokens in `Secure; SameSite=Strict` cookies — never exposed to JavaScript. Refresh-token rotation with family-based reuse detection
+- **CSRF double-submit** pattern for all state-changing requests; **HMAC-SHA256 request signing** for SDK/API clients
 - Production orders use a canonical `QS-ORDER-V1` payload, client ML-DSA-65 signature, bounded expiry, nonce, and idempotency key
-- Audit records are server-signed and protected by a SHA-256 hash chain with ML-DSA checkpoints
+- Audit records are server-signed with ML-DSA and protected by a SHA-256 hash chain with `signing_key_id` for historical verification across key rotations
+- **Kill switches** (global/user/asset-level) stored in Redis for multi-worker consistency
 - Passwords use Argon2id; locally stored private-key and webhook material uses Fernet authenticated encryption
+
 
 **Quantitative Research Engine**
 - Backtested systematic strategies **under realistic transaction-cost and execution assumptions** — not toy MA crossovers with perfect fills
@@ -53,8 +58,8 @@ flowchart TB
     end
 
     subgraph Gateway["FastAPI Gateway"]
-        MW["Security Middleware\nCORS · Rate Limiter · CSP · Security Headers"]
-        AUTH_MW["JWT Bearer Auth\nDepends(get_current_user)"]
+        MW["Security Middleware\nCORS · Rate Limiter · CSP · CSRF"]
+        AUTH_MW["HttpOnly Cookie Auth\nRefresh-token rotation · CSRF double-submit"]
         WS["WebSocket Stream\n/api/signals/stream"]
         SPA["SPA Catch-all\n/{path:path} → index.html"]
     end
@@ -69,12 +74,12 @@ flowchart TB
     end
 
     subgraph CoreSvcs["Core Services"]
-        AUTH["auth_service\nJWT · Argon2id · PQC Handshake\nNonce TTL · Session store"]
+        AUTH["auth_service\nHttpOnly cookie auth · Argon2id\nPQC Handshake V2 · Refresh rotation\nCSRF · Atomic nonce replay"]
         SIG["signal_engine\nSBA · RSI-14 · MACD 12/26/9\nLive price · 20s/15s cache"]
         TRADE["trading_service\nOrder lifecycle · Alpaca Paper API\nMarket simulator · Fill logic"]
         PORT["portfolio_service\nPositions · Equity curve\nSharpe · VaR · Drawdown"]
-        SEC["security_service\nServer ML-DSA identity\nAudit log · 90-day rotation"]
-        INTG["integration_service\nScoped API keys\nHMAC-signed webhooks"]
+        SEC["security_service\nServer ML-DSA identity\nAudit chain · Key history\n90-day rotation · Kill switches"]
+        INTG["integration_service\nScoped API keys\nHMAC-SHA256 request signing\nFernet-encrypted secrets"]
     end
 
     subgraph Research["Quant Research Engine"]
@@ -93,8 +98,8 @@ flowchart TB
     end
 
     subgraph Persistence["Persistence"]
-        DB[("SQLite / PostgreSQL\nSQLAlchemy 2.0")]
-        REDIS[("Redis\nRate limiting · Sessions\nIn-memory fallback in dev")]
+        DB[("SQLite / PostgreSQL\nSQLAlchemy 2.0\nRefresh tokens · Key history")]
+        REDIS[("Redis\nRate limiting · Nonce replay\nKill switches · Refresh cache")]
     end
 
     subgraph External["External APIs"]
@@ -102,7 +107,7 @@ flowchart TB
         ALPACA["Alpaca Paper API\npaper-api.alpaca.markets"]
     end
 
-    Client <-->|"HTTPS / WSS · Bearer JWT"| Gateway
+    Client <-->|"HTTPS / WSS · HttpOnly cookies"| Gateway
     Gateway --> AUTH_MW --> CoreSvcs
     Gateway --> AUTH_MW --> Research
     Gateway --> WS --> SIG

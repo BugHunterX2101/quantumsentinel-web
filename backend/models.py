@@ -4,7 +4,7 @@ import datetime as dt
 
 from sqlalchemy import (
     Column, String, Boolean, DateTime, Numeric, Integer, ForeignKey, Text, JSON,
-    UniqueConstraint,
+    UniqueConstraint, Sequence,
 )
 from sqlalchemy.orm import relationship
 
@@ -89,6 +89,7 @@ class ApiKey(Base):
     name = Column(String(80), nullable=False)
     key_prefix = Column(String(16), nullable=False)
     key_hash = Column(String(128), nullable=False, unique=True, index=True)
+    hmac_secret_encrypted = Column(Text, nullable=True)  # Fernet-encrypted HMAC secret for signed requests
     scopes = Column(JSON, default=list)
     last_used_at = Column(DateTime(timezone=True), nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)
@@ -163,6 +164,7 @@ class AuditLog(Base):
     resource_id = Column(String, nullable=True)
     metadata_json = Column(JSON, default=dict)
     pqc_signature = Column(Text, nullable=True)
+    signing_key_id = Column(String, nullable=True)  # FK to server_signing_keys for historical verification
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
@@ -207,4 +209,38 @@ class AuditChainLink(Base):
     previous_hash = Column(String(64), nullable=False)
     entry_hash = Column(String(64), nullable=False, unique=True)
     checkpoint_signature = Column(Text, nullable=False)
+    signing_key_id = Column(String, nullable=True)  # FK to server_signing_keys for historical verification
     created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+# --- Refresh Token (Item 1: cookie-based auth with rotation) ------------------
+
+class RefreshToken(Base):
+    """Refresh tokens for cookie-based session management with family rotation."""
+    __tablename__ = "refresh_tokens"
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_refresh_token_hash"),)
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, index=True)  # SHA-256 of the opaque token
+    family_id = Column(String, nullable=False, index=True)       # rotation chain family
+    is_used = Column(Boolean, default=False)                     # set True on rotation
+    is_revoked = Column(Boolean, default=False)                  # set True on reuse-detection
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+
+# --- Server Signing Key History (Item 8: audit key rotation) ------------------
+
+class ServerSigningKey(Base):
+    """Historical record of server ML-DSA signing keys for audit verification."""
+    __tablename__ = "server_signing_keys"
+
+    key_id = Column(String, primary_key=True, default=gen_uuid)
+    algorithm = Column(String(32), nullable=False, default="ML-DSA-65")
+    public_key = Column(Text, nullable=False)      # base64 public key
+    fingerprint = Column(String(64), nullable=False, unique=True)  # SHA-256 of public key bytes
+    status = Column(String(16), nullable=False, default="active")  # active | retired | revoked
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    activated_at = Column(DateTime(timezone=True), default=utcnow)
+    retired_at = Column(DateTime(timezone=True), nullable=True)

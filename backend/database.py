@@ -69,3 +69,20 @@ def init_db():
         if "user_timezone" not in user_cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE users ADD COLUMN user_timezone VARCHAR(64)"))
+        # Security hardening v2 migrations
+        _tables = inspect(engine).get_table_names()
+        if "audit_logs" in _tables:
+            audit_cols = {c["name"] for c in inspect(engine).get_columns("audit_logs")}
+            if "signing_key_id" not in audit_cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE audit_logs ADD COLUMN signing_key_id VARCHAR"))
+        if "audit_chain_links" in _tables:
+            chain_cols = {c["name"] for c in inspect(engine).get_columns("audit_chain_links")}
+            if "signing_key_id" not in chain_cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE audit_chain_links ADD COLUMN signing_key_id VARCHAR"))
+        if "api_keys" in _tables:
+            api_cols = {c["name"] for c in inspect(engine).get_columns("api_keys")}
+            if "hmac_secret_encrypted" not in api_cols:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE api_keys ADD COLUMN hmac_secret_encrypted TEXT"))

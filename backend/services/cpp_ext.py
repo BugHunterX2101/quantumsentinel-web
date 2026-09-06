@@ -170,7 +170,7 @@ def rolling_corr(X: np.ndarray, window: int) -> np.ndarray:
     Parameters
     ----------
     X      : (T, N) float64 return matrix
-    window : int lookback window (>= 2)
+    window : int lookback window (>= 2, must be <= T)
 
     Returns
     -------
@@ -180,9 +180,18 @@ def rolling_corr(X: np.ndarray, window: int) -> np.ndarray:
     X = np.asarray(X, dtype=np.float64)
     if X.ndim != 2:
         raise ValueError("X must be 2-D (T, N)")
+    T = X.shape[0]
+    if window < 2:
+        raise ValueError(f"window must be >= 2, got {window}")
+    if window > T:
+        raise ValueError(
+            f"window ({window}) exceeds number of observations T={T}. "
+            "Reduce window or provide a longer series."
+        )
     if CPP_AVAILABLE:
         return _cpp_rolling_corr(X, window)
     return _py_rolling_corr(X, window)
+
 
 
 def hmm_forward(obs: np.ndarray, pi: np.ndarray, A: np.ndarray,

@@ -1,7 +1,13 @@
-"""Scoped SDK API keys and signed webhook delivery for the reference API."""
+"""Scoped SDK API keys with HMAC-signed requests and signed webhook delivery.
+
+Item 7 enhancements:
+- API keys now generate an HMAC secret for request signing
+- verify_hmac_request() validates X-QS-SIGNATURE headers
+- Signature = HMAC-SHA256(secret, method || path || timestamp || nonce || SHA256(body))
+"""
 import datetime as dt
 import hashlib
-import hmac
+import hmac as hmac_mod
 import ipaddress
 import json
 import secrets
@@ -18,9 +24,23 @@ from ..config import WEBHOOK_ENCRYPTION_KEY
 _FERNET = Fernet(WEBHOOK_ENCRYPTION_KEY.encode() if WEBHOOK_ENCRYPTION_KEY else Fernet.generate_key())
 
 
-def generate_api_key() -> tuple[str, str, str]:
+def generate_api_key() -> tuple[str, str, str, str]:
+    """Generate an API key with HMAC secret.
+    Returns (raw_key, prefix, key_hash, hmac_secret).
+    """
     raw = "qs_" + secrets.token_urlsafe(32)
-    return raw, raw[:11], hashlib.sha256(raw.encode()).hexdigest()
+    hmac_secret = secrets.token_urlsafe(32)
+    return raw, raw[:11], hashlib.sha256(raw.encode()).hexdigest(), hmac_secret
+
+
+def encrypt_hmac_secret(value: str) -> str:
+    """Encrypt HMAC secret for storage."""
+    return _FERNET.encrypt(value.encode()).decode()
+
+
+def decrypt_hmac_secret(value: str) -> str:
+    """Decrypt HMAC secret from storage."""
+    return _FERNET.decrypt(value.encode()).decode()
 
 
 def encrypt_secret(value: str) -> str:
@@ -38,6 +58,61 @@ def verify_api_key(db: Session, raw_key: str, scope: str) -> models.ApiKey | Non
         expires_aware = key.expires_at if key.expires_at.tzinfo else key.expires_at.replace(tzinfo=dt.timezone.utc)
         if expires_aware < dt.datetime.now(dt.timezone.utc):
             return None
+    key.last_used_at = dt.datetime.now(dt.timezone.utc)
+    db.commit()
+    return key
+
+
+def verify_hmac_request(db: Session, key_id: str, timestamp: str, nonce: str,
+                         signature: str, method: str, path: str, body: bytes,
+                         scope: str) -> models.ApiKey | None:
+    """Verify an HMAC-signed API request (Item 7).
+
+    Validates:
+    - Key exists and is active
+    - Scope is sufficient
+    - Timestamp is within ±30 second window
+    - Signature = HMAC-SHA256(secret, method || path || timestamp || nonce || SHA256(body))
+
+    Nonce dedup is handled by the caller via Redis.
+    """
+    # Find key by ID (not hash — HMAC requests use key_id header)
+    key = db.query(models.ApiKey).filter(
+        models.ApiKey.id == key_id,
+        models.ApiKey.is_revoked.is_(False),
+    ).first()
+    if not key or (scope not in (key.scopes or []) and "admin" not in (key.scopes or [])):
+        return None
+
+    if key.expires_at:
+        expires_aware = key.expires_at if key.expires_at.tzinfo else key.expires_at.replace(tzinfo=dt.timezone.utc)
+        if expires_aware < dt.datetime.now(dt.timezone.utc):
+            return None
+
+    # Check timestamp window (±30 seconds)
+    try:
+        ts = int(timestamp)
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        if abs(now - ts) > 30:
+            return None
+    except (ValueError, TypeError):
+        return None
+
+    # Verify signature
+    if not key.hmac_secret_encrypted:
+        return None
+    try:
+        hmac_secret = decrypt_hmac_secret(key.hmac_secret_encrypted)
+    except Exception:
+        return None
+
+    body_hash = hashlib.sha256(body).hexdigest()
+    message = f"{method.upper()}||{path}||{timestamp}||{nonce}||{body_hash}"
+    expected_sig = hmac_mod.new(hmac_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac_mod.compare_digest(signature, expected_sig):
+        return None
+
     key.last_used_at = dt.datetime.now(dt.timezone.utc)
     db.commit()
     return key
@@ -65,7 +140,7 @@ def emit_webhooks(db: Session, user_id: str, event_type: str, payload: dict) -> 
             if event_type not in (hook.event_types or []) or not _is_public_https(hook.url):
                 continue
             secret = _FERNET.decrypt(hook.secret_hash.encode())
-            signature = hmac.new(secret, envelope.encode(), hashlib.sha256).hexdigest()
+            signature = hmac_mod.new(secret, envelope.encode(), hashlib.sha256).hexdigest()
             requests.post(hook.url, data=envelope, timeout=3, allow_redirects=False,
                           headers={"Content-Type": "application/json", "X-QS-Event": event_type,
                                    "X-QS-Signature": f"sha256={signature}"}).raise_for_status()

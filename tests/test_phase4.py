@@ -301,7 +301,7 @@ class TestScipyStatTests:
     def test_adf_nonstationary(self, nonstationary_series):
         """Random walk should NOT reject unit root (p > 0.05)."""
         from statsmodels.tsa.stattools import adfuller
-        result = adfuller(nonstationary_series, autolag="AIC")
+        result = adfuller(nonstationary_series, autolag="AIC", result_object=False)
         p_value = float(result[1])
         # High p-value expected — don't reject H0 of unit root
         assert p_value > 0.01, f"Random walk p-value too low: {p_value}"
@@ -309,7 +309,7 @@ class TestScipyStatTests:
     def test_adf_stationary(self, stationary_series):
         """IID noise should REJECT unit root (p < 0.05)."""
         from statsmodels.tsa.stattools import adfuller
-        result = adfuller(stationary_series, autolag="AIC")
+        result = adfuller(stationary_series, autolag="AIC", result_object=False)
         p_value = float(result[1])
         assert p_value < 0.05, f"Stationary series p-value too high: {p_value}"
 

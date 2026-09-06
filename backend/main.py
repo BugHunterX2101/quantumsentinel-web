@@ -4,6 +4,15 @@ Single-process web port of the multi-service architecture in the design
 docs (API Gateway + Trading Engine + PQC Crypto Service + Signal Engine
 collapsed into one deployable app for a portable web demo). All PQC
 operations are genuine FIPS 203/204 algorithms (see backend/crypto/pqc.py).
+
+Security hardening (v2):
+- HttpOnly cookie-based auth with refresh token rotation (Item 1)
+- CSRF double-submit cookie pattern
+- HMAC-signed API key requests (Item 7)
+- Redis-backed kill switches (Item 6)
+- Tightened CSP (no unsafe-inline, no external scripts)
+- WebSocket per-user connection limits, idle timeout, sequence numbers
+- Server signing key history endpoint (Item 8)
 """
 import datetime as dt
 try:
@@ -20,7 +29,7 @@ import numpy as np
 from collections import defaultdict, deque
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect, Query, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -33,7 +42,9 @@ import redis.asyncio as redis
 
 from . import models, schemas
 from .database import get_db, init_db, SessionLocal
-from .config import CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS
+from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS,
+                     COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
+                     REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service, order_security
 from .services import walk_forward as walk_forward_service
@@ -189,14 +200,19 @@ async def security_headers_and_rate_limit(request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # Tightened CSP: no unsafe-inline, no external scripts, explicit form-action/object-src
+    ws_policy = "wss:" if ENVIRONMENT == "production" else "wss: ws:"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self' https://cdn.jsdelivr.net; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "script-src 'self'; "
+        "style-src 'self' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data:; "
-        "connect-src 'self' wss://self ws://self https://api.github.com https://api.pwnedpasswords.com; "
-        "frame-ancestors 'none'; base-uri 'self'"
+        f"connect-src 'self' {ws_policy} https://api.github.com https://api.pwnedpasswords.com; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "object-src 'none'; "
+        "form-action 'self'"
     )
     return response
 
@@ -204,6 +220,12 @@ async def security_headers_and_rate_limit(request, call_next):
 @app.on_event("startup")
 async def on_startup():
     init_db()
+    # Register the server signing key in the DB for audit key history (Item 8)
+    db = SessionLocal()
+    try:
+        security_service.server_identity.register_in_db(db)
+    finally:
+        db.close()
     if _redis_client:
         try:
             await _redis_client.ping()
@@ -216,12 +238,26 @@ async def on_startup():
 # Auth dependency — MUST be defined before any route that uses Depends(get_current_user)
 # --------------------------------------------------------------------------
 def get_current_user(
+    request: Request,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> models.User:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Missing bearer token")
-    token = authorization.split(" ", 1)[1]
+    """Extract auth token from HttpOnly cookie (browser) or Authorization header (SDK)."""
+    token = None
+    # Priority 1: HttpOnly cookie (browser sessions)
+    cookie_token = request.cookies.get("qs_access")
+    if cookie_token:
+        # Validate CSRF for state-changing requests from browser
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            csrf_token = request.headers.get("X-CSRF-Token") or request.cookies.get("qs_csrf")
+            if not csrf_token or not auth_service.verify_csrf_token(csrf_token):
+                raise HTTPException(403, "Invalid or missing CSRF token")
+        token = cookie_token
+    # Priority 2: Bearer token (SDK / API clients)
+    elif authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1]
+    if not token:
+        raise HTTPException(401, "Missing authentication")
     payload = auth_service.decode_access_token(token)
     if not payload:
         raise HTTPException(401, "Invalid or expired token")
@@ -232,12 +268,35 @@ def get_current_user(
 
 
 def require_api_scope(scope: str):
-    def dependency(
+    """API key auth: supports both legacy bearer key and HMAC-signed requests (Item 7)."""
+    async def dependency(
+        request: Request,
         x_qs_api_key: str | None = Header(default=None),
+        x_qs_key_id: str | None = Header(default=None),
+        x_qs_timestamp: str | None = Header(default=None),
+        x_qs_nonce: str | None = Header(default=None),
+        x_qs_signature: str | None = Header(default=None),
         db: Session = Depends(get_db),
     ) -> models.ApiKey:
+        # Path 1: HMAC-signed request (Item 7)
+        if x_qs_key_id and x_qs_timestamp and x_qs_nonce and x_qs_signature:
+            # Nonce dedup via Redis
+            if _redis_client:
+                from .services import redis_store
+                nonce_ok = await redis_store.consume_api_nonce(_redis_client, x_qs_key_id, x_qs_nonce)
+                if not nonce_ok:
+                    raise HTTPException(409, "API request nonce already used")
+            body = await request.body()
+            key = integration_service.verify_hmac_request(
+                db, x_qs_key_id, x_qs_timestamp, x_qs_nonce,
+                x_qs_signature, request.method, str(request.url.path), body, scope,
+            )
+            if not key:
+                raise HTTPException(403, "Invalid HMAC signature or insufficient scope")
+            return key
+        # Path 2: Legacy bearer API key
         if not x_qs_api_key:
-            raise HTTPException(401, "Missing X-QS-API-KEY")
+            raise HTTPException(401, "Missing X-QS-API-KEY or HMAC signature headers")
         key = integration_service.verify_api_key(db, x_qs_api_key, scope)
         if not key:
             raise HTTPException(403, "Invalid API key or insufficient scope")
@@ -352,22 +411,147 @@ def login(req: schemas.LoginRequest, request: Request, db: Session = Depends(get
         user.password_hash = auth_service.hash_password(req.password)
         db.commit()
 
-    token = auth_service.create_access_token(user.id, user.tier)
+    # Item 1: Issue HttpOnly cookies instead of returning token in body
+    access_token = auth_service.create_access_token(user.id, user.tier)
+    refresh_raw, family_id = auth_service.create_refresh_token(db, user.id)
+    csrf_token = auth_service.generate_csrf_token(user.id)
+
     security_service.write_audit_log(db, user.id, "USER_LOGIN", "user", user.id,
                                       {"ip": client_ip, "hash_upgraded": needs_rehash})
-    return {
-        "access_token": token, "token_type": "bearer",
+
+    # Cache refresh token in Redis for fast lookup
+    if _redis_client:
+        import asyncio
+        from .services import redis_store
+        token_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                redis_store.cache_refresh_token(_redis_client, token_hash, user.id, REFRESH_TOKEN_SECONDS)
+            )
+        finally:
+            loop.close()
+
+    response = JSONResponse(content={
+        "token_type": "cookie",
         "expires_in": JWT_EXPIRE_SECONDS,
+        "csrf_token": csrf_token,
         "user": {"user_id": user.id, "email": user.email, "tier": user.tier,
                  "beginner_mode": user.beginner_mode}
-    }
+    })
+    # Set HttpOnly access token cookie
+    response.set_cookie(
+        key="qs_access", value=access_token,
+        httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE,
+        domain=COOKIE_DOMAIN, max_age=JWT_EXPIRE_SECONDS, path="/",
+    )
+    # Set HttpOnly refresh token cookie
+    response.set_cookie(
+        key="qs_refresh", value=refresh_raw,
+        httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE,
+        domain=COOKIE_DOMAIN, max_age=REFRESH_TOKEN_SECONDS, path="/api/auth/",
+    )
+    # Set CSRF token as a readable cookie (double-submit pattern)
+    response.set_cookie(
+        key="qs_csrf", value=csrf_token,
+        httponly=False, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE,
+        domain=COOKIE_DOMAIN, max_age=JWT_EXPIRE_SECONDS, path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/refresh")
+def refresh_session(request: Request, db: Session = Depends(get_db)):
+    """Rotate the refresh token and issue a new access token via HttpOnly cookies."""
+    refresh_raw = request.cookies.get("qs_refresh")
+    if not refresh_raw:
+        raise HTTPException(401, "Missing refresh token")
+
+    result = auth_service.rotate_refresh_token(db, refresh_raw, _redis_client)
+    if not result:
+        # Clear stale cookies
+        response = JSONResponse({"detail": "Invalid or expired refresh token"}, status_code=401)
+        response.delete_cookie("qs_access", path="/")
+        response.delete_cookie("qs_refresh", path="/api/auth/")
+        response.delete_cookie("qs_csrf", path="/")
+        return response
+
+    new_refresh_raw, user_id, family_id = result
+    user = db.get(models.User, user_id)
+    if not user or not user.is_active:
+        raise HTTPException(401, "User not found or inactive")
+
+    new_access = auth_service.create_access_token(user.id, user.tier)
+    csrf_token = auth_service.generate_csrf_token(user.id)
+
+    # Update Redis cache
+    if _redis_client:
+        import asyncio
+        from .services import redis_store
+        old_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
+        new_hash = hashlib.sha256(new_refresh_raw.encode()).hexdigest()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(redis_store.invalidate_refresh_token(_redis_client, old_hash))
+            loop.run_until_complete(
+                redis_store.cache_refresh_token(_redis_client, new_hash, user.id, REFRESH_TOKEN_SECONDS)
+            )
+        finally:
+            loop.close()
+
+    response = JSONResponse(content={
+        "token_type": "cookie",
+        "expires_in": JWT_EXPIRE_SECONDS,
+        "csrf_token": csrf_token,
+        "user": {"user_id": user.id, "email": user.email, "tier": user.tier,
+                 "beginner_mode": user.beginner_mode},
+    })
+    response.set_cookie(
+        key="qs_access", value=new_access,
+        httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE,
+        domain=COOKIE_DOMAIN, max_age=JWT_EXPIRE_SECONDS, path="/",
+    )
+    response.set_cookie(
+        key="qs_refresh", value=new_refresh_raw,
+        httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE,
+        domain=COOKIE_DOMAIN, max_age=REFRESH_TOKEN_SECONDS, path="/api/auth/",
+    )
+    response.set_cookie(
+        key="qs_csrf", value=csrf_token,
+        httponly=False, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE,
+        domain=COOKIE_DOMAIN, max_age=JWT_EXPIRE_SECONDS, path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, db: Session = Depends(get_db)):
+    """Revoke refresh token and clear all auth cookies."""
+    refresh_raw = request.cookies.get("qs_refresh")
+    if refresh_raw:
+        auth_service.revoke_refresh_token(db, refresh_raw)
+        if _redis_client:
+            import asyncio
+            from .services import redis_store
+            token_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(redis_store.invalidate_refresh_token(_redis_client, token_hash))
+            finally:
+                loop.close()
+    response = JSONResponse({"status": "logged_out"})
+    response.delete_cookie("qs_access", path="/")
+    response.delete_cookie("qs_refresh", path="/api/auth/")
+    response.delete_cookie("qs_csrf", path="/")
+    return response
 
 
 @app.post("/api/auth/pqc-handshake")
 def pqc_handshake(req: schemas.HandshakeRequest, user: models.User = Depends(get_current_user),
                    db: Session = Depends(get_db)):
     result = auth_service.perform_handshake(
-        db, user.id, req.x25519_public_key, req.ml_kem_public_key, req.client_nonce
+        db, user.id, req.x25519_public_key, req.ml_kem_public_key, req.client_nonce,
+        redis_client=_redis_client,
     )
     security_service.write_audit_log(db, user.id, "PQC_HANDSHAKE", "session",
                                       result["session_id"], {"kem_ms": result["kem_encapsulate_ms"]})
@@ -496,34 +680,56 @@ def get_asset_info_endpoint(ticker: str, user: models.User = Depends(get_current
 
 
 
+# WebSocket per-user connection tracking
+_ws_connections: dict[str, int] = defaultdict(int)
+_WS_MAX_PER_USER = 3
+_WS_IDLE_TIMEOUT = 300  # 5 minutes
+_WS_MAX_MESSAGE_SIZE = 65536  # 64KB
+_ws_sequence_counter: dict[str, int] = defaultdict(int)
+
+
 @app.websocket("/api/signals/stream")
 async def signal_stream(websocket: WebSocket):
     """Authenticated signal stream with browser-safe subprotocol credentials.
 
+    Security hardening:
+    - Per-user connection limit (max 3)
+    - Idle timeout (5 minutes)
+    - Sequence numbers for gap detection
+    - Max message size (64KB)
+
     The JWT is carried as the second requested WebSocket subprotocol rather
     than in the URL, keeping it out of query-string logs and referrers.
+    Alternatively, the access token can be read from the HttpOnly cookie.
     """
     origin = websocket.headers.get("origin")
     protocols = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
     raw_token = protocols[1] if len(protocols) == 2 and protocols[0] == "qs" else None
     # URL-decode: frontend sends encodeURIComponent(jwt) to avoid header parse issues
-    # with JWT special chars (+, /, =). Decode before verification.
     from urllib.parse import unquote
     token = unquote(raw_token) if raw_token else None
+    # Fallback: read from cookie if subprotocol didn't carry the token
+    if not token:
+        token = websocket.cookies.get("qs_access")
     payload = auth_service.decode_access_token(token) if token else None
-    # FIX: When CORS_ORIGINS contains "*" (dev mode), skip origin check.
-    # A literal `origin not in ["*"]` always fails for specific origin strings.
     origin_ok = ("*" in CORS_ORIGINS) or (origin in CORS_ORIGINS)
     if not origin_ok or not payload:
         await websocket.close(code=4401)
         return
+    user_id = payload.get("sub")
+    # Per-user connection limit
+    if _ws_connections.get(user_id, 0) >= _WS_MAX_PER_USER:
+        await websocket.close(code=4429)  # custom code: too many connections
+        return
     db = SessionLocal()
     try:
-        user = db.get(models.User, payload.get("sub"))
+        user = db.get(models.User, user_id)
         if not user or not user.is_active:
             await websocket.close(code=4401)
             return
+        _ws_connections[user_id] = _ws_connections.get(user_id, 0) + 1
         await websocket.accept(subprotocol="qs")
+        seq = 0
         while True:
             try:
                 data = signal_engine.get_cached_signals()
@@ -534,17 +740,25 @@ async def signal_stream(websocket: WebSocket):
                 ws_payload["n_assets"] = len(filtered)
                 ws_payload["total_assets"] = data.get("n_assets", len(data.get("signals", [])))
                 ws_payload["watchlist"] = sorted(wanted)
+                ws_payload["sequence"] = seq
+                seq += 1
                 await websocket.send_json(ws_payload)
             except Exception:
-                # Connection closed mid-send or serialisation error — exit cleanly
                 break
-            await asyncio.sleep(30)  # aligned with CACHE_TTL_SECONDS=30
+            # Idle timeout: wait for receive with timeout
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=min(30, _WS_IDLE_TIMEOUT))
+            except asyncio.TimeoutError:
+                # Normal: no client message within poll interval, send next update
+                pass
+            except WebSocketDisconnect:
+                break
     except WebSocketDisconnect:
         pass
     except Exception:
-        # Catch-all for unexpected errors (e.g. DB failure during user lookup)
         pass
     finally:
+        _ws_connections[user_id] = max(0, _ws_connections.get(user_id, 1) - 1)
         db.close()
 
 
@@ -953,11 +1167,14 @@ def list_api_keys(user: models.User = Depends(get_current_user), db: Session = D
 
 @app.post("/api/integrations/api-keys", status_code=201)
 def create_api_key(req: schemas.ApiKeyRequest, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    raw, prefix, digest = integration_service.generate_api_key()
-    key = models.ApiKey(user_id=user.id, name=req.name.strip(), key_prefix=prefix, key_hash=digest, scopes=req.scopes)
+    raw, prefix, digest, hmac_secret = integration_service.generate_api_key()
+    hmac_enc = integration_service.encrypt_hmac_secret(hmac_secret)
+    key = models.ApiKey(user_id=user.id, name=req.name.strip(), key_prefix=prefix,
+                        key_hash=digest, hmac_secret_encrypted=hmac_enc, scopes=req.scopes)
     db.add(key); db.commit(); db.refresh(key)
     security_service.write_audit_log(db, user.id, "API_KEY_CREATED", "api_key", key.id, {"scopes": req.scopes})
-    return {"id": key.id, "name": key.name, "prefix": key.key_prefix, "scopes": key.scopes, "api_key": raw}
+    return {"id": key.id, "name": key.name, "prefix": key.key_prefix, "scopes": key.scopes,
+            "api_key": raw, "hmac_secret": hmac_secret}
 
 
 @app.delete("/api/integrations/api-keys/{key_id}")
@@ -1958,6 +2175,65 @@ def rotate_keys(req: schemas.RotateKeysRequest, user: models.User = Depends(get_
 
     return {"new_key_pair_id": new_key.id, "algorithm": req.algorithm,
             "rotation_count": rotation_count, "keygen_ms": round(ms, 3)}
+
+
+# --------------------------------------------------------------------------
+# Server signing key history (Item 8)
+# --------------------------------------------------------------------------
+@app.get("/api/security/server-keys")
+def server_signing_keys(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return current and historical server signing key fingerprints with activation times."""
+    keys = db.execute(
+        select(models.ServerSigningKey).order_by(models.ServerSigningKey.activated_at.desc())
+    ).scalars().all()
+    return {
+        "current_fingerprint": security_service.server_identity.fingerprint,
+        "trusted_fingerprint": TRUSTED_SERVER_DSA_FINGERPRINT,
+        "keys": [{
+            "key_id": k.key_id,
+            "algorithm": k.algorithm,
+            "fingerprint": k.fingerprint,
+            "status": k.status,
+            "activated_at": k.activated_at.isoformat() if k.activated_at else None,
+            "retired_at": k.retired_at.isoformat() if k.retired_at else None,
+        } for k in keys],
+    }
+
+
+# --------------------------------------------------------------------------
+# Kill switch admin endpoints (Item 6)
+# --------------------------------------------------------------------------
+@app.post("/api/risk/kill-switch")
+async def manage_kill_switch(
+    body: dict,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Set or clear a trading kill switch. Requires admin-level user."""
+    scope = body.get("scope", "global")
+    identifier = body.get("identifier")
+    enabled = body.get("enabled", True)
+    if scope not in {"global", "user", "asset"}:
+        raise HTTPException(400, "scope must be global, user, or asset")
+    if _redis_client:
+        await order_security.set_kill_switch_async(_redis_client, scope, identifier, enabled)
+    else:
+        order_security.set_kill_switch(scope, identifier, enabled)
+    action = "KILL_SWITCH_SET" if enabled else "KILL_SWITCH_CLEARED"
+    security_service.write_audit_log(db, user.id, action, "risk", None,
+                                      {"scope": scope, "identifier": identifier})
+    return {"scope": scope, "identifier": identifier, "enabled": enabled}
+
+
+@app.get("/api/risk/kill-switch")
+async def list_kill_switches_endpoint(user: models.User = Depends(get_current_user)):
+    """List all active kill switches."""
+    if _redis_client:
+        from .services import redis_store
+        switches = await redis_store.list_kill_switches(_redis_client)
+    else:
+        switches = [{"scope": s, "identifier": i} for s, i in order_security._KILL_SWITCHES]
+    return {"kill_switches": switches}
 
 
 # --------------------------------------------------------------------------

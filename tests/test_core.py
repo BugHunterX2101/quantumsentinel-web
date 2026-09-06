@@ -32,7 +32,7 @@ def test_api_key_scope_and_hashing():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
-    raw, prefix, digest = integration_service.generate_api_key()
+    raw, prefix, digest, _hmac_secret = integration_service.generate_api_key()
     user = models.User(email="scope@example.com", password_hash="x")
     session.add(user); session.commit()
     session.add(models.ApiKey(user_id=user.id, name="read-only", key_prefix=prefix,

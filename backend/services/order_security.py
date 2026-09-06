@@ -1,4 +1,10 @@
-"""Canonical order authorisation, replay protection, and paper-trading risk gates."""
+"""Canonical order authorisation, replay protection, and paper-trading risk gates.
+
+Item 6 enhancements:
+- Kill switches are Redis-backed for multi-worker consistency
+- Nonce dedup uses Redis SET NX EX for atomicity
+- Fallback to in-memory stores in development mode
+"""
 from __future__ import annotations
 
 import datetime as dt
@@ -22,6 +28,8 @@ from . import security_service
 PROTOCOL = "QS-ORDER-V1"
 MAX_ENVELOPE_TTL_SECONDS = 300
 _GENESIS_HASH = "0" * 64
+
+# In-memory fallback for dev (replaced by Redis in production — Item 6)
 _KILL_SWITCHES: set[tuple[str, str | None]] = set()
 
 
@@ -125,10 +133,44 @@ def complete_idempotency(db: Session, user_id: str, key: str | None, response: d
         db.commit()
 
 
+# ---------------------------------------------------------------------------
+# Risk gate with Redis-backed kill switches (Item 6)
+# ---------------------------------------------------------------------------
+
+async def assert_risk_gate_async(*, user_id: str, asset: str, side: str, quantity: float,
+                                  price: float, held_quantity: float, account_equity: float,
+                                  current_gross_exposure: float, redis_client=None) -> None:
+    """Central execution boundary (async version for Redis). Must run before order is signed."""
+    from . import redis_store
+
+    # Check kill switches via Redis
+    blocked = False
+    if redis_client:
+        blocked = (
+            await redis_store.is_kill_switch_active(redis_client, "global") or
+            await redis_store.is_kill_switch_active(redis_client, "user", user_id) or
+            await redis_store.is_kill_switch_active(redis_client, "asset", asset.upper())
+        )
+    else:
+        # In-memory fallback
+        blocked = (("global", None) in _KILL_SWITCHES or ("user", user_id) in _KILL_SWITCHES
+                   or ("asset", asset.upper()) in _KILL_SWITCHES)
+    if blocked:
+        raise HTTPException(423, "trading kill switch is active")
+
+    notional = quantity * price
+    if notional > account_equity * 0.05:
+        raise HTTPException(400, "risk gate: order exceeds 5% account-equity notional limit")
+    if side == "sell" and quantity > held_quantity:
+        raise HTTPException(400, "risk gate: sell quantity exceeds available paper position")
+    if current_gross_exposure + (notional if side == "buy" else 0) > account_equity:
+        raise HTTPException(400, "risk gate: leverage limit exceeded")
+
+
 def assert_risk_gate(*, user_id: str, asset: str, side: str, quantity: float,
                      price: float, held_quantity: float, account_equity: float,
                      current_gross_exposure: float) -> None:
-    """Central execution boundary. It must run before an order is signed/sent."""
+    """Central execution boundary (sync). It must run before an order is signed/sent."""
     blocked = (("global", None) in _KILL_SWITCHES or ("user", user_id) in _KILL_SWITCHES
                or ("asset", asset.upper()) in _KILL_SWITCHES)
     if blocked:
@@ -142,7 +184,24 @@ def assert_risk_gate(*, user_id: str, asset: str, side: str, quantity: float,
         raise HTTPException(400, "risk gate: leverage limit exceeded")
 
 
+async def set_kill_switch_async(redis_client, scope: str, identifier: str | None = None,
+                                 enabled: bool = True) -> None:
+    """Set or clear a kill switch (async, Redis-backed)."""
+    from . import redis_store
+    if scope not in {"global", "user", "asset"}:
+        raise ValueError("scope must be global, user, or asset")
+    normalized_id = identifier.upper() if scope == "asset" and identifier else identifier
+    await redis_store.set_kill_switch(redis_client, scope, normalized_id, enabled)
+    # Also update in-memory for sync fallback
+    value = (scope, normalized_id)
+    if enabled:
+        _KILL_SWITCHES.add(value)
+    else:
+        _KILL_SWITCHES.discard(value)
+
+
 def set_kill_switch(scope: str, identifier: str | None = None, enabled: bool = True) -> None:
+    """Set or clear a kill switch (sync, in-memory only — for dev/tests)."""
     if scope not in {"global", "user", "asset"}:
         raise ValueError("scope must be global, user, or asset")
     value = (scope, identifier.upper() if scope == "asset" and identifier else identifier)

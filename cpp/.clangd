@@ -1,0 +1,7 @@
+CompileFlags:
+  Add:
+    - "-std=c++17"
+    - "-I../../.venv313/Lib/site-packages/pybind11/include"
+    - "-I../../.venv/Lib/site-packages/pybind11/include"
+    - "-IC:/Users/Lenovo/AppData/Local/Programs/Python/Python313/Include"
+  Compiler: clang++

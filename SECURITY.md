@@ -1,5 +1,14 @@
 # Security Policy
 
+## Supported Versions
+
+| Version | Supported          | Notes                                    |
+|---------|--------------------|------------------------------------------|
+| 1.x     | :white_check_mark: | Current release — actively maintained    |
+| < 1.0   | :x:                | Pre-release — no security patches        |
+
+---
+
 ## Cryptography
 
 - **ML-KEM-768** (FIPS 203) and **ML-DSA-65** (FIPS 204) are implemented via
@@ -64,9 +73,18 @@
 - **Zero innerHTML with unsanitized data**: all user/API data is rendered via
   DOM API (`createElement`, `textContent`, `replaceChildren`) or pre-escaped
   through `escapeHtml()`.
-- **CSP**: `script-src 'self'` (no `unsafe-inline` or external CDN scripts),
-  `style-src 'self' https://fonts.googleapis.com` (no `unsafe-inline`),
-  `object-src 'none'`, `form-action 'self'`, `frame-ancestors 'none'`.
+- **Content Security Policy (CSP)**:
+  - `script-src 'self' https://cdn.jsdelivr.net` — only self-hosted scripts
+    and the pinned Three.js CDN are allowed; no `unsafe-inline` or
+    `unsafe-eval`.
+  - `style-src 'self' https://fonts.googleapis.com` — no `unsafe-inline`.
+  - `font-src 'self' https://fonts.gstatic.com data:` — Google Fonts only.
+  - `connect-src 'self' wss: ws: https://api.github.com https://api.pwnedpasswords.com` — WebSocket and specific API endpoints.
+  - `img-src 'self' data:` — inline data URIs for icons/avatars.
+  - `object-src 'none'` — blocks Flash/Java applets.
+  - `frame-ancestors 'none'` — prevents clickjacking.
+  - `form-action 'self'` — prevents form hijacking.
+  - `base-uri 'self'` — prevents `<base>` tag injection.
 - **WebSocket hardening**: per-user connection limit (max 3), idle timeout
   (5 minutes), sequence numbers for gap detection, cookie-based auth
   fallback.
@@ -80,11 +98,13 @@
 
 ## CI security pipeline
 
-- **Bandit**: Python SAST (medium+ severity)
-- **pip-audit**: dependency CVE scanning
-- **Gitleaks**: secret detection across git history
-- **Semgrep**: SAST with OWASP Top 10 rules
-- **Trivy**: container image vulnerability scanning (CRITICAL/HIGH)
+| Scanner      | Purpose                              | Severity    |
+|-------------|--------------------------------------|-------------|
+| **Bandit**  | Python static analysis (SAST)        | Medium+     |
+| **pip-audit** | Dependency CVE scanning            | All         |
+| **Gitleaks** | Secret detection across git history | All         |
+| **Semgrep** | SAST with OWASP Top 10 rules        | All         |
+| **Trivy**   | Container image vulnerability scan   | Critical/High |
 
 ## Known simplifications vs. the full architecture spec
 
@@ -123,6 +143,31 @@
 
 ## Reporting a vulnerability
 
-Open a GitHub issue with the `security` label, or a private security
-advisory if the finding is sensitive. Do not include exploit details in a
-public issue.
+> **Please do NOT open a public GitHub issue for security vulnerabilities.**
+
+If you discover a security vulnerability, please report it responsibly:
+
+1. **GitHub Security Advisory** (preferred): use the
+   [private security advisory](https://github.com/BugHunterX2101/quantumsentinel-web/security/advisories/new)
+   feature to report privately.
+2. **Email**: contact the maintainer directly at the email listed in the
+   GitHub profile.
+
+### What to include
+
+- A clear description of the vulnerability and its potential impact.
+- Steps to reproduce (proof-of-concept code or screenshots if applicable).
+- Affected version(s) and component(s).
+- Suggested fix or mitigation (if you have one).
+
+### Response timeline
+
+| Action                    | Target      |
+|---------------------------|-------------|
+| Acknowledgement           | 48 hours    |
+| Initial triage            | 5 days      |
+| Fix released (critical)   | 7 days      |
+| Fix released (high)       | 14 days     |
+| Fix released (medium/low) | 30 days     |
+
+We will credit reporters in the release notes unless anonymity is requested.

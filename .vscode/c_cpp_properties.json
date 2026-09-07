@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/.venv313/Lib/site-packages/pybind11/include",
+                "${workspaceFolder}/.venv/Lib/site-packages/pybind11/include",
+                "C:/Users/Lenovo/AppData/Local/Programs/Python/Python313/Include"
+            ],
+            "defines": [
+                "_USE_MATH_DEFINES",
+                "NOMINMAX",
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x64",
+            "compilerPath": ""
+        }
+    ],
+    "version": 4
+}

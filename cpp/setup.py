@@ -26,7 +26,10 @@ import os
 
 try:
     import pybind11
-    PYBIND_INCS = [pybind11.get_include(), pybind11.get_include(user=True)]
+    # get_include(user=True) is a no-op since pybind11 2.6 and the `user`
+    # parameter was marked for removal in 3.x.  Call once and deduplicate.
+    _pb_inc = pybind11.get_include()
+    PYBIND_INCS = list(dict.fromkeys([_pb_inc]))   # ordered, deduplicated
 except ImportError:
     raise RuntimeError(
         "pybind11 is required to build _qs_fast. "

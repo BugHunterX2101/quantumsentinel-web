@@ -24,6 +24,7 @@ import os
 import time
 import secrets
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import numpy as np
 from collections import defaultdict, deque
@@ -142,7 +143,30 @@ def _etag(value: str) -> str:
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 
-app = FastAPI(title="QuantumSentinel API", version="1.0.0")
+# Redis client must be created before _lifespan so the startup coroutine can reference it.
+_redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """FastAPI lifespan handler — replaces deprecated @app.on_event('startup')."""
+    init_db()
+    # Register the server signing key in the DB for audit key history (Item 8)
+    db = SessionLocal()
+    try:
+        security_service.server_identity.register_in_db(db)
+    finally:
+        db.close()
+    if _redis_client:
+        try:
+            await _redis_client.ping()
+        except Exception as exc:
+            if ENVIRONMENT == "production":
+                raise RuntimeError("Redis is required and unavailable") from exc
+    yield  # ── application runs here ──
+
+
+app = FastAPI(title="QuantumSentinel API", version="1.0.0", lifespan=_lifespan)
 
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -154,7 +178,6 @@ app.add_middleware(
 
 HTTP_REQUESTS = Counter("quantumsentinel_http_requests_total", "HTTP requests", ["method", "path", "status"])
 HTTP_LATENCY = Histogram("quantumsentinel_http_request_duration_seconds", "HTTP request latency", ["method", "path"])
-_redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 # Bounded in-memory limiter for the single-process reference deployment. It
 # deliberately protects write paths even before a user has authenticated.
@@ -204,7 +227,7 @@ async def security_headers_and_rate_limit(request, call_next):
     ws_policy = "wss:" if ENVIRONMENT == "production" else "wss: ws:"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self'; "
+        "script-src 'self' https://cdn.jsdelivr.net; "
         "style-src 'self' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data:; "
@@ -217,21 +240,7 @@ async def security_headers_and_rate_limit(request, call_next):
     return response
 
 
-@app.on_event("startup")
-async def on_startup():
-    init_db()
-    # Register the server signing key in the DB for audit key history (Item 8)
-    db = SessionLocal()
-    try:
-        security_service.server_identity.register_in_db(db)
-    finally:
-        db.close()
-    if _redis_client:
-        try:
-            await _redis_client.ping()
-        except Exception as exc:
-            if ENVIRONMENT == "production":
-                raise RuntimeError("Redis is required and unavailable") from exc
+# Startup logic is in _lifespan() above (FastAPI lifespan context manager).
 
 
 # --------------------------------------------------------------------------

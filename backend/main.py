@@ -10,7 +10,7 @@ Security hardening (v2):
 - CSRF double-submit cookie pattern
 - HMAC-signed API key requests (Item 7)
 - Redis-backed kill switches (Item 6)
-- Tightened CSP (no unsafe-inline, no external scripts)
+- Tightened CSP (no unsafe-inline; jsdelivr whitelisted for Three.js only)
 - WebSocket per-user connection limits, idle timeout, sequence numbers
 - Server signing key history endpoint (Item 8)
 """

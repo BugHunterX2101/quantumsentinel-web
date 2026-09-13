@@ -510,7 +510,7 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
 });
 
 // ── Keyboard shortcuts 1-7 ──────────────────────────────────────
-const VIEW_KEYS = ['dashboard','trading','strategies','research','portfolio','security','integrations','community'];
+const VIEW_KEYS = ['dashboard','trading','strategies','research','phase3','portfolio','security','integrations','community'];
 document.addEventListener('keydown', (e) => {
   // Only when not typing in an input/textarea
   if (e.target.matches('input,textarea,select')) return;
@@ -551,7 +551,7 @@ function confirmAction(title, body) {
 }
 
 const PAGE_TITLES = { dashboard:'Dashboard', trading:'Order Desk', strategies:'Strategies', research:'Research',
-  portfolio:'Portfolio', security:'Security', integrations:'Integrations', community:'Open Source' };
+  phase3:'Lab', portfolio:'Portfolio', security:'Security', integrations:'Integrations', community:'Open Source' };
 
 // Smart freshness gate — skip re-fetching data if the view was loaded < 5s ago
 const _viewLastLoaded = {};
@@ -583,6 +583,7 @@ function switchView(view) {
     portfolio: 'Tip: Sharpe ratio > 1 is generally considered good risk-adjusted performance. Max drawdown shows worst peak-to-trough loss.',
     strategies: 'Tip: validate a strategy on historical data first. A positive backtest is not a prediction of future returns.',
     research: 'Tip: use walk-forward validation to detect overfitting. The Deflated Sharpe Ratio accounts for the number of strategies you tested.',
+    phase3: 'Tip: the Lab contains advanced tools — event backtests with realistic costs, HMM regime detection, market-neutral strategies, statistical arbitrage, and pipeline latency profiling.',
     security: 'Tip: the Quantum Safety Score reflects how fresh your cryptographic keys are — green means fully rotated and FIPS-compliant.',
   };
   const banner = document.getElementById('beginner-banner');

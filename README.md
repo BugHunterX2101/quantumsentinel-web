@@ -6,7 +6,7 @@
 
 **Open-source quantitative research and paper-trading platform with post-quantum security primitives**
 
-[![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.12+-blue?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Tests](https://img.shields.io/badge/Tests-pytest-blue)](tests/)
 [![FIPS 203](https://img.shields.io/badge/FIPS_203-ML--KEM--768-cyan)](https://csrc.nist.gov/pubs/fips/203/final)
@@ -399,7 +399,7 @@ quantumsentinel-web/
 │
 ├── backend/
 │   ├── main.py                          ← Central router · middleware · WebSocket · SPA fallback
-│   ├── models.py                        ← SQLAlchemy 2.0 schema (8 tables)
+│   ├── models.py                        ← SQLAlchemy 2.0 schema (15 tables)
 │   ├── schemas.py                       ← Pydantic v2 request/response validation (all endpoints)
 │   ├── database.py                      ← Engine · session factory · init_db()
 │   ├── config.py                        ← ENV-driven config with production safety constraints
@@ -431,7 +431,17 @@ quantumsentinel-web/
 │       ├── neutral_strategies.py        ← Pairs trading · Kalman filter · OU half-life
 │       ├── report_generator.py          ← 7-section structured JSON research report
 │       ├── cpp_ext.py                   ← C++ kernel wrapper + NumPy fallback (auto-selects)
-│       └── latency_bench.py             ← p50/p95/p99/p99.9 pipeline profiler + C++ speedup
+│       ├── latency_bench.py             ← p50/p95/p99/p99.9 pipeline profiler + C++ speedup
+│       │
+│       │   ── Market Microstructure ────────────────────────────────────
+│       ├── market_microstructure.py      ← L2 order-book analytics · OBI · microprice · spread
+│       ├── l2_event_replay.py           ← L2 event stream replay engine · synthetic L2 generator
+│       ├── order_book.py                ← In-memory L2 order book · price-time priority · FIFO queues
+│       ├── matching_engine.py           ← Queue-aware matching · stop triggers · IOC/FOK/GTC
+│       ├── paper_exchange.py            ← Event-driven paper exchange · portfolio tracking
+│       ├── latency_model.py             ← Configurable latency simulation · 7 presets
+│       ├── execution_analytics.py       ← Adverse selection · implementation shortfall · capacity
+│       └── experiment_registry.py       ← Experiment tracking · ML-DSA signed manifests · gates
 │
 ├── cpp/                                 ← C++ performance kernels (pybind11)
 │   ├── qs_fast.cpp                      ← rolling_corr · hmm_forward · backtest_loop
@@ -452,7 +462,11 @@ quantumsentinel-web/
 │   ├── test_backtest.py                 ← Execution engine & cost models
 │   ├── test_research.py                 ← Walk-forward · alpha · factor model
 │   ├── test_phase3.py                   ← Stat tests · regime detection · pairs trading
-│   └── test_phase4.py                   ← C++ kernels · p50/p99 latency · report generator
+│   ├── test_phase4.py                   ← C++ kernels · p50/p99 latency · report generator
+│   ├── test_microstructure.py           ← L2 analytics · OBI · microprice · synthetic L2 replay
+│   ├── test_paper_exchange.py           ← Order book · matching engine · paper exchange · FIFO
+│   ├── test_execution_analytics.py      ← Implementation shortfall · capacity · latency model
+│   └── test_experiment_registry.py      ← Experiment provenance · signed manifests · gates
 │
 ├── deploy/
 │   ├── nginx.conf                       ← TLS 1.3 reverse proxy with HSTS
@@ -475,7 +489,7 @@ quantumsentinel-web/
 
 | Requirement | Notes |
 |---|---|
-| **Python 3.12** | Official CPython from [python.org](https://python.org) — used locally, in CI, and in Docker |
+| **Python 3.12+** | Official CPython from [python.org](https://python.org) — tested on 3.12 and 3.13 in CI |
 | **Git** | Any recent version |
 | **C++ compiler** *(optional)* | MinGW-W64 GCC 16+ (Windows) · GCC 11+ (Linux) · Clang 14+ (macOS) — only needed for C++ kernel speedup |
 
@@ -567,6 +581,22 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 | **`POST`** | **`/api/research/report`** | **Full 7-section research report across all pipeline stages** |
 | `POST` | `/api/research/latency-benchmark` | Per-stage p50/p99 latency profile + C++ vs Python speedup benchmark |
 | `GET`  | `/api/research/cpp-status` | C++ extension load status · kernel names · active mode |
+
+### Market Microstructure & Paper Exchange Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/microstructure/snapshot/{ticker}` | Synthetic order-book snapshot with OBI, microprice, spread analytics |
+| `POST` | `/api/microstructure/analytics` | Compute microstructure features from provided bid/ask data |
+| `POST` | `/api/microstructure/replay` | Replay L2 events through the OBI-momentum strategy |
+| `POST` | `/api/exchange/order` | Submit order to queue-aware paper exchange |
+| `GET` | `/api/exchange/book/{ticker}` | Current synthetic order book state |
+| `POST` | `/api/execution/analysis` | Implementation shortfall decomposition (delay + spread + impact + fees) |
+| `POST` | `/api/execution/capacity` | Strategy capacity analysis across capital sizes |
+| `POST` | `/api/experiments/create` | Create experiment with dataset/strategy/parameter hashes |
+| `GET` | `/api/experiments/{id}` | Get experiment with signed manifest |
+| `POST` | `/api/experiments/{id}/replay` | Deterministic replay — same seed/data = same hashes |
+| `GET` | `/api/latency/presets` | List all latency presets (zero → retail, 0ms → 50ms) |
 
 ### Research Report — 7-Section JSON Structure
 
@@ -773,6 +803,7 @@ docker compose up --build -d && curl http://localhost:8000/health/ready
 | **Phase 2** — Walk-Forward & Alpha | Complete | Rolling/expanding WF · IC/Rank IC/ICIR · decay analysis · quintile returns · signal turnover |
 | **Phase 3** — Factor & Statistics | Complete | Fama-MacBeth · DSR · ADF/cointegration · pairs trading · portfolio optimisation |
 | **Phase 4** — Performance & Reporting | Complete | C++ kernels (pybind11) · p50/p99 latency profiler · 7-section JSON report generator |
+| **Phase 5** — Market Microstructure | Complete | L2 order-book analytics · queue-aware paper exchange · matching engine · latency model · execution analytics · experiment registry with ML-DSA signed manifests |
 
 ---
 

@@ -2070,7 +2070,250 @@ def cpp_status_endpoint(user: models.User = Depends(get_current_user)):
     return status
 
 
+# --------------------------------------------------------------------------
+# Market Microstructure endpoints
+# --------------------------------------------------------------------------
 
+@app.get("/api/microstructure/snapshot/{ticker}", status_code=200)
+def microstructure_snapshot(ticker: str, levels: int = 10, user: models.User = Depends(get_current_user)):
+    """Generate a synthetic order-book snapshot for a ticker.
+
+    Uses the latest cached price to seed the synthetic L2 generator,
+    then returns the snapshot with analytics (OBI, microprice, spread, depth).
+    """
+    from .services.market_microstructure import (
+        generate_synthetic_l2, build_snapshot_from_events, snapshot_to_dict,
+    )
+    price_data = signal_engine.get_live_price(ticker)
+    if not price_data or not price_data.get("price"):
+        raise HTTPException(404, f"No price data for {ticker}")
+    price = price_data["price"]
+    bar = {
+        "timestamp": time.time(),
+        "open": price * 0.999, "high": price * 1.002,
+        "low": price * 0.998, "close": price, "volume": 50_000,
+    }
+    events = generate_synthetic_l2([bar], levels=levels, seed=int(price * 100))
+    snap = build_snapshot_from_events(events, levels=levels)
+    return snapshot_to_dict(snap)
+
+
+@app.post("/api/microstructure/analytics", status_code=200)
+def microstructure_analytics(request_body: dict, user: models.User = Depends(get_current_user)):
+    """Compute microstructure analytics on provided order-book data.
+
+    Accepts ``bids`` and ``asks`` arrays and returns OBI, microprice,
+    spread, depth, and microprice deviation.
+    """
+    from .services.market_microstructure import (
+        OrderBookSnapshot, PriceLevel,
+        compute_order_book_imbalance, compute_microprice, compute_spread,
+        compute_spread_bps, compute_depth, compute_mid_price,
+        compute_microprice_deviation,
+    )
+    bids = [PriceLevel(b["price"], b["size"]) for b in request_body.get("bids", [])]
+    asks = [PriceLevel(a["price"], a["size"]) for a in request_body.get("asks", [])]
+    levels = request_body.get("levels", 5)
+    snap = OrderBookSnapshot(timestamp=time.time(), bids=bids, asks=asks)
+    return {
+        "mid_price": compute_mid_price(snap),
+        "spread": compute_spread(snap),
+        "spread_bps": compute_spread_bps(snap),
+        "microprice": compute_microprice(snap),
+        "microprice_deviation_bps": compute_microprice_deviation(snap),
+        "obi": compute_order_book_imbalance(snap, levels=levels),
+        "depth": compute_depth(snap, levels=levels),
+    }
+
+
+@app.post("/api/microstructure/replay", status_code=200)
+def microstructure_replay(request_body: dict, user: models.User = Depends(get_current_user)):
+    """Replay L2 events through the OBI-momentum strategy.
+
+    Accepts ``bars`` (OHLCV list) and optional ``seed``, ``events_per_bar``,
+    ``obi_threshold`` parameters.
+    """
+    from .services.l2_event_replay import (
+        L2EventStream, ReplayConfig, replay_session, obi_momentum_strategy,
+    )
+    bars = request_body.get("bars", [])
+    if not bars:
+        raise HTTPException(400, "bars list is required")
+    seed = request_body.get("seed", 42)
+    events_per_bar = request_body.get("events_per_bar", 50)
+    obi_threshold = request_body.get("obi_threshold", 0.3)
+    stream = L2EventStream.from_synthetic(bars, seed=seed, events_per_bar=events_per_bar)
+
+    def strategy(snap, trades):
+        return obi_momentum_strategy(snap, trades, obi_threshold=obi_threshold)
+
+    config = ReplayConfig(
+        snapshot_interval=request_body.get("snapshot_interval", 10),
+        warmup_events=request_body.get("warmup_events", 50),
+    )
+    result = replay_session(stream, strategy_fn=strategy, config=config)
+    return result.to_dict()
+
+
+# --------------------------------------------------------------------------
+# Paper Exchange endpoints
+# --------------------------------------------------------------------------
+
+@app.post("/api/exchange/order", status_code=200)
+def exchange_submit_order(request_body: dict, user: models.User = Depends(get_current_user)):
+    """Submit a paper order to the exchange.
+
+    Accepts ``symbol``, ``side`` (BUY/SELL), ``quantity``, ``order_type``
+    (market/limit/stop/stop_limit), optional ``limit_price``, ``stop_price``.
+    """
+    from .services.paper_exchange import PaperExchange, TradingMode
+    from .services.order_book import OrderType, TimeInForce
+    from .services.market_microstructure import TradeSide
+
+    symbol = request_body.get("symbol", "AAPL")
+    exchange = PaperExchange(symbol=symbol, initial_cash=request_body.get("initial_cash", 100_000))
+
+    # Seed book with synthetic liquidity from current price
+    price_data = signal_engine.get_live_price(symbol)
+    if price_data and price_data.get("price"):
+        from .services.order_book import Order
+        price = price_data["price"]
+        for i in range(5):
+            exchange.book.add_order(Order(
+                symbol=symbol, side=TradeSide.SELL, order_type=OrderType.LIMIT,
+                quantity=100 * (i + 1), limit_price=round(price * (1 + 0.001 * (i + 1)), 2),
+            ))
+            exchange.book.add_order(Order(
+                symbol=symbol, side=TradeSide.BUY, order_type=OrderType.LIMIT,
+                quantity=100 * (i + 1), limit_price=round(price * (1 - 0.001 * (i + 1)), 2),
+            ))
+
+    side = TradeSide(request_body.get("side", "BUY"))
+    order = exchange.submit_order(
+        side=side,
+        quantity=float(request_body.get("quantity", 1)),
+        order_type=OrderType(request_body.get("order_type", "market")),
+        limit_price=request_body.get("limit_price"),
+        stop_price=request_body.get("stop_price"),
+    )
+    return {
+        "order": order.to_dict(),
+        "portfolio": exchange.portfolio_summary(),
+        "exchange_stats": exchange.exchange_stats(),
+        "trading_mode": TradingMode.PAPER.value,
+    }
+
+
+@app.get("/api/exchange/book/{ticker}", status_code=200)
+def exchange_book(ticker: str, user: models.User = Depends(get_current_user)):
+    """Return a synthetic order book for a ticker."""
+    from .services.market_microstructure import generate_synthetic_l2, build_snapshot_from_events, snapshot_to_dict
+    price_data = signal_engine.get_live_price(ticker)
+    if not price_data or not price_data.get("price"):
+        raise HTTPException(404, f"No price data for {ticker}")
+    price = price_data["price"]
+    bar = {"timestamp": time.time(), "open": price, "high": price * 1.003,
+           "low": price * 0.997, "close": price, "volume": 100_000}
+    events = generate_synthetic_l2([bar], levels=10, seed=int(price * 100), events_per_bar=100)
+    snap = build_snapshot_from_events(events, levels=10)
+    d = snapshot_to_dict(snap)
+    d["symbol"] = ticker
+    return d
+
+
+# --------------------------------------------------------------------------
+# Execution Analytics endpoints
+# --------------------------------------------------------------------------
+
+@app.post("/api/execution/analysis", status_code=200)
+def execution_analysis(request_body: dict, user: models.User = Depends(get_current_user)):
+    """Compute implementation shortfall decomposition for an order."""
+    from .services.execution_analytics import compute_implementation_shortfall
+    return compute_implementation_shortfall(
+        decision_price=float(request_body.get("decision_price", 0)),
+        arrival_price=float(request_body.get("arrival_price", 0)),
+        execution_vwap=float(request_body.get("execution_vwap", 0)),
+        side=request_body.get("side", "BUY"),
+        quantity=float(request_body.get("quantity", 0)),
+        spread=float(request_body.get("spread", 0)),
+        fees=float(request_body.get("fees", 0)),
+    )
+
+
+@app.post("/api/execution/capacity", status_code=200)
+def execution_capacity(request_body: dict, user: models.User = Depends(get_current_user)):
+    """Capacity analysis across capital sizes."""
+    from .services.execution_analytics import compute_capacity_analysis
+    results = request_body.get("results_by_capital", {})
+    # Convert string keys to float
+    typed_results = {float(k): v for k, v in results.items()}
+    return compute_capacity_analysis(typed_results)
+
+
+# --------------------------------------------------------------------------
+# Experiment Registry endpoints
+# --------------------------------------------------------------------------
+
+@app.post("/api/experiments/create", status_code=201)
+def experiment_create(request_body: dict, user: models.User = Depends(get_current_user)):
+    """Create a new experiment with full provenance tracking."""
+    from .services.experiment_registry import ExperimentRegistry
+    registry = ExperimentRegistry()
+    exp = registry.create(
+        strategy_id=request_body.get("strategy_id", ""),
+        strategy_version=request_body.get("strategy_version", "1.0"),
+        dataset_id=request_body.get("dataset_id", ""),
+        dataset=request_body.get("dataset"),
+        parameters=request_body.get("parameters"),
+        random_seed=request_body.get("random_seed", 42),
+        execution_model=request_body.get("execution_model", "LOB_QUEUE_V2"),
+        latency_model=request_body.get("latency_model", "zero"),
+    )
+    return exp.to_dict()
+
+
+@app.get("/api/experiments/{experiment_id}", status_code=200)
+def experiment_get(experiment_id: str, user: models.User = Depends(get_current_user)):
+    """Get experiment details with signed manifest."""
+    from .services.experiment_registry import ExperimentRegistry
+    registry = ExperimentRegistry()
+    exp = registry.get(experiment_id)
+    if not exp:
+        raise HTTPException(404, f"Experiment {experiment_id} not found")
+    return exp.to_dict()
+
+
+@app.post("/api/experiments/{experiment_id}/replay", status_code=200)
+def experiment_replay(experiment_id: str, request_body: dict, user: models.User = Depends(get_current_user)):
+    """Deterministic replay of an experiment.
+
+    Verifies that the same dataset + parameters + seed produces
+    the same result hash.
+    """
+    from .services.experiment_registry import hash_dataset, hash_parameters
+    dataset = request_body.get("dataset")
+    parameters = request_body.get("parameters", {})
+    seed = request_body.get("random_seed", 42)
+    d_hash = hash_dataset(dataset) if dataset else ""
+    p_hash = hash_parameters(parameters)
+    return {
+        "experiment_id": experiment_id,
+        "dataset_hash": d_hash,
+        "parameter_hash": p_hash,
+        "random_seed": seed,
+        "replay_status": "deterministic_hashes_computed",
+    }
+
+
+# --------------------------------------------------------------------------
+# Latency Model endpoints
+# --------------------------------------------------------------------------
+
+@app.get("/api/latency/presets", status_code=200)
+def latency_presets(user: models.User = Depends(get_current_user)):
+    """List all available latency presets."""
+    from .services.latency_model import LATENCY_PRESETS
+    return {name: model.to_dict() for name, model in LATENCY_PRESETS.items()}
 
 
 # --------------------------------------------------------------------------

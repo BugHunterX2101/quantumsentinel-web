@@ -1,11 +1,5 @@
 # Security Policy
 
-## Supported Versions
-
-| Version | Supported          | Notes                                    |
-|---------|--------------------|------------------------------------------|
-| 1.x     | :white_check_mark: | Current release — actively maintained    |
-| < 1.0   | :x:                | Pre-release — no security patches        |
 
 ---
 

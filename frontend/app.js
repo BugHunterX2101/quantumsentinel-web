@@ -578,7 +578,7 @@ function switchView(view) {
   }
   // Beginner banner
   const banners = {
-    dashboard: 'Tip: BUY signals with higher confidence bars indicate stronger multi-asset agreement. Use keys 1–7 to navigate.',
+    dashboard: 'Tip: BUY signals with higher confidence bars indicate stronger multi-asset agreement. Use keys 1–9 to navigate.',
     trading: 'Tip: every order is cryptographically signed with ML-DSA-65 before submission and settles as a paper (simulated) trade.',
     portfolio: 'Tip: Sharpe ratio > 1 is generally considered good risk-adjusted performance. Max drawdown shows worst peak-to-trough loss.',
     strategies: 'Tip: validate a strategy on historical data first. A positive backtest is not a prediction of future returns.',
@@ -1252,6 +1252,9 @@ function _renderWatchlistModal(filter = '') {
   let total = 0;
   const tracked = new Set(state.meta?.tracked_assets || []);
 
+  // Collect all tickers that have already been rendered (via ASSET_GROUPS)
+  const renderedTickers = new Set();
+
   for (const grp of ASSET_GROUPS) {
     const matchesGroup = !filterLow || grp.label.toLowerCase().includes(filterLow);
     const items = grp.prefix.filter(t =>
@@ -1265,9 +1268,26 @@ function _renderWatchlistModal(filter = '') {
         <span class="watchlist-ticker">${escapeHtml(ticker)}</span>
         <span class="watchlist-toggle" title="${active ? 'Remove' : 'Add'} ${escapeHtml(ticker)}"></span>
       </div>`;
+      renderedTickers.add(ticker);
     }
     total += items.length;
   }
+
+  // Show any tickers currently pending that aren't in any ASSET_GROUP
+  const orphanSelected = [...(_pendingWatchlist || [])].filter(t =>
+    !renderedTickers.has(t) && (!filterLow || t.toLowerCase().includes(filterLow))
+  );
+  if (orphanSelected.length) {
+    html += `<div class="watchlist-group-header">Custom / Other</div>`;
+    for (const ticker of orphanSelected.sort()) {
+      html += `<div class="watchlist-asset-row active" data-ticker="${escapeHtml(ticker)}">
+        <span class="watchlist-ticker">${escapeHtml(ticker)}</span>
+        <span class="watchlist-toggle" title="Remove ${escapeHtml(ticker)}"></span>
+      </div>`;
+    }
+    total += orphanSelected.length;
+  }
+
   if (!total) {
     html = `<div class="empty-state" style="padding:40px 0;">No assets match "${escapeHtml(filter)}"</div>`;
   }
@@ -1602,6 +1622,8 @@ function _renderSignalGrid(grid, signals, fromCache) {
     const price     = rawP.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawP < 1 ? 6 : 2 });
     const exchCodes = { US:'[US]',NSE:'[NSE]',LSE:'[LSE]',XETRA:'[XETRA]',TSE:'[TSE]',HKEX:'[HKEX]',ASX:'[ASX]',TSX:'[TSX]',CRYPTO:'[CRYPTO]' };
     const flag      = exchCodes[s.exchange || 'US'] || '[INTL]';
+    const changePct = s.change_pct != null ? Number(s.change_pct) : null;
+    const changeStr = changePct != null ? `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%` : null;
 
     const card = makeEl('div', { cls: `signal-card sig-${sigType}`, attrs: { id: `signal-${asset}` }, style: { animationDelay: (i * 40) + 'ms' } });
 
@@ -1613,7 +1635,9 @@ function _renderSignalGrid(grid, signals, fromCache) {
     assetLine.appendChild(makeEl('span', { cls: 'sig-exch-code', text: flag }));
     if (s.sector) { assetLine.appendChild(document.createTextNode(' ')); assetLine.appendChild(makeEl('span', { cls: 'sig-sector-pill', text: String(s.sector) })); }
     headerLeft.appendChild(assetLine);
-    headerLeft.appendChild(makeEl('div', { cls: 'price', text: price }));
+    const priceRow = makeEl('div', { cls: 'price', text: price });
+    if (changeStr) priceRow.appendChild(makeEl('span', { cls: `sig-change ${changePct >= 0 ? 'positive' : 'negative'}`, text: changeStr }));
+    headerLeft.appendChild(priceRow);
 
     const headerRight = makeEl('div', { style: { display: 'flex', alignItems: 'flex-start', gap: '8px' } });
     headerRight.appendChild(makeEl('span', { cls: `badge ${sigType}`, text: sigType }));
@@ -3027,3 +3051,281 @@ function renderPortOptResult(d, el) {
 
   el.innerHTML = html;
 }
+
+// ══════════════════════════════════════════════════════════════════
+// LAB (PHASE 3) — Event Backtest, Regime Detection, Neutral Strategy,
+//                 Pairs Trading, Pipeline Latency Benchmark
+// ══════════════════════════════════════════════════════════════════
+
+// ── Shared Lab helper: POST with Bearer token + loading state ──
+async function _labPost(endpoint, body, btnId, errId, resultId, loadingMsg) {
+  const btn = document.getElementById(btnId);
+  const errEl = document.getElementById(errId);
+  const resultEl = document.getElementById(resultId);
+  errEl.textContent = '';
+  resultEl.innerHTML = `<div class="empty-state">${loadingMsg}</div>`;
+  setButtonLoading(btn, true, 'Running…');
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    return await res.json();
+  } catch (err) {
+    errEl.textContent = err.message;
+    resultEl.innerHTML = '<div class="empty-state">Request failed. Check the parameters and try again.</div>';
+    return null;
+  } finally {
+    setButtonLoading(btn, false);
+  }
+}
+
+// ── Event-Driven Backtest ──────────────────────────────────────────
+document.getElementById('eb-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    assets: document.getElementById('eb-assets').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+    period: document.getElementById('eb-period').value,
+    strategy_type: document.getElementById('eb-strategy').value,
+    fast_window: +document.getElementById('eb-fast').value,
+    slow_window: +document.getElementById('eb-slow').value,
+    execution_preset: document.getElementById('eb-cost').value,
+    sizing_method: document.getElementById('eb-sizing').value,
+    initial_capital: +document.getElementById('eb-capital').value,
+    allow_short_selling: document.getElementById('eb-short').checked,
+  };
+  const d = await _labPost('/api/research/event-backtest', body, 'eb-submit', 'eb-error', 'eb-result',
+    'Running event-driven backtest with 1-bar delay…');
+  if (!d) return;
+  const resultEl = document.getElementById('eb-result');
+  const retCls = d.total_return >= 0 ? 'up' : 'down';
+  let html = `<div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+    ${metricCard('Total Return', d.total_return, '%', retCls)}
+    ${metricCard('Sharpe (net)', d.sharpe_ratio_net)}
+    ${metricCard('Max Drawdown', d.max_drawdown_net, '%')}
+    ${metricCard('Total Trades', d.total_trades)}
+    ${metricCard('Win Rate', d.win_rate, '%')}
+    ${metricCard('Sortino', d.sortino_ratio)}
+  </div>`;
+  const cb = d.cost_breakdown || {};
+  html += `<h4 style="margin:12px 0 6px;">Transaction Cost Breakdown</h4>
+    <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+      ${metricCard('Commission', '$' + (cb.total_commission || 0).toFixed(2))}
+      ${metricCard('Slippage', '$' + (cb.total_slippage || 0).toFixed(2))}
+      ${metricCard('Spread', '$' + (cb.total_spread || 0).toFixed(2))}
+      ${metricCard('Borrow', '$' + (cb.total_borrow || 0).toFixed(2))}
+      ${metricCard('Total Costs', '$' + (cb.total_costs || 0).toFixed(2))}
+      ${metricCard('Costs % Cap', (cb.costs_pct_of_capital || 0).toFixed(2) + '%')}
+    </div>`;
+  if (d.equity_curve_net && d.equity_curve_net.length > 1) {
+    const curve = d.equity_curve_net;
+    const mn = Math.min(...curve), mx = Math.max(...curve);
+    const bars = curve.map(v => {
+      const h = mx > mn ? Math.round(((v - mn) / (mx - mn)) * 40) + 2 : 20;
+      return `<div style="flex:1;min-width:2px;height:${h}px;background:var(--accent);border-radius:1px 1px 0 0;"></div>`;
+    }).join('');
+    html += `<h4 style="margin:12px 0 6px;">Equity Curve (Net of Costs)</h4>
+      <div style="display:flex;align-items:flex-end;height:50px;gap:1px;padding:4px 0;">${bars}</div>
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-3);"><span>$${curve[0].toLocaleString()}</span><span>$${curve[curve.length-1].toLocaleString()}</span></div>`;
+  }
+  html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">Executed in ${d.execution_time_ms}ms &nbsp;·&nbsp; 1-bar execution delay applied</div>`;
+  resultEl.innerHTML = html;
+});
+
+// ── Market Regime Detection ───────────────────────────────────────
+document.getElementById('regime-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    asset: document.getElementById('regime-asset').value.trim().toUpperCase(),
+    period: document.getElementById('regime-period').value,
+    n_iter: +document.getElementById('regime-iters').value,
+  };
+  const d = await _labPost('/api/research/regime', body, 'regime-submit', 'regime-error', 'regime-result',
+    'Fitting 2-state Gaussian HMM (Baum-Welch EM + Viterbi)…');
+  if (!d) return;
+  const resultEl = document.getElementById('regime-result');
+  const regimeColors = { bull: 'var(--green)', bear: 'var(--red)', neutral: 'var(--amber)' };
+  const curColor = regimeColors[d.current_regime] || 'var(--text-2)';
+  let html = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 16px;background:var(--s1);border-radius:var(--r-md);border-left:3px solid ${curColor};">
+    <div>
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-3);margin-bottom:2px;">Current Regime</div>
+      <div style="font-size:20px;font-weight:700;color:${curColor};text-transform:capitalize;">${d.current_regime || 'Unknown'}</div>
+    </div>
+    <div style="margin-left:auto;text-align:right;">
+      <div style="font-size:10px;color:var(--text-3);">HMM Probability</div>
+      <div style="font-size:16px;font-weight:600;">${d.current_regime_probability != null ? (d.current_regime_probability * 100).toFixed(1) + '%' : '—'}</div>
+    </div>
+  </div>`;
+  if (d.regime_stats && Object.keys(d.regime_stats).length) {
+    html += `<h4 style="margin:0 0 8px;">Per-Regime Performance</h4>
+      <div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">
+        <thead><tr style="border-bottom:1px solid var(--border);">
+          <th style="padding:5px 8px;text-align:left;">Regime</th>
+          <th style="padding:5px 8px;">Ann. Return</th>
+          <th style="padding:5px 8px;">Ann. Vol</th>
+          <th style="padding:5px 8px;">Sharpe</th>
+          <th style="padding:5px 8px;">Days</th>
+        </tr></thead><tbody>`;
+    for (const [name, st] of Object.entries(d.regime_stats)) {
+      const c = regimeColors[name] || 'var(--text-2)';
+      html += `<tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:5px 8px;font-weight:600;color:${c};text-transform:capitalize;">${name}</td>
+        <td style="padding:5px 8px;text-align:center;color:${(st.annual_return || 0) >= 0 ? 'var(--up)' : 'var(--down)'}">${st.annual_return != null ? (st.annual_return * 100).toFixed(2) + '%' : '—'}</td>
+        <td style="padding:5px 8px;text-align:center;">${st.annual_volatility != null ? (st.annual_volatility * 100).toFixed(2) + '%' : '—'}</td>
+        <td style="padding:5px 8px;text-align:center;">${st.sharpe_ratio != null ? st.sharpe_ratio.toFixed(3) : '—'}</td>
+        <td style="padding:5px 8px;text-align:center;">${st.n_days ?? '—'}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+  if (d.transition_matrix) {
+    const states = Object.keys(d.transition_matrix);
+    html += `<h4 style="margin:14px 0 6px;">Transition Matrix</h4>
+      <div style="overflow-x:auto;"><table style="font-size:11px;border-collapse:collapse;">
+        <thead><tr><th style="padding:3px 6px;"></th>${states.map(s => `<th style="padding:3px 8px;text-align:center;text-transform:capitalize;">${s}</th>`).join('')}</tr></thead><tbody>`;
+    for (const from of states) {
+      html += `<tr><td style="padding:3px 6px;font-weight:600;text-transform:capitalize;">${from}</td>`;
+      for (const to of states) {
+        const v = d.transition_matrix[from]?.[to] ?? 0;
+        html += `<td style="padding:3px 8px;text-align:center;">${(v * 100).toFixed(1)}%</td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+  html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">HMM converged in ${d.n_iter_converged ?? '?'} iterations</div>`;
+  resultEl.innerHTML = html;
+});
+
+// ── Market-Neutral Long/Short Strategy ───────────────────────────
+document.getElementById('neutral-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    assets: document.getElementById('neutral-assets').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+    period: document.getElementById('neutral-period').value,
+    signal_type: document.getElementById('neutral-signal').value,
+    n_long: +document.getElementById('neutral-nlong').value,
+    n_short: +document.getElementById('neutral-nshort').value,
+    target_volatility: +document.getElementById('neutral-tvol').value / 100,
+    factor_neutralise: document.getElementById('neutral-fn').checked,
+  };
+  const d = await _labPost('/api/research/neutral-strategy', body, 'neutral-submit', 'neutral-error', 'neutral-result',
+    'Running market-neutral L/S strategy…');
+  if (!d) return;
+  const resultEl = document.getElementById('neutral-result');
+  let html = `<div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+    ${metricCard('L/S Sharpe', d.sharpe_ratio)}
+    ${metricCard('L/S Return', d.total_return, '%', d.total_return >= 0 ? 'up' : 'down')}
+    ${metricCard('Max DD', d.max_drawdown, '%')}
+    ${metricCard('Ann. Vol', d.annualised_volatility, '%')}
+    ${metricCard('Avg Turnover', d.avg_monthly_turnover, '%')}
+    ${metricCard('Beta', d.beta)}
+  </div>`;
+  if (d.factor_neutral && d.factor_neutral.sharpe_ratio != null) {
+    html += `<h4 style="margin:12px 0 6px;">Factor-Neutral Comparison</h4>
+      <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+        ${metricCard('FN Sharpe', d.factor_neutral.sharpe_ratio)}
+        ${metricCard('FN Return', d.factor_neutral.total_return, '%')}
+        ${metricCard('FN Beta', d.factor_neutral.beta)}
+      </div>`;
+  }
+  if (d.top_longs?.length) {
+    html += `<h4 style="margin:12px 0 4px;">Current Longs</h4><div style="font-family:var(--f-mono);font-size:12px;color:var(--green);">${d.top_longs.join(' &nbsp;·&nbsp; ')}</div>`;
+  }
+  if (d.top_shorts?.length) {
+    html += `<h4 style="margin:10px 0 4px;">Current Shorts</h4><div style="font-family:var(--f-mono);font-size:12px;color:var(--red);">${d.top_shorts.join(' &nbsp;·&nbsp; ')}</div>`;
+  }
+  resultEl.innerHTML = html;
+});
+
+// ── Pairs Trading (Statistical Arbitrage) ───────────────────────
+document.getElementById('pairs-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    asset_y: document.getElementById('pairs-y').value.trim().toUpperCase(),
+    asset_x: document.getElementById('pairs-x').value.trim().toUpperCase(),
+    period: document.getElementById('pairs-period').value,
+    entry_z: +document.getElementById('pairs-entry').value,
+    exit_z: +document.getElementById('pairs-exit').value,
+    use_kalman: document.getElementById('pairs-kalman').checked,
+  };
+  const d = await _labPost('/api/research/pairs-trading', body, 'pairs-submit', 'pairs-error', 'pairs-result',
+    'Running cointegration test + Kalman filter…');
+  if (!d) return;
+  const resultEl = document.getElementById('pairs-result');
+  const cointColor = d.cointegrated ? 'var(--green)' : 'var(--red)';
+  let html = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 16px;background:var(--s1);border-radius:var(--r-md);border-left:3px solid ${cointColor};">
+    <div>
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-3);margin-bottom:2px;">Cointegration Test</div>
+      <div style="font-size:16px;font-weight:700;color:${cointColor};">${d.cointegrated ? '✓ Cointegrated' : '✗ Not Cointegrated'}</div>
+    </div>
+    <div style="margin-left:auto;text-align:right;">
+      <div style="font-size:10px;color:var(--text-3);">p-value</div>
+      <div style="font-size:15px;font-weight:600;">${d.p_value != null ? d.p_value.toFixed(4) : '—'}</div>
+    </div>
+  </div>`;
+  html += `<div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+    ${metricCard('Sharpe', d.sharpe_ratio)}
+    ${metricCard('Total Return', d.total_return, '%', d.total_return >= 0 ? 'up' : 'down')}
+    ${metricCard('Max DD', d.max_drawdown, '%')}
+    ${metricCard('ADF Statistic', d.adf_statistic)}
+    ${metricCard('Hedge Ratio', d.hedge_ratio)}
+    ${metricCard('Total Trades', d.total_trades)}
+  </div>`;
+  if (d.current_z_score != null) {
+    const zColor = Math.abs(d.current_z_score) > (d.entry_z || body.entry_z) ? 'var(--amber)' : 'var(--text-2)';
+    html += `<div style="padding:8px 14px;background:var(--s1);border-radius:var(--r-sm);margin-bottom:12px;font-family:var(--f-mono);font-size:12px;">Current Z-score: <span style="font-weight:700;color:${zColor};">${d.current_z_score.toFixed(3)}</span> &nbsp; Entry: ±${body.entry_z} &nbsp; Exit: ±${body.exit_z}</div>`;
+  }
+  resultEl.innerHTML = html;
+});
+
+// ── Pipeline Latency Benchmark ───────────────────────────────────
+document.getElementById('bench-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    assets: document.getElementById('bench-assets').value.split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+    period: document.getElementById('bench-period').value,
+  };
+  const d = await _labPost('/api/research/latency-benchmark', body, 'bench-submit', 'bench-error', 'bench-result',
+    'Profiling all 7 pipeline stages…');
+  if (!d) return;
+  const resultEl = document.getElementById('bench-result');
+  const stages = d.stage_timings || {};
+  const bottleneck = d.bottleneck_stage || '';
+  let html = `<div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
+    ${metricCard('Total Latency', d.total_time_ms, 'ms')}
+    ${metricCard('N Assets', d.n_assets)}
+    ${metricCard('Bottleneck', bottleneck.replace(/_/g, ' ') || '—')}
+  </div>`;
+  if (Object.keys(stages).length) {
+    const maxMs = Math.max(...Object.values(stages));
+    html += `<h4 style="margin:0 0 8px;">Stage Breakdown</h4><div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px;">`;
+    for (const [stage, ms] of Object.entries(stages)) {
+      const barW = maxMs > 0 ? (ms / maxMs * 100).toFixed(1) : 0;
+      const isBot = stage === bottleneck;
+      html += `<div style="display:flex;align-items:center;gap:8px;font-size:12px;">
+        <span style="min-width:130px;color:var(--text-2);font-family:var(--f-mono);font-size:11px;${isBot ? 'font-weight:700;color:var(--amber);' : ''}">${stage.replace(/_/g, ' ')}</span>
+        <div style="flex:1;height:14px;background:var(--s2);border-radius:3px;overflow:hidden;">
+          <div style="width:${barW}%;height:100%;background:${isBot ? 'var(--amber)' : 'var(--accent)'};border-radius:3px;"></div>
+        </div>
+        <span style="min-width:54px;text-align:right;font-family:var(--f-mono);font-size:11px;${isBot ? 'font-weight:700;color:var(--amber);' : ''}">${ms.toFixed(1)}ms</span>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  if (d.scaling && d.scaling.length > 1) {
+    html += `<h4 style="margin:0 0 6px;">Latency Scaling by Asset Count</h4>
+      <div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">
+        <thead><tr style="border-bottom:1px solid var(--border);"><th style="padding:4px 8px;text-align:left;">N Assets</th><th style="padding:4px 8px;">Total (ms)</th></tr></thead><tbody>`;
+    for (const row of d.scaling) {
+      html += `<tr style="border-bottom:1px solid var(--border);"><td style="padding:4px 8px;">${row.n_assets}</td><td style="padding:4px 8px;text-align:center;font-family:var(--f-mono);">${row.time_ms.toFixed(1)}</td></tr>`;
+    }
+    html += '</tbody></table></div>';
+  }
+  resultEl.innerHTML = html;
+});

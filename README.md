@@ -379,6 +379,8 @@ data is explicitly labelled as not survivorship-free or point-in-time validated.
 
 ### Trading Terminal
 
+**Navigation Tabs (9):** Dashboard · Order Desk · Strategies · Research · Lab · Portfolio · Security · Integrations · Open Source
+
 - **Signal Engine** — SBA + RSI-14 + MACD 12/26/9 + 20-day momentum + Bollinger Band Width + AI-generated insight text
 - **Live Prices** — 5s micro-cached `fast_info` prices for any world ticker via Yahoo Finance
 - **Asset Intelligence** — Instrument type · exchange · market open/closed status · fractional & 24/7 flags
@@ -386,6 +388,7 @@ data is explicitly labelled as not survivorship-free or point-in-time validated.
 - **Order Types** — Market / Limit / Stop / Stop-Limit · Day / GTC / IOC · 30s duplicate guard · oversell prevention · dynamic 5% cap
 - **Global Markets** — 9 exchanges: NYSE/NASDAQ, NSE/BSE, LSE, Xetra, TSE, HKEX, ASX, TSX, Crypto — with live market-hours detection
 - **Portfolio Risk** — Mark-to-market positions · unrealised/realised P&L · equity curve · Sharpe · VaR 95/99 · CSV export
+- **Lab (Advanced Tools)** — Event-driven backtest · Market regime detection (HMM) · Market-neutral L/S strategy · Pairs trading (Engle-Granger + Kalman filter) · Pipeline latency benchmark — each with full result rendering in-browser
 - **Enterprise SDK** — Scoped `X-QS-API-KEY` credentials: `read` / `trade` / `admin` · SHA-256 stored hash
 - **Signed Webhooks** — HTTPS-only · HMAC-SHA256 event signatures · Fernet-encrypted secrets at rest
 - **Observability** — Prometheus metrics (HTTP request counts, latency histograms) behind auth guard
@@ -432,6 +435,8 @@ quantumsentinel-web/
 │       ├── report_generator.py          ← 7-section structured JSON research report
 │       ├── cpp_ext.py                   ← C++ kernel wrapper + NumPy fallback (auto-selects)
 │       ├── latency_bench.py             ← p50/p95/p99/p99.9 pipeline profiler + C++ speedup
+│       ├── event_simulator.py           ← Event-driven backtest with 1-bar delay · realistic fills
+│       ├── redis_store.py               ← Redis session/nonce/kill-switch helper (optional fallback)
 │       │
 │       │   ── Market Microstructure ────────────────────────────────────
 │       ├── market_microstructure.py      ← L2 order-book analytics · OBI · microprice · spread
@@ -449,20 +454,23 @@ quantumsentinel-web/
 │   └── target-platform extension built in CI/Docker (not committed)
 │
 ├── frontend/                            ← Vanilla JS SPA (zero build step)
-│   ├── index.html                       ← App shell · 7-tab navigation · all forms
-│   ├── app.js                           ← ~2100-line SPA: auth · trading · portfolio · WS
+│   ├── index.html                       ← App shell · 9-tab navigation · all forms
+│   ├── app.js                           ← ~3300-line SPA: auth · trading · portfolio · research · lab · WS
 │   ├── bg3d.js                          ← Three.js 3D particle background engine
 │   ├── styles.css                       ← Glassmorphism · micro-animations · mobile-first
-│   └── favicon.ico                      ← Quantum diamond icon
+│   ├── robots.txt                       ← Search engine crawl policy
+│   ├── favicon.ico                      ← Quantum diamond icon (ICO format)
+│   └── favicon.png                      ← Quantum diamond icon (PNG format)
 │
 ├── tests/                               ← Pytest suite validated by CI
-│   ├── test_auth.py                     ← Authentication & PQC handshake
-│   ├── test_trading.py                  ← Order lifecycle & fills
-│   ├── test_portfolio.py                ← Risk metrics
-│   ├── test_backtest.py                 ← Execution engine & cost models
-│   ├── test_research.py                 ← Walk-forward · alpha · factor model
-│   ├── test_phase3.py                   ← Stat tests · regime detection · pairs trading
+│   ├── test_core.py                     ← Auth · trading · portfolio · signal engine · core routes
+│   ├── test_research_engine.py          ← Backtest engine · execution cost model · walk-forward
+│   ├── test_phase2.py                   ← Alpha research · IC/Rank IC · decay · quintile returns
+│   ├── test_phase3.py                   ← Stat tests · regime detection · pairs trading · optimisation
 │   ├── test_phase4.py                   ← C++ kernels · p50/p99 latency · report generator
+│   ├── test_order_security.py           ← Canonical order · nonce/idempotency · risk gate · kill-switch
+│   ├── test_research_governance.py      ← Experiment metadata · data lineage · reproducibility
+│   ├── test_security_hardening.py       ← PQC handshake · audit chain · key rotation · CSRF
 │   ├── test_microstructure.py           ← L2 analytics · OBI · microprice · synthetic L2 replay
 │   ├── test_paper_exchange.py           ← Order book · matching engine · paper exchange · FIFO
 │   ├── test_execution_analytics.py      ← Implementation shortfall · capacity · latency model

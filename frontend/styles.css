@@ -37,6 +37,14 @@
   --amber:     #B06E00;
   --amber-lo:  rgba(176, 110, 0, 0.07);
 
+  /* Aliases used in inline result renderers */
+  --up:        #0D7A52;   /* same as --green */
+  --down:      #C0272D;   /* same as --red */
+  --border:    #D8DCE6;   /* same as --b1 */
+  --surface-2: #EFF1F5;   /* same as --s2 */
+  --text-1:    #0B0F1A;   /* same as --text */
+  --text-4:    #B0B8CC;   /* lighter muted text */
+
   /* Shadows */
   --sh-xs: 0 1px 3px rgba(11, 15, 26, .06);
   --sh-sm: 0 2px 10px rgba(11, 15, 26, .08);
@@ -513,27 +521,45 @@ h3 { font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spaci
 .trading-grid, .portfolio-grid, .security-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 @media (max-width: 900px) { .trading-grid, .portfolio-grid, .security-grid { grid-template-columns: 1fr; } }
 
-/* Forms */
-#order-form label, #strategy-form label, #api-key-form label, #webhook-form label { display: block; font-family: var(--f-ui); font-size: 10.5px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; color: var(--text-3); margin-bottom: 14px; flex: 1; }
-#order-form input, #order-form select, #strategy-form input, #strategy-form select,
-#api-key-form input, #api-key-form select, #webhook-form input, #webhook-form select {
+/* Forms — shared across Order Desk, Strategies, Research, Lab, API/Webhook forms */
+.card form label {
+  display: block; font-family: var(--f-ui); font-size: 10.5px; font-weight: 700;
+  letter-spacing: .8px; text-transform: uppercase; color: var(--text-3);
+  margin-bottom: 14px; flex: 1;
+}
+.card form input,
+.card form select {
   display: block; width: 100%; margin-top: 6px; padding: 9px 12px;
   background: var(--s1); border: 1.5px solid var(--b1); border-radius: var(--r-sm);
   color: var(--text); font-family: var(--f-mono); font-size: 12.5px;
   font-variant-numeric: tabular-nums; transition: border-color .14s, box-shadow .14s;
   appearance: none; -webkit-appearance: none;
 }
+.card form select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237A8599' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 12px center; padding-right: 32px;
+  background-color: var(--s1);
+}
+.card form input:focus,
+.card form select:focus {
+  outline: none; border-color: var(--b-focus); box-shadow: var(--sh-focus); background: var(--bg);
+}
+.card form input::placeholder { color: var(--text-3); }
+.card form input:invalid:not(:placeholder-shown) { border-color: var(--red); }
+
+/* Row / form-row: flex two-column layouts inside forms */
+.card form .row,
+.card form .form-row,
+.row, .form-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.card form .row > label,
+.card form .form-row > label { flex: 1; min-width: 120px; }
+
+/* Legacy scoped selectors — kept for specificity safety */
 #order-form select, #strategy-form select, #api-key-form select, #webhook-form select {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237A8599' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat; background-position: right 12px center; padding-right: 32px;
   background-color: var(--s1);
 }
-#order-form input:focus, #order-form select:focus, #strategy-form input:focus, #strategy-form select:focus,
-#api-key-form input:focus, #api-key-form select:focus, #webhook-form input:focus, #webhook-form select:focus {
-  outline: none; border-color: var(--b-focus); box-shadow: var(--sh-focus); background: var(--bg);
-}
-#order-form input::placeholder, #strategy-form input::placeholder, #webhook-form input::placeholder { color: var(--text-3); }
-#order-form .row, #strategy-form .row { display: flex; gap: 10px; }
 #order-price-preview { font-family: var(--f-mono); font-size: 11px; color: var(--text-2); background: var(--s1); border: 1px solid var(--b1); border-left: 3px solid var(--accent); border-radius: var(--r-sm); padding: 8px 13px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
 #order-price-preview .price-val { font-size: 16px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
 #order-filter { margin-bottom: 12px; }

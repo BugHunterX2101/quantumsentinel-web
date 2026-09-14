@@ -153,7 +153,7 @@
       <div class="auth-footnote">
         Each session is established via hybrid <b>X25519 + ML-KEM-768</b> key exchange with an
         <b>ML-DSA-65</b> signed, tamper-evident audit trail &mdash; FIPS 203 / FIPS 204 compliant.
-        Use keys <kbd>1</kbd>&ndash;<kbd>7</kbd> to navigate between modules.
+        Use keys <kbd>1</kbd>&ndash;<kbd>9</kbd> to navigate between modules.
       </div>
     </div>
   </div>
@@ -572,7 +572,7 @@
           <p class="hint" data-beginner>Processes bars chronologically with 1-bar execution delay — eliminating look-ahead bias. Includes bid/ask spread, commission, slippage, and short-selling borrow costs.</p>
           <form id="eb-form">
             <label>Assets (comma-separated)
-              <input id="eb-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM" maxlength="200">
+              <input id="eb-assets" value="AAPL,MSFT,GOOGL,NVDA,JPM" maxlength="200" required>
             </label>
             <div class="form-row">
               <label>Period
@@ -619,7 +619,7 @@
             </label>
             <label class="checkbox-item"><input id="eb-short" type="checkbox"><span class="checkbox-box"></span>Allow Short Selling</label>
             <div id="eb-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
-            <button type="submit" class="btn-primary" style="margin-top:10px;width:100%;">Run Event Backtest</button>
+            <button type="submit" class="btn-primary ripple-btn" id="eb-submit" style="margin-top:10px;width:100%;"><span class="btn-label">Run Event Backtest</span></button>
           </form>
           <div id="eb-result" class="empty-state" style="margin-top:14px;">Configure and run to see realistic P&amp;L, Sharpe, drawdown, and transaction cost breakdown.</div>
         </div>
@@ -630,7 +630,7 @@
           <p class="hint" data-beginner>Detects bull/bear regimes using a 2-state Gaussian HMM (Baum-Welch EM + Viterbi decoding), rolling volatility percentiles, and SMA crossover trend classifier.</p>
           <form id="regime-form">
             <label>Asset
-              <input id="regime-asset" value="SPY" maxlength="10">
+              <input id="regime-asset" value="SPY" maxlength="10" required>
             </label>
             <div class="form-row">
               <label>Period
@@ -646,7 +646,7 @@
               </label>
             </div>
             <div id="regime-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
-            <button type="submit" class="btn-primary" style="margin-top:10px;width:100%;">Detect Regimes</button>
+            <button type="submit" class="btn-primary ripple-btn" id="regime-submit" style="margin-top:10px;width:100%;"><span class="btn-label">Detect Regimes</span></button>
           </form>
           <div id="regime-result" class="empty-state" style="margin-top:14px;">Run to see current regime, HMM transition matrix, volatility states, and per-regime performance statistics.</div>
         </div>
@@ -689,7 +689,7 @@
             </div>
             <label class="checkbox-item"><input id="neutral-fn" type="checkbox"><span class="checkbox-box"></span>Factor Neutralise (remove market beta)</label>
             <div id="neutral-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
-            <button type="submit" class="btn-primary" style="margin-top:10px;width:100%;">Run Neutral Strategy</button>
+            <button type="submit" class="btn-primary ripple-btn" id="neutral-submit" style="margin-top:10px;width:100%;"><span class="btn-label">Run Neutral Strategy</span></button>
           </form>
           <div id="neutral-result" class="empty-state" style="margin-top:14px;">Run to see dollar-neutral Sharpe, drawdown, turnover, and optional factor-neutral comparison.</div>
         </div>
@@ -724,7 +724,7 @@
             </div>
             <label class="checkbox-item"><input id="pairs-kalman" type="checkbox" checked><span class="checkbox-box"></span>Kalman Filter Hedge Ratio (adaptive)</label>
             <div id="pairs-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
-            <button type="submit" class="btn-primary" style="margin-top:10px;width:100%;">Analyse Pair</button>
+            <button type="submit" class="btn-primary ripple-btn" id="pairs-submit" style="margin-top:10px;width:100%;"><span class="btn-label">Analyse Pair</span></button>
           </form>
           <div id="pairs-result" class="empty-state" style="margin-top:14px;">Run to see cointegration test, ADF statistic, hedge ratio, Z-spread history, and strategy Sharpe.</div>
         </div>
@@ -747,7 +747,7 @@
               </label>
             </div>
             <div id="bench-error" style="color:var(--down);font-size:12px;margin-top:4px;"></div>
-            <button type="submit" class="btn-primary" style="margin-top:10px;">Run Benchmark</button>
+            <button type="submit" class="btn-primary ripple-btn" id="bench-submit" style="margin-top:10px;"><span class="btn-label">Run Benchmark</span></button>
           </form>
           <div id="bench-result" class="empty-state" style="margin-top:14px;">Run to profile all pipeline stages, identify the bottleneck, and see latency scaling by asset count.</div>
         </div>

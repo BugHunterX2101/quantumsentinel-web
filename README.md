@@ -803,17 +803,7 @@ docker compose up --build -d && curl http://localhost:8000/health/ready
 
 ---
 
-## Development Roadmap
 
-| Phase | Status | Key Deliverables |
-|---|---|---|
-| **Phase 1** — Research Engine | Complete | Event-driven backtest · execution simulator · commission/spread/slippage/borrow/leverage |
-| **Phase 2** — Walk-Forward & Alpha | Complete | Rolling/expanding WF · IC/Rank IC/ICIR · decay analysis · quintile returns · signal turnover |
-| **Phase 3** — Factor & Statistics | Complete | Fama-MacBeth · DSR · ADF/cointegration · pairs trading · portfolio optimisation |
-| **Phase 4** — Performance & Reporting | Complete | C++ kernels (pybind11) · p50/p99 latency profiler · 7-section JSON report generator |
-| **Phase 5** — Market Microstructure | Complete | L2 order-book analytics · queue-aware paper exchange · matching engine · latency model · execution analytics · experiment registry with ML-DSA signed manifests |
-
----
 
 ## Contributing
 

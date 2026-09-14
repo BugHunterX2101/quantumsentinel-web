@@ -265,6 +265,29 @@ document.querySelectorAll('.auth-tab').forEach((btn) => {
 });
 
 // ===========================================================================
+// Password eye-toggle (login + register)
+// ===========================================================================
+(function initPasswordEye() {
+  const EYE_OPEN  = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>';
+  const EYE_SLASH = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>' +
+    '<path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>' +
+    '<line x1="1" y1="1" x2="23" y2="23"/>';
+  [['login-password','login-pw-eye'],['register-password','register-pw-eye']].forEach(([inputId, btnId]) => {
+    const input = document.getElementById(inputId);
+    const btn   = document.getElementById(btnId);
+    if (!input || !btn) return;
+    const icon = btn.querySelector('svg');
+    let visible = false;
+    btn.addEventListener('click', () => {
+      visible = !visible;
+      input.type = visible ? 'text' : 'password';
+      icon.innerHTML = visible ? EYE_SLASH : EYE_OPEN;
+      btn.setAttribute('aria-label', visible ? 'Hide password' : 'Show password');
+    });
+  });
+}());
+
+// ===========================================================================
 // Password strength meter (register form)
 // ===========================================================================
 (function initPasswordStrength() {
@@ -1213,7 +1236,7 @@ _searchInput.addEventListener('focus', () => {
 
 // Refresh market status strip every 60s
 setInterval(() => {
-  if (state.token && state.activeView === 'dashboard') loadExchanges();
+  if (state.user && state.activeView === 'dashboard') loadExchanges();
 }, 60000);
 
 // ===========================================================================
@@ -1395,8 +1418,8 @@ window.addEventListener('load', () => {
     };
     tryInit();
   }
-  // If already logged in (token persisted), start app canvas immediately
-  if (state.token) {
+  // If already logged in (user in state), start app canvas immediately
+  if (state.user) {
     const appCanvas = document.getElementById('app-bg-canvas');
     if (appCanvas) {
       authCanvas?.style && (authCanvas.style.display = 'none');
@@ -1411,14 +1434,11 @@ window.addEventListener('load', () => {
 });
 
 function connectSignalStream() {
-
-  if (!state.token || state.signalSocket) return;
+  // Auth: backend reads the HttpOnly qs_access cookie automatically via its
+  // cookie-fallback path (line 720-722 in main.py). No token in subprotocol.
+  if (!state.user || state.signalSocket) return;
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // URL-encode the JWT to prevent header parse failures on tokens with
-  // special characters ('+', '/', '=') that are not valid in WS subprotocol values.
-  // The server decodes it identically since it only calls decode_access_token().
-  const safeToken = encodeURIComponent(state.token);
-  const socket = new WebSocket(`${scheme}//${location.host}/api/signals/stream`, ['qs', safeToken]);
+  const socket = new WebSocket(`${scheme}//${location.host}/api/signals/stream`, ['qs']);
   state.signalSocket = socket;
   setLiveIndicator('reconnecting');
   socket.onopen = () => { state.signalReconnectMs = 1000; setLiveIndicator('connected'); };
@@ -1440,7 +1460,7 @@ function connectSignalStream() {
     state.signalSocket = null;
     const delay = state.signalReconnectMs;
     state.signalReconnectMs = Math.min(30000, delay * 2);
-    if (state.token) {
+    if (state.user) {
       setLiveIndicator('reconnecting');
       setTimeout(connectSignalStream, delay);
     } else {
@@ -1539,7 +1559,7 @@ function startRefreshCountdown() {
     if (remaining <= 0) {
       remaining = SIGNAL_REFRESH_INTERVAL;
       countdownEl.textContent = 'Refreshing…';
-      if (state.activeView === 'dashboard' && state.token) {
+      if (state.activeView === 'dashboard' && state.user) {
         loadDashboard(true);
       }
     } else {
@@ -2030,8 +2050,10 @@ document.getElementById('portfolio-export').addEventListener('click', async () =
   const btn = document.getElementById('portfolio-export');
   setButtonLoading(btn, true, 'Generating…');
   try {
+    // Use credentials:'include' so the HttpOnly cookie is sent automatically.
     const response = await fetch('/api/portfolio/export', {
-      headers: { Authorization: 'Bearer ' + state.token },
+      credentials: 'include',
+      headers: state.csrfToken ? { 'X-CSRF-Token': state.csrfToken } : {},
     });
     if (!response.ok) throw new Error('Export could not be generated');
     const url = URL.createObjectURL(await response.blob());
@@ -2294,32 +2316,37 @@ async function loadCommunity() {
 }
 
 // ===========================================================================
-// Resume session on page load
+// Resume session on page load — uses HttpOnly cookie via /api/auth/refresh
 // ===========================================================================
 (async function init() {
-  if (state.token && state.user) {
-    // Hide the auth screen immediately — show app shell while handshake runs
-    document.getElementById('auth-screen').classList.add('hidden');
-    document.getElementById('app').classList.remove('hidden');
-    document.getElementById('user-email').textContent = state.user.email;
-    try {
+  // Try to silently restore session using the refresh cookie (HttpOnly).
+  // state.token is always null; authentication is cookie-based.
+  try {
+    const refreshData = await fetch('/api/auth/refresh', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+    }).then(r => r.ok ? r.json() : null);
+    if (refreshData && refreshData.csrf_token && refreshData.user) {
+      state.csrfToken = refreshData.csrf_token;
+      state.user = refreshData.user;
+      scheduleTokenExpiry(refreshData.expires_in || 900);
+      // Hide auth, show app shell immediately
+      document.getElementById('auth-screen').classList.add('hidden');
+      // Switch 3D canvas
+      const authCanvas = document.getElementById('auth-bg-canvas');
+      const appCanvas  = document.getElementById('app-bg-canvas');
+      if (authCanvas) authCanvas.style.display = 'none';
+      if (appCanvas)  { appCanvas.style.display = ''; setTimeout(() => window.QS3D?.init('app-bg-canvas', 'dashboard'), 100); }
+      document.getElementById('app').classList.remove('hidden');
+      document.getElementById('user-email').textContent = state.user.email;
       await performHandshake({ showOverlay: false });
       await bootstrapApp();
-      // Compute actual remaining token lifetime from stored login timestamp
-      const loginAt = parseInt(localStorage.getItem('qs_login_at') || '0', 10);
-      const expiresIn = parseInt(localStorage.getItem('qs_expires_in') || '900', 10);
-      const elapsedSeconds = Math.floor((Date.now() - loginAt) / 1000);
-      // Minimum 30s remaining to avoid immediate expiry warning on fresh restores
-      const remainingSeconds = Math.max(30, expiresIn - elapsedSeconds);
-      scheduleTokenExpiry(remainingSeconds);
-    } catch (e) {
-      console.error('Session restore failed:', e);
-      localStorage.removeItem('qs_token');
-      localStorage.removeItem('qs_user');
-      location.reload();
+      // scheduleTokenExpiry already called above with refreshData.expires_in
     }
+  } catch (_) {
+    // No valid session cookie — stay on auth screen
   }
-})();
+}());
 
 // ══════════════════════════════════════════════════════════════════
 // RESEARCH ENGINE — Advanced backtest, walk-forward, stat tests
@@ -2329,8 +2356,20 @@ let _lastBacktestReturns = null;
 
 // ── Helper: metric card ──
 function metricCard(label, value, unit='', cls='') {
-  const vStr = typeof value === 'number' ? (Math.abs(value) < 1 && unit === '%' ? (value * 100).toFixed(2) + '%' : value.toFixed(3)) : value;
-  return `<div class="metric-card ${cls}"><div class="metric-label">${label}</div><div class="metric-value">${vStr}${unit && typeof value !== 'string' && Math.abs(value) >= 1 ? unit : ''}</div></div>`;
+  let vStr;
+  if (typeof value === 'number') {
+    // Auto-convert decimal fractions to percentage when unit='%' (backend returns 0.123 for 12.3%)
+    if (unit === '%' && Math.abs(value) <= 1 && value !== 0) {
+      vStr = (value * 100).toFixed(2) + '%';
+    } else if (Number.isInteger(value)) {
+      vStr = String(value) + (unit || '');
+    } else {
+      vStr = value.toFixed(3) + (unit || '');
+    }
+  } else {
+    vStr = (value == null || value === undefined) ? '—' : String(value);
+  }
+  return `<div class="metric-card ${cls}"><div class="metric-label">${label}</div><div class="metric-value">${vStr}</div></div>`;
 }
 
 function signalBadge(ok, label) {
@@ -2360,13 +2399,10 @@ document.getElementById('research-backtest-form').addEventListener('submit', asy
   };
 
   try {
-    const res = await fetch('/api/research/backtest', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
-    const d = await res.json();
-    _lastBacktestReturns = d.equity_curve_net ? d.equity_curve_net.map((v, i, a) => i > 0 && a[i-1] ? (v - a[i-1]) / a[i-1] : 0).slice(1) : null;
+    const d = await api('/api/research/backtest', { method: 'POST', body: JSON.stringify(body) });
+    _lastBacktestReturns = d.equity_curve_net
+      ? d.equity_curve_net.map((v, i, a) => i > 0 && a[i-1] ? (v - a[i-1]) / a[i-1] : 0).slice(1)
+      : null;
     renderBacktestResult(d, resultEl);
   } catch (err) {
     errEl.textContent = err.message;
@@ -2438,24 +2474,28 @@ document.getElementById('research-wf-form').addEventListener('submit', async (e)
   const errEl = document.getElementById('wf-error');
   const resultEl = document.getElementById('research-wf-result');
   errEl.textContent = '';
-  resultEl.innerHTML = '<div class="empty-state">Running walk-forward validation (this may take 30-60s)…</div>';
+
+  const totalYears = +document.getElementById('wf-total').value;
+  const trainYears = +document.getElementById('wf-train').value;
+  const testYears  = +document.getElementById('wf-test').value;
+  // Client-side guard: train + test must not exceed total
+  if (trainYears + testYears > totalYears) {
+    errEl.textContent = `Train (${trainYears}y) + Test (${testYears}y) = ${trainYears+testYears}y exceeds Total (${totalYears}y). Reduce train/test windows or increase total years.`;
+    return;
+  }
+  if (trainYears < 1 || testYears < 1) { errEl.textContent = 'Train and test windows must each be at least 1 year.'; return; }
+
+  resultEl.innerHTML = '<div class="empty-state">Running walk-forward validation (this may take 30–60s)…</div>';
 
   const body = {
     assets: [document.getElementById('wf-asset').value.trim().toUpperCase()],
     window_type: document.getElementById('wf-type').value,
-    total_years: +document.getElementById('wf-total').value,
-    train_years: +document.getElementById('wf-train').value,
-    test_years: +document.getElementById('wf-test').value,
+    total_years: totalYears, train_years: trainYears, test_years: testYears,
     optimize_parameters: document.getElementById('wf-optimize').checked,
   };
 
   try {
-    const res = await fetch('/api/research/walk-forward', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
-    const d = await res.json();
+    const d = await api('/api/research/walk-forward', { method: 'POST', body: JSON.stringify(body) });
     renderWalkForwardResult(d, resultEl);
   } catch (err) {
     errEl.textContent = err.message;
@@ -2552,12 +2592,7 @@ document.getElementById('research-stat-form').addEventListener('submit', async (
   };
 
   try {
-    const res = await fetch('/api/research/stat-test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
-    const d = await res.json();
+    const d = await api('/api/research/stat-test', { method: 'POST', body: JSON.stringify(body) });
     renderStatResult(d, resultEl);
   } catch (err) {
     errEl.textContent = err.message;
@@ -2658,12 +2693,7 @@ document.getElementById('alpha-research-form').addEventListener('submit', async 
   };
 
   try {
-    const res = await fetch('/api/research/alpha', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
-    renderAlphaResult(await res.json(), resultEl);
+    renderAlphaResult(await api('/api/research/alpha', { method: 'POST', body: JSON.stringify(body) }), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Alpha research failed.</div>';
@@ -2772,12 +2802,7 @@ document.getElementById('factor-model-form').addEventListener('submit', async (e
   };
 
   try {
-    const res = await fetch('/api/research/factor-model', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
-    renderFactorModelResult(await res.json(), resultEl);
+    renderFactorModelResult(await api('/api/research/factor-model', { method: 'POST', body: JSON.stringify(body) }), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Factor model failed.</div>';
@@ -2850,12 +2875,7 @@ document.getElementById('correlation-form').addEventListener('submit', async (e)
   };
 
   try {
-    const res = await fetch('/api/research/correlation', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
-    renderCorrelationResult(await res.json(), resultEl);
+    renderCorrelationResult(await api('/api/research/correlation', { method: 'POST', body: JSON.stringify(body) }), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Correlation analysis failed.</div>';
@@ -2955,12 +2975,7 @@ document.getElementById('portopt-form').addEventListener('submit', async (e) => 
   };
 
   try {
-    const res = await fetch('/api/research/optimize', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
-    renderPortOptResult(await res.json(), resultEl);
+    renderPortOptResult(await api('/api/research/optimize', { method: 'POST', body: JSON.stringify(body) }), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Optimisation failed.</div>';
@@ -3057,7 +3072,7 @@ function renderPortOptResult(d, el) {
 //                 Pairs Trading, Pipeline Latency Benchmark
 // ══════════════════════════════════════════════════════════════════
 
-// ── Shared Lab helper: POST with Bearer token + loading state ──
+// ── Shared Lab helper: POST via api() helper (cookie auth + CSRF) ──
 async function _labPost(endpoint, body, btnId, errId, resultId, loadingMsg) {
   const btn = document.getElementById(btnId);
   const errEl = document.getElementById(errId);
@@ -3066,16 +3081,7 @@ async function _labPost(endpoint, body, btnId, errId, resultId, loadingMsg) {
   resultEl.innerHTML = `<div class="empty-state">${loadingMsg}</div>`;
   setButtonLoading(btn, true, 'Running…');
   try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}` },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || res.statusText);
-    }
-    return await res.json();
+    return await api(endpoint, { method: 'POST', body: JSON.stringify(body) });
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Request failed. Check the parameters and try again.</div>';

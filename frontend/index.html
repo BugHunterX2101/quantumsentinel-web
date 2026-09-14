@@ -117,15 +117,33 @@
       <div class="auth-form-wrap">
         <form id="login-form" class="auth-form">
           <label>Email Address<input type="email" id="login-email" required placeholder="you@institution.com" autocomplete="email"></label>
-          <label>Password<input type="password" id="login-password" required placeholder="Your secure password" autocomplete="current-password"></label>
+          <label>Password
+            <div class="pw-field-wrap">
+              <input type="password" id="login-password" required placeholder="Your secure password" autocomplete="current-password">
+              <button type="button" class="pw-eye-btn" id="login-pw-eye" aria-label="Toggle password visibility" tabindex="-1">
+                <svg viewBox="0 0 24 24" id="login-pw-eye-icon">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              </button>
+            </div>
+          </label>
           <button type="submit" class="btn-primary ripple-btn"><span class="btn-label">Sign In &amp; Establish PQC Session</span></button>
           <div class="auth-error" id="login-error"></div>
         </form>
         <form id="register-form" class="auth-form hidden">
           <label>Email Address<input type="email" id="register-email" required placeholder="you@institution.com" autocomplete="email"></label>
           <label>Password
-            <input type="password" id="register-password" required minlength="14" maxlength="128"
-                   placeholder="14+ chars, mixed case, digit &amp; symbol" autocomplete="new-password">
+            <div class="pw-field-wrap">
+              <input type="password" id="register-password" required minlength="14" maxlength="128"
+                     placeholder="14+ chars, mixed case, digit &amp; symbol" autocomplete="new-password">
+              <button type="button" class="pw-eye-btn" id="register-pw-eye" aria-label="Toggle password visibility" tabindex="-1">
+                <svg viewBox="0 0 24 24" id="register-pw-eye-icon">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              </button>
+            </div>
           </label>
           <!-- Password strength meter -->
           <div class="pw-strength-wrap">

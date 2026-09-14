@@ -44,6 +44,9 @@
   --surface-2: #EFF1F5;   /* same as --s2 */
   --text-1:    #0B0F1A;   /* same as --text */
   --text-4:    #B0B8CC;   /* lighter muted text */
+  /* Signal badge backgrounds */
+  --up-bg:     rgba(13, 122, 82, 0.12);  /* positive signal badge bg */
+  --down-bg:   rgba(192, 39, 45, 0.10);  /* negative signal badge bg */
 
   /* Shadows */
   --sh-xs: 0 1px 3px rgba(11, 15, 26, .06);
@@ -257,6 +260,19 @@ a:hover { color: var(--accent-hi); text-decoration: underline; }
 }
 .auth-form input:focus { outline: none; border-color: var(--b-focus); box-shadow: var(--sh-focus); }
 .auth-form input::placeholder { color: var(--text-3); }
+/* ── Password eye-toggle ─────────────────────────────────────────── */
+.pw-field-wrap { position: relative; display: block; }
+.pw-field-wrap input { padding-right: 42px !important; }
+.pw-eye-btn {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; cursor: pointer; color: var(--text-3);
+  padding: 4px; border-radius: 4px; display: flex; align-items: center;
+  justify-content: center; transition: color .14s;
+  line-height: 1;
+}
+.pw-eye-btn:hover { color: var(--accent); }
+.pw-eye-btn svg { width: 18px; height: 18px; stroke: currentColor; fill: none;
+  stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .auth-error { color: var(--red); font-family: var(--f-ui); font-size: 11.5px; margin-top: 8px; min-height: 16px; animation: fadeIn .2s ease; }
 .auth-footnote {
   margin-top: 22px; font-family: var(--f-ui); font-size: 11px; color: var(--text-3);

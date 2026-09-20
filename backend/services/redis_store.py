@@ -13,6 +13,7 @@ stores when Redis is not configured (development mode).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -21,6 +22,41 @@ from threading import Lock
 from typing import Any
 
 _log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Cross-loop bridge for synchronous (threadpool) routes
+# ---------------------------------------------------------------------------
+# `redis.asyncio` connections are bound to the event loop that created them.
+# Spinning up a throwaway `asyncio.new_event_loop()` per request — as earlier
+# revisions did — leaves pooled connections attached to a loop that is then
+# closed, so every subsequent Redis call raises "Event loop is closed" or
+# "attached to a different loop". Instead, sync routes submit their coroutine
+# to the single application loop captured at startup.
+_app_loop: asyncio.AbstractEventLoop | None = None
+
+
+def set_app_loop(loop: asyncio.AbstractEventLoop | None) -> None:
+    """Record the application's running event loop (called from the lifespan)."""
+    global _app_loop
+    _app_loop = loop
+
+
+def run_sync(coro, timeout: float = 2.0):
+    """Run a Redis coroutine from a synchronous route and return its result.
+
+    Returns None (and closes the coroutine) if no application loop is
+    available or the call fails/times out — Redis caching is an optimisation
+    here, never the source of truth, so a failure must not break the request.
+    """
+    loop = _app_loop
+    if loop is None or loop.is_closed():
+        coro.close()
+        return None
+    try:
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+    except Exception as exc:  # noqa: BLE001 - best-effort cache path
+        _log.warning("Redis operation failed from sync context: %s", exc)
+        return None
 
 # In-memory fallback stores for development (single process)
 _mem_lock = Lock()
@@ -54,7 +90,7 @@ async def set_nx_ex(redis_client, key: str, ttl: int = 300) -> bool:
         except Exception as exc:
             _log.warning("Redis SET NX failed for %s: %s", key, exc)
             # In production we must not silently fall through
-            from .config import ENVIRONMENT
+            from ..config import ENVIRONMENT
             if ENVIRONMENT == "production":
                 raise
     # In-memory fallback for dev
@@ -74,7 +110,7 @@ async def exists(redis_client, key: str) -> bool:
             return bool(await redis_client.exists(key))
         except Exception as exc:
             _log.warning("Redis EXISTS failed for %s: %s", key, exc)
-            from .config import ENVIRONMENT
+            from ..config import ENVIRONMENT
             if ENVIRONMENT == "production":
                 raise
     with _mem_lock:
@@ -93,7 +129,7 @@ async def set_key(redis_client, key: str, value: str = "1", ttl: int | None = No
             return
         except Exception as exc:
             _log.warning("Redis SET failed for %s: %s", key, exc)
-            from .config import ENVIRONMENT
+            from ..config import ENVIRONMENT
             if ENVIRONMENT == "production":
                 raise
     with _mem_lock:
@@ -108,7 +144,7 @@ async def get_key(redis_client, key: str) -> str | None:
             return await redis_client.get(key)
         except Exception as exc:
             _log.warning("Redis GET failed for %s: %s", key, exc)
-            from .config import ENVIRONMENT
+            from ..config import ENVIRONMENT
             if ENVIRONMENT == "production":
                 raise
     with _mem_lock:

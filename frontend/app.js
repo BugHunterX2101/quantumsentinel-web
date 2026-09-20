@@ -638,13 +638,18 @@ function switchView(view) {
 
 function restartPolling() {
   if (state.pollTimer) clearInterval(state.pollTimer);
+  // Dashboard is deliberately excluded here — its refresh cadence is owned
+  // by startRefreshCountdown() (the "Next refresh in Ns" ticker), which
+  // already re-fetches on the dashboard's own 30s cycle. Having both this
+  // interval AND that ticker call loadDashboard(true) independently double
+  // polled /api/signals/latest at out-of-phase offsets (~every 15s instead
+  // of 30s) on top of whatever the live WebSocket stream was already
+  // pushing — pure wasted latency/bandwidth for data that wasn't stale.
   // community tab fetches from GitHub API — exclude from polling to avoid rate-limits
-  const loaders = { dashboard: () => loadDashboard(true), trading: () => refreshOrders(true), strategies: loadStrategies, portfolio: () => loadPortfolio(true), security: () => loadSecurity(true), integrations: loadIntegrations };
+  const loaders = { trading: () => refreshOrders(true), strategies: loadStrategies, portfolio: () => loadPortfolio(true), security: () => loadSecurity(true), integrations: loadIntegrations };
   const fn = loaders[state.activeView];
   if (!fn) return;
-  // Poll every 30s on dashboard (aligns with backend CACHE_TTL_SECONDS=30), 20s elsewhere
-  const interval = state.activeView === 'dashboard' ? 30000 : 20000;
-  state.pollTimer = setInterval(() => fn(true), interval);
+  state.pollTimer = setInterval(() => fn(true), 20000);
 }
 
 function applyBeginnerMode() {
@@ -1564,9 +1569,17 @@ function startRefreshCountdown() {
     remaining--;
     if (remaining <= 0) {
       remaining = SIGNAL_REFRESH_INTERVAL;
-      countdownEl.textContent = 'Refreshing…';
-      if (state.activeView === 'dashboard' && state.user) {
+      // Skip the REST re-fetch while the WebSocket stream is actually
+      // connected — it already pushes fresh signals on this same cadence,
+      // so polling too would fetch data that's already been delivered.
+      // The countdown still resets/redisplays either way so it keeps
+      // reading as a live "signals refresh" indicator.
+      const wsLive = state.signalSocket && state.signalSocket.readyState === WebSocket.OPEN;
+      if (state.activeView === 'dashboard' && state.user && !wsLive) {
+        countdownEl.textContent = 'Refreshing…';
         loadDashboard(true);
+      } else {
+        countdownEl.textContent = `Next refresh in ${remaining}s`;
       }
     } else {
       countdownEl.textContent = `Next refresh in ${remaining}s`;
@@ -2248,6 +2261,10 @@ async function loadIntegrations() {
     api('/api/integrations/webhooks', {}, { silent: true }).catch(() => []),
   ]);
 
+  // NOTE: buttons below are wired with addEventListener + data-* attributes,
+  // not inline onclick="..." — the app's CSP (script-src with no
+  // 'unsafe-inline') silently blocks inline event-handler attributes, which
+  // would make Revoke/Disable completely non-functional despite rendering.
   const keyList = document.getElementById('api-key-list');
   if (!keys.length) {
     keyList.innerHTML = '<div class="empty-state">No API keys yet.</div>';
@@ -2255,9 +2272,12 @@ async function loadIntegrations() {
     keyList.innerHTML = keys.map((key) =>
       `<div class="order-row" style="justify-content:space-between;">
         <span><b>${escapeHtml(key.name)}</b> · <code style="font-size:11px;">${escapeHtml(key.prefix)}…</code> · ${key.is_revoked ? '<span style="color:var(--down);">REVOKED</span>' : escapeHtml((key.scopes || []).join(', '))}</span>
-        ${!key.is_revoked ? `<button class="btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="revokeApiKey('${escapeHtml(key.id)}')">Revoke</button>` : ''}
+        ${!key.is_revoked ? `<button class="btn-ghost revoke-key-btn" style="font-size:11px;padding:4px 10px;" data-key-id="${escapeHtml(key.id)}">Revoke</button>` : ''}
       </div>`
     ).join('');
+    keyList.querySelectorAll('.revoke-key-btn').forEach((btn) => {
+      btn.addEventListener('click', () => revokeApiKey(btn.dataset.keyId));
+    });
   }
 
   const hookList = document.getElementById('webhook-list');
@@ -2267,9 +2287,12 @@ async function loadIntegrations() {
     hookList.innerHTML = hooks.map((hook) =>
       `<div class="order-row" style="justify-content:space-between;">
         <span style="word-break:break-all;">${escapeHtml(hook.url)} · ${hook.is_active ? escapeHtml((hook.event_types || []).join(', ')) : '<span style="color:var(--down);">DISABLED</span>'}</span>
-        ${hook.is_active ? `<button class="btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="deleteWebhook('${escapeHtml(hook.id)}')">Disable</button>` : ''}
+        ${hook.is_active ? `<button class="btn-ghost disable-webhook-btn" style="font-size:11px;padding:4px 10px;" data-hook-id="${escapeHtml(hook.id)}">Disable</button>` : ''}
       </div>`
     ).join('');
+    hookList.querySelectorAll('.disable-webhook-btn').forEach((btn) => {
+      btn.addEventListener('click', () => deleteWebhook(btn.dataset.hookId));
+    });
   }
 }
 
@@ -2462,9 +2485,11 @@ document.getElementById('research-backtest-form').addEventListener('submit', asy
 
   try {
     const d = await api('/api/research/backtest', { method: 'POST', body: JSON.stringify(body) });
-    _lastBacktestReturns = d.equity_curve_net
-      ? d.equity_curve_net.map((v, i, a) => i > 0 && a[i-1] ? (v - a[i-1]) / a[i-1] : 0).slice(1)
-      : null;
+    // Use the server's full-resolution daily_returns_net, not a series
+    // re-derived from equity_curve_net — that curve is downsampled to ~200
+    // points for chart-payload size, so differencing it would silently feed
+    // the statistical-tests panel returns with the wrong periodicity.
+    _lastBacktestReturns = (d.daily_returns_net && d.daily_returns_net.length) ? d.daily_returns_net : null;
     renderBacktestResult(d, resultEl);
   } catch (err) {
     errEl.textContent = err.message;
@@ -3174,37 +3199,43 @@ document.getElementById('eb-form').addEventListener('submit', async (e) => {
     'Running event-driven backtest with 1-bar delay…');
   if (!d) return;
   const resultEl = document.getElementById('eb-result');
+  // FIX: field names must match run_event_backtest's actual return shape
+  // (event_simulator.py) — sharpe_ratio/max_drawdown/n_trades are flat, not
+  // *_net-suffixed, there is no sortino_ratio, cost fields are flat (not
+  // nested under cost_breakdown, and there's no total_spread/costs_pct),
+  // the curve key is equity_curve (not equity_curve_net), and the endpoint
+  // doesn't return execution_time_ms. Every metric card here used to read
+  // undefined and render blank.
   const retCls = d.total_return >= 0 ? 'up' : 'down';
   let html = `<div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
     ${metricCard('Total Return', d.total_return, '%', retCls)}
-    ${metricCard('Sharpe (net)', d.sharpe_ratio_net)}
-    ${metricCard('Max Drawdown', d.max_drawdown_net, '%')}
-    ${metricCard('Total Trades', d.total_trades)}
+    ${metricCard('Sharpe', d.sharpe_ratio)}
+    ${metricCard('Max Drawdown', d.max_drawdown, '%')}
+    ${metricCard('Total Trades', d.n_trades)}
     ${metricCard('Win Rate', d.win_rate, '%')}
-    ${metricCard('Sortino', d.sortino_ratio)}
+    ${metricCard('Calmar', d.calmar_ratio)}
   </div>`;
-  const cb = d.cost_breakdown || {};
   html += `<h4 style="margin:12px 0 6px;">Transaction Cost Breakdown</h4>
     <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
-      ${metricCard('Commission', '$' + (cb.total_commission || 0).toFixed(2))}
-      ${metricCard('Slippage', '$' + (cb.total_slippage || 0).toFixed(2))}
-      ${metricCard('Spread', '$' + (cb.total_spread || 0).toFixed(2))}
-      ${metricCard('Borrow', '$' + (cb.total_borrow || 0).toFixed(2))}
-      ${metricCard('Total Costs', '$' + (cb.total_costs || 0).toFixed(2))}
-      ${metricCard('Costs % Cap', (cb.costs_pct_of_capital || 0).toFixed(2) + '%')}
+      ${metricCard('Commission', '$' + (d.total_commission || 0).toFixed(2))}
+      ${metricCard('Slippage', '$' + (d.total_slippage || 0).toFixed(2))}
+      ${metricCard('Borrow', '$' + (d.total_borrow_cost || 0).toFixed(2))}
+      ${metricCard('Total Costs', '$' + (d.total_transaction_costs || 0).toFixed(2))}
+      ${metricCard('Costs % Capital', d.initial_capital ? ((d.total_transaction_costs || 0) / d.initial_capital * 100).toFixed(2) + '%' : '—')}
+      ${metricCard('CVaR 5%', d.cvar_5pct, '%')}
     </div>`;
-  if (d.equity_curve_net && d.equity_curve_net.length > 1) {
-    const curve = d.equity_curve_net;
+  if (d.equity_curve && d.equity_curve.length > 1) {
+    const curve = d.equity_curve;
     const mn = Math.min(...curve), mx = Math.max(...curve);
     const bars = curve.map(v => {
       const h = mx > mn ? Math.round(((v - mn) / (mx - mn)) * 40) + 2 : 20;
       return `<div style="flex:1;min-width:2px;height:${h}px;background:var(--accent);border-radius:1px 1px 0 0;"></div>`;
     }).join('');
-    html += `<h4 style="margin:12px 0 6px;">Equity Curve (Net of Costs)</h4>
+    html += `<h4 style="margin:12px 0 6px;">Equity Curve</h4>
       <div style="display:flex;align-items:flex-end;height:50px;gap:1px;padding:4px 0;">${bars}</div>
       <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-3);"><span>$${curve[0].toLocaleString()}</span><span>$${curve[curve.length-1].toLocaleString()}</span></div>`;
   }
-  html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">Executed in ${d.execution_time_ms}ms &nbsp;·&nbsp; 1-bar execution delay applied</div>`;
+  html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">${d.n_bars ?? '?'} bars &nbsp;·&nbsp; 1-bar execution delay applied</div>`;
   resultEl.innerHTML = html;
 });
 
@@ -3220,19 +3251,37 @@ document.getElementById('regime-form').addEventListener('submit', async (e) => {
     'Fitting 2-state Gaussian HMM (Baum-Welch EM + Viterbi)…');
   if (!d) return;
   const resultEl = document.getElementById('regime-result');
-  const regimeColors = { bull: 'var(--green)', bear: 'var(--red)', neutral: 'var(--amber)' };
-  const curColor = regimeColors[d.current_regime] || 'var(--text-2)';
+  // FIX: run_regime_detection nests everything under d.hmm_regime (plus
+  // sibling d.volatility_regime / d.trend_regime, unused here) — there is
+  // no top-level current_regime/regime_stats/transition_matrix, and the
+  // per-regime stat keys are ann_return/ann_vol/sharpe/count, not
+  // annual_return/annual_volatility/sharpe_ratio/n_days. Every field this
+  // used to read was undefined, so the panel rendered "Unknown" with a
+  // blank probability, an empty performance table, and no transition matrix.
+  const hmm = d.hmm_regime || {};
+  if (hmm.error) {
+    resultEl.innerHTML = `<div class="empty-state">${escapeHtml(hmm.error)}</div>`;
+    return;
+  }
+  const regimeColors = { bull: 'var(--green)', bear: 'var(--red)', sideways: 'var(--amber)' };
+  const curColor = regimeColors[hmm.current_regime] || 'var(--text-2)';
+  // current_bull_prob is specifically P(bull) — when the live regime is
+  // bear that's the probability of the *other* state, so the complement is
+  // what "confidence in the current regime" actually means here.
+  const curProb = hmm.current_bull_prob != null
+    ? (hmm.current_regime === 'bull' ? hmm.current_bull_prob : 1 - hmm.current_bull_prob)
+    : null;
   let html = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 16px;background:var(--s1);border-radius:var(--r-md);border-left:3px solid ${curColor};">
     <div>
       <div style="font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-3);margin-bottom:2px;">Current Regime</div>
-      <div style="font-size:20px;font-weight:700;color:${curColor};text-transform:capitalize;">${d.current_regime || 'Unknown'}</div>
+      <div style="font-size:20px;font-weight:700;color:${curColor};text-transform:capitalize;">${hmm.current_regime || 'Unknown'}</div>
     </div>
     <div style="margin-left:auto;text-align:right;">
       <div style="font-size:10px;color:var(--text-3);">HMM Probability</div>
-      <div style="font-size:16px;font-weight:600;">${d.current_regime_probability != null ? (d.current_regime_probability * 100).toFixed(1) + '%' : '—'}</div>
+      <div style="font-size:16px;font-weight:600;">${curProb != null ? (curProb * 100).toFixed(1) + '%' : '—'}</div>
     </div>
   </div>`;
-  if (d.regime_stats && Object.keys(d.regime_stats).length) {
+  if (hmm.regime_stats && Object.keys(hmm.regime_stats).length) {
     html += `<h4 style="margin:0 0 8px;">Per-Regime Performance</h4>
       <div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">
         <thead><tr style="border-bottom:1px solid var(--border);">
@@ -3242,34 +3291,34 @@ document.getElementById('regime-form').addEventListener('submit', async (e) => {
           <th style="padding:5px 8px;">Sharpe</th>
           <th style="padding:5px 8px;">Days</th>
         </tr></thead><tbody>`;
-    for (const [name, st] of Object.entries(d.regime_stats)) {
+    for (const [name, st] of Object.entries(hmm.regime_stats)) {
       const c = regimeColors[name] || 'var(--text-2)';
       html += `<tr style="border-bottom:1px solid var(--border);">
         <td style="padding:5px 8px;font-weight:600;color:${c};text-transform:capitalize;">${name}</td>
-        <td style="padding:5px 8px;text-align:center;color:${(st.annual_return || 0) >= 0 ? 'var(--up)' : 'var(--down)'}">${st.annual_return != null ? (st.annual_return * 100).toFixed(2) + '%' : '—'}</td>
-        <td style="padding:5px 8px;text-align:center;">${st.annual_volatility != null ? (st.annual_volatility * 100).toFixed(2) + '%' : '—'}</td>
-        <td style="padding:5px 8px;text-align:center;">${st.sharpe_ratio != null ? st.sharpe_ratio.toFixed(3) : '—'}</td>
-        <td style="padding:5px 8px;text-align:center;">${st.n_days ?? '—'}</td>
+        <td style="padding:5px 8px;text-align:center;color:${(st.ann_return || 0) >= 0 ? 'var(--up)' : 'var(--down)'}">${st.ann_return != null ? (st.ann_return * 100).toFixed(2) + '%' : '—'}</td>
+        <td style="padding:5px 8px;text-align:center;">${st.ann_vol != null ? (st.ann_vol * 100).toFixed(2) + '%' : '—'}</td>
+        <td style="padding:5px 8px;text-align:center;">${st.sharpe != null ? st.sharpe.toFixed(3) : '—'}</td>
+        <td style="padding:5px 8px;text-align:center;">${st.count ?? '—'}</td>
       </tr>`;
     }
     html += '</tbody></table></div>';
   }
-  if (d.transition_matrix) {
-    const states = Object.keys(d.transition_matrix);
+  if (hmm.transition_matrix) {
+    const states = Object.keys(hmm.transition_matrix);
     html += `<h4 style="margin:14px 0 6px;">Transition Matrix</h4>
       <div style="overflow-x:auto;"><table style="font-size:11px;border-collapse:collapse;">
         <thead><tr><th style="padding:3px 6px;"></th>${states.map(s => `<th style="padding:3px 8px;text-align:center;text-transform:capitalize;">${s}</th>`).join('')}</tr></thead><tbody>`;
     for (const from of states) {
       html += `<tr><td style="padding:3px 6px;font-weight:600;text-transform:capitalize;">${from}</td>`;
       for (const to of states) {
-        const v = d.transition_matrix[from]?.[to] ?? 0;
+        const v = hmm.transition_matrix[from]?.[to] ?? 0;
         html += `<td style="padding:3px 8px;text-align:center;">${(v * 100).toFixed(1)}%</td>`;
       }
       html += '</tr>';
     }
     html += '</tbody></table></div>';
   }
-  html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">HMM converged in ${d.n_iter_converged ?? '?'} iterations</div>`;
+  html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">${hmm.n_regime_switches ?? '?'} regime switches over ${d.n_periods ?? '?'} periods</div>`;
   resultEl.innerHTML = html;
 });
 
@@ -3282,34 +3331,46 @@ document.getElementById('neutral-form').addEventListener('submit', async (e) => 
     signal_type: document.getElementById('neutral-signal').value,
     n_long: +document.getElementById('neutral-nlong').value,
     n_short: +document.getElementById('neutral-nshort').value,
-    target_volatility: +document.getElementById('neutral-tvol').value / 100,
-    factor_neutralise: document.getElementById('neutral-fn').checked,
+    // FIX: field names must match NeutralStrategyRequest (schemas.py) —
+    // target_vol / factor_neutral. The previous target_volatility /
+    // factor_neutralise names are silently dropped by Pydantic (unknown
+    // fields are ignored, not rejected), so the Target Vol% and Factor
+    // Neutralise controls had no effect on the request at all.
+    target_vol: +document.getElementById('neutral-tvol').value / 100,
+    factor_neutral: document.getElementById('neutral-fn').checked,
   };
   const d = await _labPost('/api/research/neutral-strategy', body, 'neutral-submit', 'neutral-error', 'neutral-result',
     'Running market-neutral L/S strategy…');
   if (!d) return;
   const resultEl = document.getElementById('neutral-result');
+  // FIX: the backend (run_neutral_strategies) returns { base_long_short,
+  // factor_neutral_long_short, asset_names, signal_type } — not the flat
+  // sharpe_ratio/total_return/beta/top_longs/top_shorts shape this used to
+  // read, which meant every metric card silently rendered blank/undefined
+  // and the ticker lists never had backing data at all.
+  const base = d.base_long_short || {};
+  if (base.error) {
+    resultEl.innerHTML = `<div class="empty-state">${escapeHtml(base.error)}</div>`;
+    return;
+  }
   let html = `<div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
-    ${metricCard('L/S Sharpe', d.sharpe_ratio)}
-    ${metricCard('L/S Return', d.total_return, '%', d.total_return >= 0 ? 'up' : 'down')}
-    ${metricCard('Max DD', d.max_drawdown, '%')}
-    ${metricCard('Ann. Vol', d.annualised_volatility, '%')}
-    ${metricCard('Avg Turnover', d.avg_monthly_turnover, '%')}
-    ${metricCard('Beta', d.beta)}
+    ${metricCard('L/S Sharpe', base.sharpe_ratio)}
+    ${metricCard('Ann. Return', base.annual_return, '%', base.annual_return >= 0 ? 'up' : 'down')}
+    ${metricCard('Max DD', base.max_drawdown, '%')}
+    ${metricCard('Ann. Vol', base.annual_volatility, '%')}
+    ${metricCard('Avg Daily Turnover', base.avg_daily_turnover, '%')}
+    ${metricCard('N Periods', base.n_periods)}
   </div>`;
-  if (d.factor_neutral && d.factor_neutral.sharpe_ratio != null) {
+  const fn = d.factor_neutral_long_short;
+  if (fn && !fn.error && fn.sharpe_ratio != null) {
     html += `<h4 style="margin:12px 0 6px;">Factor-Neutral Comparison</h4>
       <div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
-        ${metricCard('FN Sharpe', d.factor_neutral.sharpe_ratio)}
-        ${metricCard('FN Return', d.factor_neutral.total_return, '%')}
-        ${metricCard('FN Beta', d.factor_neutral.beta)}
+        ${metricCard('FN Sharpe', fn.sharpe_ratio)}
+        ${metricCard('FN Ann. Return', fn.annual_return, '%')}
+        ${metricCard('FN Max DD', fn.max_drawdown, '%')}
       </div>`;
-  }
-  if (d.top_longs?.length) {
-    html += `<h4 style="margin:12px 0 4px;">Current Longs</h4><div style="font-family:var(--f-mono);font-size:12px;color:var(--green);">${d.top_longs.join(' &nbsp;·&nbsp; ')}</div>`;
-  }
-  if (d.top_shorts?.length) {
-    html += `<h4 style="margin:10px 0 4px;">Current Shorts</h4><div style="font-family:var(--f-mono);font-size:12px;color:var(--red);">${d.top_shorts.join(' &nbsp;·&nbsp; ')}</div>`;
+  } else if (body.factor_neutral) {
+    html += `<p class="hint" style="margin-top:8px;">Factor-neutral comparison unavailable — not enough valid cross-sectional data to estimate factor exposures for this asset set/period.</p>`;
   }
   resultEl.innerHTML = html;
 });
@@ -3329,28 +3390,49 @@ document.getElementById('pairs-form').addEventListener('submit', async (e) => {
     'Running cointegration test + Kalman filter…');
   if (!d) return;
   const resultEl = document.getElementById('pairs-result');
-  const cointColor = d.cointegrated ? 'var(--green)' : 'var(--red)';
+  // FIX: the response nests the cointegration test under d.cointegration
+  // (engle_granger_cointegration's own dict), reports strategy Sharpe as
+  // d.strategy_sharpe and trade count as d.n_trades, has no total_return /
+  // max_drawdown at all, and exposes the Z-spread as a time series
+  // (d.z_spread) rather than a single "current" scalar. All of the fields
+  // this used to read (d.cointegrated, d.p_value, d.sharpe_ratio,
+  // d.total_return, d.max_drawdown, d.adf_statistic, d.hedge_ratio,
+  // d.total_trades, d.current_z_score) are undefined on the real payload.
+  const coint = d.cointegration || {};
+  if (coint.error) {
+    resultEl.innerHTML = `<div class="empty-state">${escapeHtml(coint.error)}</div>`;
+    return;
+  }
+  const cointColor = coint.cointegrated ? 'var(--green)' : 'var(--red)';
   let html = `<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 16px;background:var(--s1);border-radius:var(--r-md);border-left:3px solid ${cointColor};">
     <div>
-      <div style="font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-3);margin-bottom:2px;">Cointegration Test</div>
-      <div style="font-size:16px;font-weight:700;color:${cointColor};">${d.cointegrated ? '✓ Cointegrated' : '✗ Not Cointegrated'}</div>
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-3);margin-bottom:2px;">Cointegration Test (Engle-Granger)</div>
+      <div style="font-size:16px;font-weight:700;color:${cointColor};">${coint.cointegrated ? '✓ Cointegrated' : '✗ Not Cointegrated'}</div>
     </div>
     <div style="margin-left:auto;text-align:right;">
-      <div style="font-size:10px;color:var(--text-3);">p-value</div>
-      <div style="font-size:15px;font-weight:600;">${d.p_value != null ? d.p_value.toFixed(4) : '—'}</div>
+      <div style="font-size:10px;color:var(--text-3);">ADF p-value (approx.)</div>
+      <div style="font-size:15px;font-weight:600;">${coint.adf_p_approx != null ? coint.adf_p_approx.toFixed(4) : '—'}</div>
     </div>
   </div>`;
   html += `<div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
-    ${metricCard('Sharpe', d.sharpe_ratio)}
-    ${metricCard('Total Return', d.total_return, '%', d.total_return >= 0 ? 'up' : 'down')}
-    ${metricCard('Max DD', d.max_drawdown, '%')}
-    ${metricCard('ADF Statistic', d.adf_statistic)}
-    ${metricCard('Hedge Ratio', d.hedge_ratio)}
-    ${metricCard('Total Trades', d.total_trades)}
+    ${metricCard('Strategy Sharpe', d.strategy_sharpe)}
+    ${metricCard('ADF Statistic', coint.adf_stat)}
+    ${metricCard('OLS Hedge Ratio', coint.hedge_ratio)}
+    ${metricCard('Total Trades', d.n_trades)}
+    ${metricCard('Cointegrated (1%)', coint.cointegrated_1pct ? 'Yes' : 'No')}
+    ${metricCard('Spread Std', coint.spread_std)}
   </div>`;
-  if (d.current_z_score != null) {
-    const zColor = Math.abs(d.current_z_score) > (d.entry_z || body.entry_z) ? 'var(--amber)' : 'var(--text-2)';
-    html += `<div style="padding:8px 14px;background:var(--s1);border-radius:var(--r-sm);margin-bottom:12px;font-family:var(--f-mono);font-size:12px;">Current Z-score: <span style="font-weight:700;color:${zColor};">${d.current_z_score.toFixed(3)}</span> &nbsp; Entry: ±${body.entry_z} &nbsp; Exit: ±${body.exit_z}</div>`;
+  const zSeries = (d.z_spread || []).filter(z => z != null);
+  const currentZ = zSeries.length ? zSeries[zSeries.length - 1] : null;
+  if (currentZ != null) {
+    const zColor = Math.abs(currentZ) > body.entry_z ? 'var(--amber)' : 'var(--text-2)';
+    html += `<div style="padding:8px 14px;background:var(--s1);border-radius:var(--r-sm);margin-bottom:12px;font-family:var(--f-mono);font-size:12px;">Current Z-score: <span style="font-weight:700;color:${zColor};">${currentZ.toFixed(3)}</span> &nbsp; Entry: ±${body.entry_z} &nbsp; Exit: ±${body.exit_z}</div>`;
+  }
+  if (body.use_kalman && d.hedge_ratios && d.hedge_ratios.length) {
+    const validRatios = d.hedge_ratios.filter(h => h != null);
+    if (validRatios.length) {
+      html += `<div style="font-size:12px;color:var(--text-2);">Current Kalman-adaptive hedge ratio: <b>${validRatios[validRatios.length - 1].toFixed(4)}</b></div>`;
+    }
   }
   resultEl.innerHTML = html;
 });
@@ -3366,21 +3448,29 @@ document.getElementById('bench-form').addEventListener('submit', async (e) => {
     'Profiling all 7 pipeline stages…');
   if (!d) return;
   const resultEl = document.getElementById('bench-result');
-  const stages = d.stage_timings || {};
-  const bottleneck = d.bottleneck_stage || '';
+  // FIX: run_full_benchmark returns d.stages as a LIST of {stage,
+  // elapsed_ms,...} objects (not a d.stage_timings map), d.bottleneck as an
+  // object (not a d.bottleneck_stage string), total latency under
+  // d.total_elapsed_ms (not d.total_time_ms), and the scaling rows under
+  // d.scaling_analysis with a total_ms field (not d.scaling / row.time_ms).
+  // Object.keys(d.stage_timings || {}) was always {} here, so the stage
+  // breakdown and scaling table never rendered at all.
+  const stages = d.stages || [];
+  const bottleneckStage = d.bottleneck?.stage || '';
   let html = `<div class="metrics-row" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px;">
-    ${metricCard('Total Latency', d.total_time_ms, 'ms')}
+    ${metricCard('Total Latency', d.total_elapsed_ms, 'ms')}
     ${metricCard('N Assets', d.n_assets)}
-    ${metricCard('Bottleneck', bottleneck.replace(/_/g, ' ') || '—')}
+    ${metricCard('Bottleneck', bottleneckStage || '—')}
   </div>`;
-  if (Object.keys(stages).length) {
-    const maxMs = Math.max(...Object.values(stages));
+  if (stages.length) {
+    const maxMs = Math.max(...stages.map(s => s.elapsed_ms || 0));
     html += `<h4 style="margin:0 0 8px;">Stage Breakdown</h4><div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px;">`;
-    for (const [stage, ms] of Object.entries(stages)) {
+    for (const s of stages) {
+      const ms = s.elapsed_ms || 0;
       const barW = maxMs > 0 ? (ms / maxMs * 100).toFixed(1) : 0;
-      const isBot = stage === bottleneck;
+      const isBot = s.stage === bottleneckStage;
       html += `<div style="display:flex;align-items:center;gap:8px;font-size:12px;">
-        <span style="min-width:130px;color:var(--text-2);font-family:var(--f-mono);font-size:11px;${isBot ? 'font-weight:700;color:var(--amber);' : ''}">${stage.replace(/_/g, ' ')}</span>
+        <span style="min-width:150px;color:var(--text-2);font-family:var(--f-mono);font-size:11px;${isBot ? 'font-weight:700;color:var(--amber);' : ''}">${escapeHtml(s.stage || '')}</span>
         <div style="flex:1;height:14px;background:var(--s2);border-radius:3px;overflow:hidden;">
           <div style="width:${barW}%;height:100%;background:${isBot ? 'var(--amber)' : 'var(--accent)'};border-radius:3px;"></div>
         </div>
@@ -3389,14 +3479,17 @@ document.getElementById('bench-form').addEventListener('submit', async (e) => {
     }
     html += '</div>';
   }
-  if (d.scaling && d.scaling.length > 1) {
+  if (d.scaling_analysis && d.scaling_analysis.length > 1) {
     html += `<h4 style="margin:0 0 6px;">Latency Scaling by Asset Count</h4>
       <div style="overflow-x:auto;"><table style="width:100%;font-size:12px;border-collapse:collapse;">
         <thead><tr style="border-bottom:1px solid var(--border);"><th style="padding:4px 8px;text-align:left;">N Assets</th><th style="padding:4px 8px;">Total (ms)</th></tr></thead><tbody>`;
-    for (const row of d.scaling) {
-      html += `<tr style="border-bottom:1px solid var(--border);"><td style="padding:4px 8px;">${row.n_assets}</td><td style="padding:4px 8px;text-align:center;font-family:var(--f-mono);">${row.time_ms.toFixed(1)}</td></tr>`;
+    for (const row of d.scaling_analysis) {
+      html += `<tr style="border-bottom:1px solid var(--border);"><td style="padding:4px 8px;">${row.n_assets}</td><td style="padding:4px 8px;text-align:center;font-family:var(--f-mono);">${(row.total_ms || 0).toFixed(1)}</td></tr>`;
     }
     html += '</tbody></table></div>';
+  }
+  if (d.summary?.performance_rating) {
+    html += `<div style="margin-top:12px;font-size:11px;color:var(--text-3);">${escapeHtml(d.summary.performance_rating)} &nbsp;·&nbsp; ${d.summary.bars_per_second?.toLocaleString() ?? '?'} bars/sec</div>`;
   }
   resultEl.innerHTML = html;
 });

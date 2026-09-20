@@ -1,10 +1,35 @@
 """QuantumSentinel — Portfolio analytics: positions, P&L, VaR, Sharpe, drawdown."""
 import math
+import time
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from .. import models
 from .trading_service import get_last_price
+
+# ---------------------------------------------------------------------------
+# SPY benchmark history cache
+# ---------------------------------------------------------------------------
+# risk_metrics() is polled every 20s while the Portfolio tab is open
+# (frontend restartPolling interval). Without caching, every poll from every
+# active session re-downloaded a full 1-year daily history for SPY from
+# Yahoo Finance — pure added latency on a series that only changes once a
+# day, and a needless amplifier of yfinance rate-limit risk under load.
+_SPY_CACHE: dict = {"data": None, "fetched_at": 0.0}
+_SPY_CACHE_TTL_SECONDS = 900  # 15 min — daily bars don't need finer freshness
+
+
+def _get_spy_history():
+    """Return cached SPY 1y daily history, refetching at most every 15 minutes."""
+    now = time.time()
+    cached = _SPY_CACHE["data"]
+    if cached is not None and (now - _SPY_CACHE["fetched_at"]) < _SPY_CACHE_TTL_SECONDS:
+        return cached
+    import yfinance as yf_bench
+    spy_data = yf_bench.Ticker("SPY").history(period="1y", auto_adjust=True)
+    _SPY_CACHE["data"] = spy_data
+    _SPY_CACHE["fetched_at"] = now
+    return spy_data
 
 
 def recompute_positions(db: Session, user_id: str) -> None:
@@ -239,8 +264,7 @@ def risk_metrics(db: Session, user_id: str) -> dict:
     information_ratio = 0.0
 
     try:
-        import yfinance as yf_bench
-        spy_data = yf_bench.Ticker("SPY").history(period="1y", auto_adjust=True)
+        spy_data = _get_spy_history()
         if not spy_data.empty and len(spy_data) > 10:
             spy_close = spy_data["Close"].to_numpy(dtype=float)
             spy_returns = np.diff(spy_close) / spy_close[:-1]

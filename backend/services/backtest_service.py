@@ -596,6 +596,16 @@ class BacktestEngine:
             "cost_breakdown": cost_breakdown,
             "equity_curve_net": [round(float(v), 2) for v in eq_net[::step]],
             "equity_curve_gross": [round(float(v), 2) for v in eq_gross[::step]],
+            # Full-resolution daily net returns (NOT subsampled by `step`).
+            # The equity curves above are downsampled to ~200 points purely
+            # to keep the chart payload small; recomputing returns from that
+            # downsampled series (as the frontend statistical-tests panel
+            # used to) silently changes the return periodicity — e.g. a 3-day
+            # gap gets treated as one "daily" observation — which corrupts
+            # every downstream statistic (t-test, bootstrap CI, Deflated
+            # Sharpe, Ljung-Box) that assumes true daily returns. Exposing
+            # the real series here is what /api/research/stat-test consumes.
+            "daily_returns_net": [round(float(r), 6) for r in rets_net],
             "trade_log": [t.to_dict() for t in trade_log[:100]],  # cap at 100 trades
             "execution_time_ms": round(elapsed_ms, 2),
         }

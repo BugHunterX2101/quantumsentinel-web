@@ -80,6 +80,9 @@ class ServerIdentity:
         # Key identification
         self.key_id: str | None = None
         self.fingerprint: str | None = None
+        # True once THIS process has confirmed the current key is persisted
+        # in server_signing_keys. See ensure_registered() for why this matters.
+        self._registered = False
         if pk:
             self.fingerprint = hashlib.sha256(pk).hexdigest()
 
@@ -95,6 +98,33 @@ class ServerIdentity:
         self.created_at = dt.datetime.now(dt.timezone.utc)
         self.fingerprint = hashlib.sha256(pk).hexdigest()
         self.key_id = models.gen_uuid()
+        self._registered = False
+
+    def ensure_registered(self, db: Session) -> None:
+        """Guarantee the active signing key is resolvable in server_signing_keys
+        *before* it signs anything that will later be verified by key_id
+        (audit-chain checkpoints, audit-log entries).
+
+        Without this, a key generated lazily on first use (`sign()` calling
+        `_ensure_keypair()`) can sign several entries with `signing_key_id`
+        set to an id that isn't in the DB yet. `verify_audit_log` /
+        `verify_audit_chain` then fall back to whatever key is *currently*
+        active — which is correct only until the process restarts or the
+        key rotates, at which point those earlier entries become permanently
+        unverifiable even though nothing about them was tampered with. In
+        production this gap is already closed by the FastAPI lifespan
+        calling `register_in_db()` before the app accepts traffic; this
+        method closes it for every other caller (tests, scripts, request
+        paths that sign before that hook has run) with the same idempotent
+        registration, at the cost of one no-op check per process instead of
+        a bug in the audit trail's core accountability guarantee.
+        """
+        if self._registered:
+            return
+        if self.dsa_sk is None:
+            self._ensure_keypair()
+        self.register_in_db(db)
+        self._registered = True
 
     def register_in_db(self, db: Session) -> str | None:
         """Register the current key in the server_signing_keys table if not already present."""
@@ -110,6 +140,7 @@ class ServerIdentity:
         ).scalars().first()
         if existing:
             self.key_id = existing.key_id
+            self._registered = True
             return existing.key_id
         # Register new
         key_id = self.key_id or models.gen_uuid()
@@ -124,6 +155,7 @@ class ServerIdentity:
         )
         db.add(record)
         db.commit()
+        self._registered = True
         return key_id
 
     def rotate(self, db: Session | None = None):
@@ -192,6 +224,8 @@ def write_audit_log(db: Session, user_id: str | None, action: str,
                      resource_type: str | None = None, resource_id: str | None = None,
                      metadata: dict | None = None) -> models.AuditLog:
     metadata = metadata or {}
+    # Must happen before signing — see ServerIdentity.ensure_registered().
+    server_identity.ensure_registered(db)
     payload = json.dumps({
         "action": action, "user_id": user_id, "resource_type": resource_type,
         "resource_id": resource_id, "metadata": metadata,

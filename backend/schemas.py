@@ -339,6 +339,11 @@ class HandshakeRequest(BaseModel):
     client_nonce: str
 
 
+class UserSettingsRequest(BaseModel):
+    """Partial user preference update — all fields optional (PATCH semantics)."""
+    beginner_mode: bool | None = None
+
+
 class OrderRequest(BaseModel):
     asset: str = Field(min_length=1, max_length=20)  # raised to 20 to accommodate e.g. RELIANCE.NS
     side: Literal["buy", "sell"]

@@ -389,6 +389,10 @@
               <label>Train Years<input id="wf-train" type="number" min="1" max="5" value="2"></label>
               <label>Test Years<input id="wf-test" type="number" min="1" max="3" value="1"></label>
             </div>
+            <div class="form-row">
+              <label>Fast MA Window<input id="wf-fast" type="number" min="2" max="100" value="20"></label>
+              <label>Slow MA Window<input id="wf-slow" type="number" min="5" max="250" value="50"></label>
+            </div>
             <label class="checkbox-item" style="margin-top:8px;"><input type="checkbox" id="wf-optimize" checked><span class="checkbox-box"></span>Optimize Parameters per Fold</label>
             <button type="submit" class="btn-primary ripple-btn" id="wf-submit"><span class="btn-label">Run Walk-Forward</span></button>
             <div class="auth-error" id="wf-error"></div>
@@ -581,6 +585,7 @@
     <section id="view-phase3" class="view">
       <div class="section-header"><h2>Trading Engine &amp; Microstructure</h2></div>
       <p class="hint" data-beginner>Event-driven backtesting with realistic transaction costs, market regime detection (HMM), market-neutral strategies, pairs trading (cointegration + Kalman), and pipeline latency profiling.</p>
+      <p id="cpp-status" style="font-family:var(--f-mono);font-size:11px;color:var(--text-3);margin:0 0 12px;">Checking C++ engine status…</p>
 
       <div class="trading-grid">
 

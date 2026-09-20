@@ -567,6 +567,25 @@ def pqc_handshake(req: schemas.HandshakeRequest, user: models.User = Depends(get
     return result
 
 
+# --------------------------------------------------------------------------
+# User settings endpoint
+# --------------------------------------------------------------------------
+@app.patch("/api/user/settings")
+def update_user_settings(
+    req: schemas.UserSettingsRequest,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Partial update of per-user preferences (PATCH semantics — only provided fields updated)."""
+    if req.beginner_mode is not None:
+        user.beginner_mode = req.beginner_mode
+    db.commit()
+    return {
+        "user_id": user.id,
+        "email": user.email,
+        "beginner_mode": user.beginner_mode,
+    }
+
 
 
 # --------------------------------------------------------------------------

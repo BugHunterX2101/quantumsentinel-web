@@ -402,6 +402,11 @@ async function afterLogin(data) {
   // Item 1: Token is now in HttpOnly cookie — do NOT store in localStorage or state
   state.csrfToken = data.csrf_token || null;
   state.user = data.user;
+  // Sync beginner mode from server — overrides localStorage default
+  if (data.user?.beginner_mode != null) {
+    state.beginner = data.user.beginner_mode;
+    localStorage.setItem('qs_beginner', String(state.beginner));
+  }
   // Schedule silent refresh based on server-provided TTL
   scheduleTokenExpiry(data.expires_in || 900);
   document.getElementById('auth-screen').classList.add('hidden');
@@ -619,13 +624,14 @@ function switchView(view) {
   _viewLastLoaded[view] = now;
 
   if (!fresh) {
-    if (view === 'dashboard')   loadDashboard();
-    if (view === 'trading')     loadTrading();
-    if (view === 'strategies')  loadStrategies();
-    if (view === 'portfolio')   loadPortfolio();
-    if (view === 'security')    loadSecurity();
+    if (view === 'dashboard')    loadDashboard();
+    if (view === 'trading')      loadTrading();
+    if (view === 'strategies')   loadStrategies();
+    if (view === 'portfolio')    loadPortfolio();
+    if (view === 'security')     loadSecurity();
     if (view === 'integrations') loadIntegrations();
-    if (view === 'community')   loadCommunity();
+    if (view === 'community')    loadCommunity();
+    if (view === 'phase3')       loadLab();
   }
   restartPolling();
 }
@@ -2241,12 +2247,48 @@ async function loadIntegrations() {
     api('/api/integrations/api-keys', {}, { silent: true }).catch(() => []),
     api('/api/integrations/webhooks', {}, { silent: true }).catch(() => []),
   ]);
-  document.getElementById('api-key-list').innerHTML = keys.map((key) =>
-    `<div class="order-row"><span>${escapeHtml(key.name)} · ${escapeHtml(key.prefix)}…</span><span>${key.is_revoked ? 'REVOKED' : escapeHtml(key.scopes.join(', '))}</span></div>`
-  ).join('') || '<div class="empty-state">No API keys yet.</div>';
-  document.getElementById('webhook-list').innerHTML = hooks.map((hook) =>
-    `<div class="order-row"><span>${escapeHtml(hook.url)}</span><span>${hook.is_active ? escapeHtml(hook.event_types.join(', ')) : 'DISABLED'}</span></div>`
-  ).join('') || '<div class="empty-state">No webhooks yet.</div>';
+
+  const keyList = document.getElementById('api-key-list');
+  if (!keys.length) {
+    keyList.innerHTML = '<div class="empty-state">No API keys yet.</div>';
+  } else {
+    keyList.innerHTML = keys.map((key) =>
+      `<div class="order-row" style="justify-content:space-between;">
+        <span><b>${escapeHtml(key.name)}</b> · <code style="font-size:11px;">${escapeHtml(key.prefix)}…</code> · ${key.is_revoked ? '<span style="color:var(--down);">REVOKED</span>' : escapeHtml((key.scopes || []).join(', '))}</span>
+        ${!key.is_revoked ? `<button class="btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="revokeApiKey('${escapeHtml(key.id)}')">Revoke</button>` : ''}
+      </div>`
+    ).join('');
+  }
+
+  const hookList = document.getElementById('webhook-list');
+  if (!hooks.length) {
+    hookList.innerHTML = '<div class="empty-state">No webhooks yet.</div>';
+  } else {
+    hookList.innerHTML = hooks.map((hook) =>
+      `<div class="order-row" style="justify-content:space-between;">
+        <span style="word-break:break-all;">${escapeHtml(hook.url)} · ${hook.is_active ? escapeHtml((hook.event_types || []).join(', ')) : '<span style="color:var(--down);">DISABLED</span>'}</span>
+        ${hook.is_active ? `<button class="btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="deleteWebhook('${escapeHtml(hook.id)}')">Disable</button>` : ''}
+      </div>`
+    ).join('');
+  }
+}
+
+async function revokeApiKey(keyId) {
+  if (!await confirmAction('Revoke API Key', 'This key will stop working immediately. This action cannot be undone.')) return;
+  try {
+    await api(`/api/integrations/api-keys/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
+    toast('API Key Revoked', 'The key has been permanently revoked.', 'success');
+    await loadIntegrations();
+  } catch (err) { toast('Error', err.message, 'error'); }
+}
+
+async function deleteWebhook(hookId) {
+  if (!await confirmAction('Disable Webhook', 'This webhook will stop receiving events. You can add a new one later.')) return;
+  try {
+    await api(`/api/integrations/webhooks/${encodeURIComponent(hookId)}`, { method: 'DELETE' });
+    toast('Webhook Disabled', 'The webhook has been disabled.', 'success');
+    await loadIntegrations();
+  } catch (err) { toast('Error', err.message, 'error'); }
 }
 
 document.getElementById('api-key-form').addEventListener('submit', async (event) => {
@@ -2277,6 +2319,21 @@ document.getElementById('webhook-form').addEventListener('submit', async (event)
     await loadIntegrations();
   } finally { setButtonLoading(btn, false); }
 });
+
+async function loadLab() {
+  // Fetch C++ engine status and show it in the lab header if the element exists
+  const statusEl = document.getElementById('cpp-status');
+  if (!statusEl) return; // element not present in this build — graceful skip
+  try {
+    const s = await api('/api/research/cpp-status', {}, { silent: true });
+    statusEl.textContent = s.available
+      ? `✓ C++ acceleration active (${s.version || 'native'}) — ${s.speedup_estimate || ''}x typical speedup`
+      : `⚠ C++ acceleration unavailable — running Python fallback`;
+    statusEl.style.color = s.available ? 'var(--up)' : 'var(--text-3)';
+  } catch (_) {
+    statusEl.textContent = 'C++ engine status unavailable';
+  }
+}
 
 async function loadCommunity() {
   const stats = document.getElementById('community-stats');
@@ -2329,6 +2386,11 @@ async function loadCommunity() {
     if (refreshData && refreshData.csrf_token && refreshData.user) {
       state.csrfToken = refreshData.csrf_token;
       state.user = refreshData.user;
+      // Sync beginner mode from server on session restore
+      if (refreshData.user.beginner_mode != null) {
+        state.beginner = refreshData.user.beginner_mode;
+        localStorage.setItem('qs_beginner', String(state.beginner));
+      }
       scheduleTokenExpiry(refreshData.expires_in || 900);
       // Hide auth, show app shell immediately
       document.getElementById('auth-screen').classList.add('hidden');
@@ -2478,6 +2540,8 @@ document.getElementById('research-wf-form').addEventListener('submit', async (e)
   const totalYears = +document.getElementById('wf-total').value;
   const trainYears = +document.getElementById('wf-train').value;
   const testYears  = +document.getElementById('wf-test').value;
+  const wfFast     = +document.getElementById('wf-fast')?.value || 20;
+  const wfSlow     = +document.getElementById('wf-slow')?.value || 50;
   // Client-side guard: train + test must not exceed total
   if (trainYears + testYears > totalYears) {
     errEl.textContent = `Train (${trainYears}y) + Test (${testYears}y) = ${trainYears+testYears}y exceeds Total (${totalYears}y). Reduce train/test windows or increase total years.`;
@@ -2491,6 +2555,7 @@ document.getElementById('research-wf-form').addEventListener('submit', async (e)
     assets: [document.getElementById('wf-asset').value.trim().toUpperCase()],
     window_type: document.getElementById('wf-type').value,
     total_years: totalYears, train_years: trainYears, test_years: testYears,
+    fast_window: wfFast, slow_window: wfSlow,
     optimize_parameters: document.getElementById('wf-optimize').checked,
   };
 

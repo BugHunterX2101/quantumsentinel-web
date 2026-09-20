@@ -329,13 +329,22 @@ def deflated_sharpe_ratio(observed_sharpe: float,
     # E[max(SR)] ≈ σ * √(2 * ln(N)) for N trials
     expected_max_sharpe = sharpe_std * math.sqrt(2 * math.log(max(n_trials, 2)))
 
-    # Variance of Sharpe ratio estimator (Lo, 2002)
-    # Var(SR) ≈ (1 + 0.25 * SR^2 * (γ₂ - 1) - SR * γ₁) / (n - 1)
-    # where γ₁ = skewness, γ₂ = excess kurtosis
-    excess_kurtosis = kurtosis - 3.0
+    # Variance of the Sharpe ratio estimator (Mertens 2002; used by Bailey &
+    # López de Prado 2014 for the DSR/PSR denominator, building on Lo 2002):
+    #   Var(SR) ≈ (1 - γ₁*SR + ((γ₂ - 1) / 4) * SR^2) / (n - 1)
+    # where γ₁ = skewness and γ₂ = kurtosis (NOT excess kurtosis — this
+    # `kurtosis` parameter's own default of 3.0, the kurtosis of a normal
+    # distribution, is what forces the correct sanity check: at γ₁=0, γ₂=3
+    # this must reduce to the classical Var(SR) ≈ (1 + 0.5*SR^2)/n for i.i.d.
+    # normal returns. A previous version of this formula subtracted 3 from
+    # kurtosis here (i.e. used excess kurtosis in the (γ₂-1) slot), which
+    # silently dropped that entire +0.5*SR^2 baseline term even for
+    # perfectly normal returns — understating sr_std and therefore
+    # overstating DSR significance (smaller p-values than the math supports)
+    # on every single call, not just non-normal ones.
     sr_variance = (
-        (1 + 0.25 * observed_sharpe ** 2 * excess_kurtosis
-         - observed_sharpe * skewness) / max(1, n_observations - 1)
+        (1 - observed_sharpe * skewness
+         + 0.25 * observed_sharpe ** 2 * (kurtosis - 1)) / max(1, n_observations - 1)
     )
     sr_std = math.sqrt(max(sr_variance, 1e-12))
 

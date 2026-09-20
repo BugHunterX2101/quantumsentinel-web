@@ -96,6 +96,7 @@ def verify_or_attest(db: Session, user_id: str, canonical: str,
         raise HTTPException(403, "production order submission requires a client ML-DSA signature")
     # Keeps the existing browser paper-trading demo functional, while being
     # explicitly distinguishable from client authorisation in the audit trail.
+    security_service.server_identity.ensure_registered(db)
     return "server-development-attestation", pqc.b64(security_service.server_identity.sign(canonical.encode())), "development_server"
 
 
@@ -169,10 +170,25 @@ async def assert_risk_gate_async(*, user_id: str, asset: str, side: str, quantit
 
 def assert_risk_gate(*, user_id: str, asset: str, side: str, quantity: float,
                      price: float, held_quantity: float, account_equity: float,
-                     current_gross_exposure: float) -> None:
-    """Central execution boundary (sync). It must run before an order is signed/sent."""
+                     current_gross_exposure: float, redis_client=None) -> None:
+    """Central execution boundary (sync). It must run before an order is signed/sent.
+
+    Kill switches are process-global in multi-worker deployments only when
+    checked against Redis: the in-memory `_KILL_SWITCHES` set is per-process,
+    so a switch flipped via the admin endpoint on one worker would silently
+    fail to block orders handled by another worker if only the local set is
+    consulted. When a Redis client is available it is checked first (via the
+    synchronous bridge in redis_store), with the in-memory set as fallback.
+    """
     blocked = (("global", None) in _KILL_SWITCHES or ("user", user_id) in _KILL_SWITCHES
                or ("asset", asset.upper()) in _KILL_SWITCHES)
+    if not blocked and redis_client is not None:
+        from . import redis_store
+        blocked = bool(
+            redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "global"))
+            or redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "user", user_id))
+            or redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "asset", asset.upper()))
+        )
     if blocked:
         raise HTTPException(423, "trading kill switch is active")
     notional = quantity * price

@@ -199,8 +199,12 @@ def generate_csrf_token(session_id: str) -> str:
     return base64.urlsafe_b64encode(payload + b":" + sig.encode()).decode()
 
 
-def verify_csrf_token(token: str, max_age: int = 86400) -> bool:
-    """Verify CSRF token validity."""
+def verify_csrf_token(token: str, session_id: str | None = None, max_age: int = 86400) -> bool:
+    """Verify CSRF token validity and, if `session_id` is given, that the
+    token was issued to that exact session. Binding the token to the caller's
+    own session (from the already-verified access-token JWT) is what makes
+    the double-submit pattern meaningful — without it, any validly-signed
+    CSRF token from any account would pass this check."""
     try:
         decoded = base64.urlsafe_b64decode(token.encode())
         parts = decoded.rsplit(b":", 1)
@@ -210,10 +214,15 @@ def verify_csrf_token(token: str, max_age: int = 86400) -> bool:
         expected = hmac.new(CSRF_SECRET.encode(), payload, hashlib.sha256).hexdigest()[:32]
         if not hmac.compare_digest(sig.decode(), expected):
             return False
-        # Check age
-        ts_str = payload.decode().rsplit(":", 1)[-1]
+        # payload is "<session_id>:<timestamp>" — session_id itself may
+        # contain ':' (it does not, UUIDs don't, but split from the right to
+        # be safe), so only the trailing timestamp segment is stripped off.
+        payload_str = payload.decode()
+        token_session_id, _, ts_str = payload_str.rpartition(":")
         ts = int(ts_str)
         if time.time() - ts > max_age:
+            return False
+        if session_id is not None and not hmac.compare_digest(token_session_id, session_id):
             return False
         return True
     except Exception:
@@ -389,14 +398,19 @@ def perform_handshake(db: Session, user_id: str, client_x25519_pub_b64: str,
     # --- Item 2: Atomic nonce replay protection ---
     # Redis: SET qs:pqc:nonce:<hash> 1 NX EX 300
     # If SET NX fails → HTTP 409 HANDSHAKE_REPLAY
+    #
+    # Dispatched via redis_store.run_sync onto the application's own event
+    # loop rather than a throwaway `asyncio.new_event_loop()` — the async
+    # redis client's connections are bound to the loop that created them, so
+    # a fresh loop per call either hangs or raises "attached to a different
+    # loop", and if it falls back silently the replay guard is defeated.
     if redis_client:
-        import asyncio
-        from .redis_store import consume_pqc_nonce
-        loop = asyncio.new_event_loop()
-        try:
-            accepted = loop.run_until_complete(consume_pqc_nonce(redis_client, client_nonce))
-        finally:
-            loop.close()
+        from .redis_store import consume_pqc_nonce, run_sync
+        accepted = run_sync(consume_pqc_nonce(redis_client, client_nonce))
+        if accepted is None:
+            # Redis call failed/unavailable — fail safe by also requiring
+            # the local in-memory check rather than silently accepting.
+            accepted = _consume_nonce_local(client_nonce)
     else:
         accepted = _consume_nonce_local(client_nonce)
 
@@ -436,6 +450,11 @@ def perform_handshake(db: Session, user_id: str, client_x25519_pub_b64: str,
         "session_context": user_id,
     })
     transcript_hash = hashlib.sha256(transcript.encode()).hexdigest()
+    # Ensures the key used for this ServerHello is resolvable in
+    # server_signing_keys (see ServerIdentity.ensure_registered) — the
+    # /api/security/server-keys history and future audit verification both
+    # depend on the signing key having been registered before it signs.
+    security_service.server_identity.ensure_registered(db)
     signature = security_service.server_identity.sign(transcript_hash.encode())
 
     # --- Item 4: Server identity fingerprint ---

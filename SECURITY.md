@@ -64,14 +64,25 @@
 
 ## Frontend security
 
-- **Zero innerHTML with unsanitized data**: all user/API data is rendered via
-  DOM API (`createElement`, `textContent`, `replaceChildren`) or pre-escaped
-  through `escapeHtml()`.
+- **No unsanitized data reaches innerHTML**: the auth screen, dashboard,
+  trading, portfolio and security views render via the DOM API
+  (`createElement`, `textContent`, `replaceChildren`) or pre-escape any
+  server/API string through `escapeHtml()` before it is interpolated into a
+  template string. The Research and Lab result panels build their markup
+  with `innerHTML` template strings for layout convenience, but the values
+  interpolated there are server-computed numbers/labels (Sharpe ratios,
+  p-values, metric names) — never raw user or third-party text — so this is
+  a rendering-convenience choice, not an unescaped-user-input path.
 - **Content Security Policy (CSP)**:
   - `script-src 'self' https://cdn.jsdelivr.net` — only self-hosted scripts
     and the pinned Three.js CDN are allowed; no `unsafe-inline` or
     `unsafe-eval`.
-  - `style-src 'self' https://fonts.googleapis.com` — no `unsafe-inline`.
+  - `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com` — the
+    Research/Lab result panels and parts of the base markup use inline
+    `style="..."` attributes rather than a stylesheet, so `unsafe-inline` is
+    required here for those views to render at all. This does not reopen the
+    script-injection surface `script-src` closes: inline styles cannot
+    execute JavaScript, only affect presentation.
   - `font-src 'self' https://fonts.gstatic.com data:` — Google Fonts only.
   - `connect-src 'self' wss: ws: https://api.github.com https://api.pwnedpasswords.com` — WebSocket and specific API endpoints.
   - `img-src 'self' data:` — inline data URIs for icons/avatars.

@@ -3,9 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)">
+<!-- The design is a single deliberately-light institutional theme — styles.css
+     only overrides the 3D-background opacity under prefers-color-scheme:dark,
+     it does not redefine the page's color variables. Declaring
+     "light dark" here previously made Chromium/Firefox render native form
+     controls and scrollbars in dark UA styling on a page that stays light,
+     producing a jarring mixed-theme look for OS dark-mode users. -->
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#FFFFFF">
 <meta name="description" content="QuantumSentinel — The institutional trading terminal secured by post-quantum cryptography. FIPS 203/204 compliant ML-KEM-768 and ML-DSA-65 with live market intelligence.">
 <meta property="og:title" content="QuantumSentinel — Post-Quantum Institutional Trading Terminal">
 <meta property="og:description" content="Institutional-grade paper trading with quantum-safe cryptography. ML-KEM-768 and ML-DSA-65 FIPS compliant session security.">
@@ -250,7 +255,7 @@
       <div class="trading-grid">
         <div class="card">
           <h3>Simulated Order Desk</h3>
-          <p class="hint" data-beginner>Paper order execution &mdash; no capital at risk. Each order is cryptographically signed with ML-DSA-65 before submission and recorded in the tamper-evident audit log.</p>
+          <p class="hint" data-beginner>Paper order execution &mdash; no capital at risk. Each order is cryptographically signed with ML-DSA-65 before submission and recorded in the tamper-evident audit log. Long positions only &mdash; a Sell order can close up to your current holding; naked short selling isn't available on the Order Desk (the Research and Lab backtests support modelling short strategies separately).</p>
           <!-- Live price preview -->
           <div id="order-price-preview" class="hidden">
             <span id="order-price-label">Market price</span>
@@ -259,7 +264,7 @@
           <form id="order-form">
             <label>Instrument<select id="order-asset"></select></label>
             <div class="row">
-              <label>Direction<select id="order-side"><option value="buy">Buy / Long</option><option value="sell">Sell / Short</option></select></label>
+              <label>Direction<select id="order-side"><option value="buy">Buy</option><option value="sell">Sell</option></select></label>
               <label>Quantity<input type="number" id="order-qty" value="1" min="0.0001" step="0.0001" required></label>
             </div>
             <div class="row">

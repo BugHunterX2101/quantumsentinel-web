@@ -20,6 +20,7 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 from typing import Optional, List
+import logging
 import os
 import time
 import secrets
@@ -38,6 +39,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import redis.asyncio as redis
 
@@ -50,23 +52,24 @@ from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service, order_security
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
+from .services import redis_store
 
+log = logging.getLogger(__name__)
 
-# Default watchlist for new users — 50 liquid US assets for cross-sectional factor modeling
-# Covers: Mega-cap tech, financials, healthcare, energy, consumer, industrials,
-# materials, REITs, ETFs, and crypto proxies for broad factor coverage.
-DEFAULT_WATCHLIST = [
-    # Mega-cap tech / growth
-    "AAPL","MSFT","NVDA","GOOGL","META","AMZN","TSLA","AVGO","ORCL","CRM",
-    # Financials
-    "JPM","BAC","GS","MS","BLK","V","MA","PYPL","C","WFC",
-    # Healthcare / biotech
-    "JNJ","LLY","ABBV","MRK","UNH","PFE","AMGN","GILD","BMY","ISRG",
-    # Energy / materials / industrials
-    "XOM","CVX","COP","NEE","CAT","RTX","HON","LIN","FCX","NEM",
-    # Consumer / media / ETFs / crypto
-    "NFLX","AMD","BKNG","DIS","KO","WMT","HD","SPY","QQQ","COIN",
-]
+# Single source of truth for the product version reported by /api/meta,
+# the OpenAPI schema and the compliance evidence bundle.
+APP_VERSION = "1.2.0"
+
+# Default watchlist for new users.
+#
+# This is deliberately identical to signal_engine.PRELOADED_ASSETS: those are
+# the only tickers the SBA basket pipeline keeps warm, so a default containing
+# anything else would show the user a watchlist entry that can never produce a
+# signal. It also has to stay strictly below the 50-asset cap, otherwise a
+# brand-new user (whose effective watchlist is this default) would be unable to
+# add their first ticker.
+DEFAULT_WATCHLIST = list(signal_engine.PRELOADED_ASSETS)
+MAX_WATCHLIST_SIZE = 50
 
 # ── Exchange Registry ──────────────────────────────────────────────────────────
 EXCHANGE_REGISTRY = {
@@ -140,6 +143,39 @@ def _user_watchlist(user: models.User) -> list[str]:
 def _etag(value: str) -> str:
     return hashlib.sha1(value.encode()).hexdigest()[:16]
 
+
+def _probe_tickers_parallel(tickers: list[str], max_workers: int = 10) -> set[str]:
+    """Validate a batch of non-preloaded tickers against yfinance concurrently.
+
+    Probing sequentially (one `yf.Ticker(t).fast_info` HTTP round-trip per
+    ticker) turns a 50-asset watchlist save into tens of seconds of serial
+    network latency. Each probe is independent I/O, so a small thread pool
+    collapses that to roughly the slowest single probe.
+    """
+    if not tickers:
+        return set()
+    import yfinance as yf
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _probe(t: str) -> str | None:
+        try:
+            info = yf.Ticker(t).fast_info
+            return t if getattr(info, "last_price", None) is not None else None
+        except Exception:
+            return None
+
+    valid: set[str] = set()
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(tickers))) as pool:
+        futures = {pool.submit(_probe, t): t for t in tickers}
+        for future in as_completed(futures, timeout=15):
+            try:
+                result = future.result()
+            except Exception:
+                result = None
+            if result:
+                valid.add(result)
+    return valid
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 
@@ -150,6 +186,9 @@ _redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL el
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """FastAPI lifespan handler — replaces deprecated @app.on_event('startup')."""
+    # Publish the running loop so synchronous routes can safely await Redis
+    # coroutines on it instead of creating (and closing) throwaway loops.
+    redis_store.set_app_loop(asyncio.get_running_loop())
     init_db()
     # Register the server signing key in the DB for audit key history (Item 8)
     db = SessionLocal()
@@ -163,10 +202,13 @@ async def _lifespan(_app: FastAPI):
         except Exception as exc:
             if ENVIRONMENT == "production":
                 raise RuntimeError("Redis is required and unavailable") from exc
-    yield  # ── application runs here ──
+    try:
+        yield  # ── application runs here ──
+    finally:
+        redis_store.set_app_loop(None)
 
 
-app = FastAPI(title="QuantumSentinel API", version="1.0.0", lifespan=_lifespan)
+app = FastAPI(title="QuantumSentinel API", version=APP_VERSION, lifespan=_lifespan)
 
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -181,7 +223,32 @@ HTTP_LATENCY = Histogram("quantumsentinel_http_request_duration_seconds", "HTTP 
 
 # Bounded in-memory limiter for the single-process reference deployment. It
 # deliberately protects write paths even before a user has authenticated.
+#
+# Keys are (principal, path) pairs and paths include dynamic segments such as
+# /api/price/{ticker}, so the map has to be swept or it grows without bound for
+# the lifetime of the process.
 _request_windows: dict[str, deque[float]] = defaultdict(deque)
+_RATE_WINDOW_SECONDS = 60
+_RATE_SWEEP_INTERVAL = 120.0
+_RATE_MAX_KEYS = 20_000
+_last_rate_sweep = 0.0
+
+
+def _sweep_request_windows(now: float) -> None:
+    """Drop rate-limit buckets whose window has fully expired."""
+    global _last_rate_sweep
+    if now - _last_rate_sweep < _RATE_SWEEP_INTERVAL and len(_request_windows) < _RATE_MAX_KEYS:
+        return
+    _last_rate_sweep = now
+    for key in [k for k, w in _request_windows.items()
+                if not w or now - w[-1] > _RATE_WINDOW_SECONDS]:
+        _request_windows.pop(key, None)
+    # Hard ceiling: if a burst still leaves the map oversized, evict the
+    # least-recently-seen buckets rather than letting memory grow unbounded.
+    if len(_request_windows) > _RATE_MAX_KEYS:
+        oldest = sorted(_request_windows.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0)
+        for key, _ in oldest[:len(_request_windows) - _RATE_MAX_KEYS]:
+            _request_windows.pop(key, None)
 
 
 @app.middleware("http")
@@ -204,8 +271,9 @@ async def security_headers_and_rate_limit(request, call_next):
                 return JSONResponse({"detail": "Rate-limit service unavailable"}, status_code=503)
             current = 0
     if not _redis_client or current == 0:
+        _sweep_request_windows(now)
         window = _request_windows[key]
-        while window and now - window[0] > 60:
+        while window and now - window[0] > _RATE_WINDOW_SECONDS:
             window.popleft()
         current = len(window) + 1
         window.append(now)
@@ -223,12 +291,22 @@ async def security_headers_and_rate_limit(request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    # Tightened CSP: no unsafe-inline, no external scripts, explicit form-action/object-src
+    # CSP: no unsafe-inline/eval on scripts, no external script hosts beyond
+    # jsdelivr (Three.js), explicit form-action/object-src.
+    #
+    # style-src DOES need 'unsafe-inline': the frontend renders its Research
+    # and Lab result panels (and a fair amount of index.html itself) with
+    # inline `style="..."` attributes rather than a stylesheet — hundreds of
+    # them, generated dynamically per request (metric cards, tables, mini
+    # charts). Without 'unsafe-inline' here, browsers silently drop every one
+    # of those styles, so most of Research/Lab renders unstyled/broken while
+    # script-src stays fully locked down (inline styles cannot execute
+    # script, so this doesn't reopen the XSS surface script-src closes).
     ws_policy = "wss:" if ENVIRONMENT == "production" else "wss: ws:"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "script-src 'self' https://cdn.jsdelivr.net; "
-        "style-src 'self' https://fonts.googleapis.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data:; "
         f"connect-src 'self' {ws_policy} https://api.github.com https://api.pwnedpasswords.com; "
@@ -253,15 +331,12 @@ def get_current_user(
 ) -> models.User:
     """Extract auth token from HttpOnly cookie (browser) or Authorization header (SDK)."""
     token = None
+    from_cookie = False
     # Priority 1: HttpOnly cookie (browser sessions)
     cookie_token = request.cookies.get("qs_access")
     if cookie_token:
-        # Validate CSRF for state-changing requests from browser
-        if request.method not in ("GET", "HEAD", "OPTIONS"):
-            csrf_token = request.headers.get("X-CSRF-Token") or request.cookies.get("qs_csrf")
-            if not csrf_token or not auth_service.verify_csrf_token(csrf_token):
-                raise HTTPException(403, "Invalid or missing CSRF token")
         token = cookie_token
+        from_cookie = True
     # Priority 2: Bearer token (SDK / API clients)
     elif authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ", 1)[1]
@@ -270,6 +345,14 @@ def get_current_user(
     payload = auth_service.decode_access_token(token)
     if not payload:
         raise HTTPException(401, "Invalid or expired token")
+    # Validate CSRF for state-changing browser requests.
+    # The token must be bound to *this* session: a merely well-signed token
+    # issued to some other account would otherwise satisfy the double-submit
+    # check, which defeats the point of the pattern.
+    if from_cookie and request.method not in ("GET", "HEAD", "OPTIONS"):
+        csrf_token = request.headers.get("X-CSRF-Token") or request.cookies.get("qs_csrf")
+        if not csrf_token or not auth_service.verify_csrf_token(csrf_token, session_id=payload["sub"]):
+            raise HTTPException(403, "Invalid or missing CSRF token")
     user = db.get(models.User, payload["sub"])
     if not user or not user.is_active:
         raise HTTPException(401, "User not found or inactive")
@@ -349,7 +432,16 @@ def register(req: schemas.RegisterRequest, request: Request, db: Session = Depen
 
     user = models.User(email=req.email, password_hash=auth_service.hash_password(req.password))
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two concurrent registrations for the same email can both pass the
+        # SELECT check above before either commits; the DB's unique
+        # constraint on users.email is the real guard. Without this handler
+        # the second request surfaces as a raw 500 instead of the same 409
+        # the first-checked path already returns.
+        db.rollback()
+        raise HTTPException(409, "Email already registered")
     db.refresh(user)
 
     # Generate the user's PQC identity keys
@@ -428,18 +520,15 @@ def login(req: schemas.LoginRequest, request: Request, db: Session = Depends(get
     security_service.write_audit_log(db, user.id, "USER_LOGIN", "user", user.id,
                                       {"ip": client_ip, "hash_upgraded": needs_rehash})
 
-    # Cache refresh token in Redis for fast lookup
+    # Cache refresh token in Redis for fast lookup. Dispatched onto the
+    # application's own event loop (see redis_store.run_sync) rather than a
+    # throwaway one — the async redis client's connections are bound to the
+    # loop that created them, so running them elsewhere silently fails.
     if _redis_client:
-        import asyncio
-        from .services import redis_store
         token_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(
-                redis_store.cache_refresh_token(_redis_client, token_hash, user.id, REFRESH_TOKEN_SECONDS)
-            )
-        finally:
-            loop.close()
+        redis_store.run_sync(
+            redis_store.cache_refresh_token(_redis_client, token_hash, user.id, REFRESH_TOKEN_SECONDS)
+        )
 
     response = JSONResponse(content={
         "token_type": "cookie",
@@ -495,18 +584,12 @@ def refresh_session(request: Request, db: Session = Depends(get_db)):
 
     # Update Redis cache
     if _redis_client:
-        import asyncio
-        from .services import redis_store
         old_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
         new_hash = hashlib.sha256(new_refresh_raw.encode()).hexdigest()
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(redis_store.invalidate_refresh_token(_redis_client, old_hash))
-            loop.run_until_complete(
-                redis_store.cache_refresh_token(_redis_client, new_hash, user.id, REFRESH_TOKEN_SECONDS)
-            )
-        finally:
-            loop.close()
+        redis_store.run_sync(redis_store.invalidate_refresh_token(_redis_client, old_hash))
+        redis_store.run_sync(
+            redis_store.cache_refresh_token(_redis_client, new_hash, user.id, REFRESH_TOKEN_SECONDS)
+        )
 
     response = JSONResponse(content={
         "token_type": "cookie",
@@ -540,14 +623,8 @@ def logout(request: Request, db: Session = Depends(get_db)):
     if refresh_raw:
         auth_service.revoke_refresh_token(db, refresh_raw)
         if _redis_client:
-            import asyncio
-            from .services import redis_store
             token_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(redis_store.invalidate_refresh_token(_redis_client, token_hash))
-            finally:
-                loop.close()
+            redis_store.run_sync(redis_store.invalidate_refresh_token(_redis_client, token_hash))
     response = JSONResponse({"status": "logged_out"})
     response.delete_cookie("qs_access", path="/")
     response.delete_cookie("qs_refresh", path="/api/auth/")
@@ -760,7 +837,14 @@ async def signal_stream(websocket: WebSocket):
         seq = 0
         while True:
             try:
-                data = signal_engine.get_cached_signals()
+                # get_cached_signals() is a blocking call — on a cache miss it
+                # does a synchronous yfinance HTTP download while holding a
+                # threading.Lock. Calling it directly here would block this
+                # coroutine's turn on the single shared event loop, stalling
+                # every other request (HTTP and WebSocket) on the server for
+                # the duration of that download. asyncio.to_thread offloads
+                # it to a worker thread so the loop stays responsive.
+                data = await asyncio.to_thread(signal_engine.get_cached_signals)
                 wanted = set(_user_watchlist(user))
                 filtered = [s for s in data.get("signals", []) if s.get("asset") in wanted]
                 ws_payload = dict(data)
@@ -807,36 +891,33 @@ def set_watchlist(
     db: Session = Depends(get_db),
 ):
     """Replace the full watchlist. Body: {"watchlist": ["AAPL","MSFT", ...]}
-    
+
     Accepts any ticker that Yahoo Finance can resolve — not limited to the 20
-    preloaded stocks. Unknown tickers are validated via a fast yfinance probe.
+    preloaded stocks. Unknown tickers are validated via a fast yfinance probe,
+    run concurrently across a small thread pool so a full 50-ticker save
+    doesn't serialise into tens of seconds of network latency.
     """
-    import yfinance as yf
     tickers = body.get("watchlist", [])
     if not isinstance(tickers, list):
         raise HTTPException(400, "watchlist must be a list")
-    if len(tickers) > 50:
-        raise HTTPException(400, "Watchlist limited to 50 assets")
-    
-    cleaned: list[str] = []
+    if len(tickers) > MAX_WATCHLIST_SIZE:
+        raise HTTPException(400, f"Watchlist limited to {MAX_WATCHLIST_SIZE} assets")
+
     preloaded_set = set(signal_engine.PRELOADED_ASSETS)
+    normalized: list[str] = []
+    seen: set[str] = set()
     for raw in tickers:
         t = str(raw).upper().strip()
-        if not t:
-            continue
-        # Preloaded assets are always valid — no need to probe
-        if t in preloaded_set:
-            cleaned.append(t)
-            continue
-        # For unknown tickers, do a fast yfinance probe (history returns non-empty if valid)
-        try:
-            probe = yf.Ticker(t)
-            info = probe.fast_info
-            if getattr(info, 'last_price', None) is not None:
-                cleaned.append(t)
-        except Exception:
-            pass  # skip invalid tickers silently
-    
+        if t and t not in seen:
+            normalized.append(t)
+            seen.add(t)
+
+    to_probe = [t for t in normalized if t not in preloaded_set]
+    probed_valid = _probe_tickers_parallel(to_probe)
+
+    # Preserve the caller's requested ordering rather than "preloaded first".
+    cleaned = [t for t in normalized if t in preloaded_set or t in probed_valid]
+
     if not cleaned:
         raise HTTPException(400, "No recognized tickers provided")
     
@@ -861,8 +942,8 @@ def add_to_watchlist(
     current = _user_watchlist(user)
     if ticker in current:
         return {"watchlist": current, "message": f"{ticker} already in watchlist"}
-    if len(current) >= 50:
-        raise HTTPException(400, "Watchlist limited to 50 assets")
+    if len(current) >= MAX_WATCHLIST_SIZE:
+        raise HTTPException(400, f"Watchlist limited to {MAX_WATCHLIST_SIZE} assets")
     
     # Validate: preloaded assets are always valid; others are probed via yfinance
     if ticker not in signal_engine.PRELOADED_ASSETS:
@@ -968,10 +1049,13 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
         for ft in filled_trades
     )
     # Mandatory boundary between order construction and paper/broker execution.
+    # Passing _redis_client makes kill-switch checks consistent across
+    # worker processes instead of only the process that received the
+    # POST /api/risk/kill-switch request.
     order_security.assert_risk_gate(
         user_id=user.id, asset=req.asset, side=req.side, quantity=req.quantity,
         price=price_for_risk, held_quantity=held, account_equity=account_equity,
-        current_gross_exposure=current_gross_exposure,
+        current_gross_exposure=current_gross_exposure, redis_client=_redis_client,
     )
 
     # FIX: 30-second duplicate window (was 15s) — Alpaca round-trips can take
@@ -2521,7 +2605,7 @@ def meta():
     for key, info in EXCHANGE_REGISTRY.items():
         exchanges_with_status[key] = {**info, "market_status": _market_status(key)}
     return {
-        "product": "QuantumSentinel", "version": "1.1.0",
+        "product": "QuantumSentinel", "version": APP_VERSION,
         "fips_standards": ["FIPS 203 (ML-KEM-768)", "FIPS 204 (ML-DSA-65)"],
         "tracked_assets": signal_engine.TRACKED_ASSETS,
         "asset_exchange_map": signal_engine.ASSET_EXCHANGE_MAP,

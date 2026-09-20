@@ -107,7 +107,7 @@ jobs:
       - name: Build Docker image
         run: docker build -t quantumsentinel:ci .
       - name: Run Trivy (container scan)
-        uses: aquasecurity/trivy-action@0.69.3
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: quantumsentinel:ci
           format: table

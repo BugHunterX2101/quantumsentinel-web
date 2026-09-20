@@ -353,9 +353,10 @@ class WalkForwardEngine:
             for i in range(start + slow_w + 1, min(end, len(close))):
                 fast_ma = np.mean(close[i - fast_w:i])
                 slow_ma = np.mean(close[i - slow_w:i])
-                prev_fast = np.mean(close[i - fast_w - 1:i - 1])
-                prev_slow = np.mean(close[i - slow_w - 1:i - 1])
-                # Simplified: track if we're in position
+                # Simplified: track if we're in position (level signal, not
+                # a crossover-edge signal — the previous-bar MAs aren't
+                # needed here, so they're not recomputed on every iteration
+                # of what's a hot loop during hyperparameter search).
                 in_position = fast_ma > slow_ma
                 if in_position and close[i - 1] > 0:
                     ret = close[i] / close[i - 1] - 1

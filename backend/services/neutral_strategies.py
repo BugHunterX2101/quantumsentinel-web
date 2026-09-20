@@ -95,6 +95,20 @@ class KalmanHedgeFilter:
 # Cointegration test (Engle-Granger two-step, pure Python)
 # ---------------------------------------------------------------------------
 
+# MacKinnon (1991/2010) asymptotic critical values for the Engle-Granger
+# residual-based cointegration test with n=2 (one regressor + a constant in
+# the first-stage OLS). These are NOT the plain Dickey-Fuller "with constant"
+# critical values (-3.43 / -2.86 / -2.57) — the EG test's critical values are
+# more negative because the residual series being tested was itself derived
+# from an estimated cointegrating vector, which adds estimation uncertainty
+# that the plain ADF table doesn't account for. Defined once here and reused
+# by both the cointegration-decision threshold and the p-value approximation
+# below so the two can never disagree with each other.
+_EG_CV_1PCT = -3.96
+_EG_CV_5PCT = -3.37
+_EG_CV_10PCT = -3.04
+
+
 def engle_granger_cointegration(y: np.ndarray, x: np.ndarray,
                                  max_lag: int = 1) -> dict:
     """Engle-Granger (1987) two-step cointegration test.
@@ -102,7 +116,7 @@ def engle_granger_cointegration(y: np.ndarray, x: np.ndarray,
     Step 1: OLS regression y = alpha + beta * x + spread
     Step 2: ADF test on residual spread
 
-    Returns p-value approximation (MacKinnon 1994 critical values).
+    Returns p-value approximation (MacKinnon cointegration critical values).
     """
     T = len(y)
     if T < 30:
@@ -119,19 +133,16 @@ def engle_granger_cointegration(y: np.ndarray, x: np.ndarray,
     hedge_ratio = float(beta[1])
     alpha = float(beta[0])
 
-    # Step 2: ADF test on spread (no-constant, no-trend)
-    adf_stat, adf_p = _adf_test(spread, max_lag=max_lag)
-
-    # MacKinnon (1994) 5% critical value for cointegration: ~ -3.37
-    CV_5pct = -3.37
-    CV_1pct = -3.96
+    # Step 2: ADF test on spread (no-constant, no-trend — the residual is
+    # already mean-zero by construction from the step-1 OLS with intercept).
+    adf_stat, adf_p = _eg_residual_adf_test(spread, max_lag=max_lag)
 
     return {
-        "cointegrated": adf_stat < CV_5pct,
-        "cointegrated_1pct": adf_stat < CV_1pct,
+        "cointegrated": adf_stat < _EG_CV_5PCT,
+        "cointegrated_1pct": adf_stat < _EG_CV_1PCT,
         "adf_stat": round(adf_stat, 4),
         "adf_p_approx": round(adf_p, 4),
-        "critical_value_5pct": CV_5pct,
+        "critical_value_5pct": _EG_CV_5PCT,
         "hedge_ratio": round(hedge_ratio, 6),
         "alpha": round(alpha, 6),
         "spread_mean": round(float(spread.mean()), 6),
@@ -140,8 +151,20 @@ def engle_granger_cointegration(y: np.ndarray, x: np.ndarray,
     }
 
 
-def _adf_test(series: np.ndarray, max_lag: int = 1) -> tuple[float, float]:
-    """Augmented Dickey-Fuller test statistic for a unit root."""
+def _eg_residual_adf_test(series: np.ndarray, max_lag: int = 1) -> tuple[float, float]:
+    """(Augmented) Dickey-Fuller t-statistic for a unit root in an
+    Engle-Granger cointegrating residual series, with a p-value
+    approximation against the Engle-Granger (not plain-ADF) critical
+    values.
+
+    This is deliberately not a general-purpose ADF test: the regression run
+    here has no constant term (see below) and the p-value bucketing uses
+    _EG_CV_1PCT/5PCT/10PCT — the correct table for testing residuals of an
+    estimated cointegrating relationship, not the plain "no constant"
+    Dickey-Fuller table (whose asymptotic 5% value is ≈ -1.95, a very
+    different number). Reusing this helper for a standalone unit-root test
+    on a raw (non-residual) series would silently apply the wrong table.
+    """
     T = len(series)
     dy = np.diff(series)
     y_lag = series[max_lag:-1] if max_lag > 0 else series[:-1]
@@ -171,13 +194,19 @@ def _adf_test(series: np.ndarray, max_lag: int = 1) -> tuple[float, float]:
     except Exception:
         return 0.0, 1.0
 
-    # Approximate p-value via MacKinnon critical values
-    cv = {0.01: -3.48, 0.05: -2.87, 0.10: -2.57}
-    if t_stat < cv[0.01]:
+    # Approximate p-value via the *same* Engle-Granger critical values used
+    # for the "cointegrated" / "cointegrated_1pct" decision above — using a
+    # different table here (as a previous version of this function did, with
+    # the plain "constant, no trend" ADF critical values -3.48/-2.87/-2.57)
+    # let adf_p_approx contradict the cointegrated flag: a spread could be
+    # flagged cointegrated at 5% (t_stat < -3.37) while its own reported
+    # p-value read back as > 5% (since -3.37 > -2.87), because the two
+    # thresholds weren't the same test.
+    if t_stat < _EG_CV_1PCT:
         p = 0.005
-    elif t_stat < cv[0.05]:
+    elif t_stat < _EG_CV_5PCT:
         p = 0.025
-    elif t_stat < cv[0.10]:
+    elif t_stat < _EG_CV_10PCT:
         p = 0.075
     else:
         p = 0.20

@@ -192,8 +192,14 @@ class PositionSizer:
             b = max(0.01, avg_win_loss_ratio)
             q = 1.0 - p
             kelly_f = (p * b - q) / b
-            kelly_f = max(0.0, min(kelly_f, 0.5))  # half-Kelly cap
-            notional = capital * kelly_f * 0.5  # use half-Kelly
+            # Safety cap on the full-Kelly fraction itself (never treat more
+            # than 50% of capital as the *full*-Kelly answer, regardless of
+            # how favorable p/b look — full Kelly can be very aggressive on
+            # noisy win-rate/win-loss estimates), then apply half-Kelly on
+            # top of that capped value. The combined effect caps the actual
+            # position at 25% of capital even in the most favorable case.
+            kelly_f = max(0.0, min(kelly_f, 0.5))
+            notional = capital * kelly_f * 0.5  # half-Kelly of the capped fraction
             shares = notional / price
 
         elif self.method == SizingMethod.EQUAL_WEIGHT:

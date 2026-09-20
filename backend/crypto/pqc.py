@@ -28,7 +28,11 @@ from kyber_py.ml_kem import ML_KEM_768
 from dilithium_py.ml_dsa import ML_DSA_65
 from ..config import ENVIRONMENT, PQC_PROVIDER, PQC_PROVIDER_URL
 
-HKDF_SALT_CONTEXT = b"QuantumSentinel-v1"
+# Passed as HKDF's `info` parameter (domain-separation context), NOT `salt` —
+# the per-session client/server nonces below serve as the actual salt. Named
+# for what HKDF's RFC 5869 calls this parameter's *purpose* (protocol/context
+# binding), not its keyword name, to avoid it being misread as the salt input.
+HKDF_INFO_CONTEXT = b"QuantumSentinel-v1"
 HANDSHAKE_PROTOCOL_VERSION = "QS-HANDSHAKE-V2"
 
 
@@ -128,7 +132,7 @@ def derive_session_key(x25519_shared: bytes, ml_kem_shared: bytes,
     """session_key = HKDF-SHA256(X25519_secret || ML-KEM_secret, salt=client||server nonce)."""
     combined_ikm = x25519_shared + ml_kem_shared
     salt = client_nonce + server_nonce
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=HKDF_SALT_CONTEXT)
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=HKDF_INFO_CONTEXT)
     return hkdf.derive(combined_ikm)
 
 

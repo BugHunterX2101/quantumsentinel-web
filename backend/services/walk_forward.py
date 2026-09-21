@@ -104,6 +104,22 @@ class FoldResult:
         }
 
 
+def _windowed_vol(close: np.ndarray, i: int, window: int = 22) -> float:
+    """Trailing return volatility over up to `window` bars ending at close[i-1].
+
+    Slices a single price window and derives both the numerator (price
+    diffs) and denominator (prior prices) from it via ``[:-1]`` so their
+    lengths always match by construction, instead of computing the two
+    slices independently (which silently breaks alignment near array
+    boundaries — a shape mismatch that previously raised at runtime).
+    """
+    prices = close[max(0, i - window):i]
+    if len(prices) <= 2:
+        return 0.02
+    rets = np.diff(prices) / np.maximum(prices[:-1], 1e-9)
+    return float(np.std(rets))
+
+
 class WalkForwardEngine:
     """Walk-forward validation engine."""
 
@@ -410,8 +426,7 @@ class WalkForwardEngine:
             # Crossover detection
             if position == 0 and prev_fast <= prev_slow and fast_ma > slow_ma:
                 # Buy
-                vol = float(np.std(np.diff(close[max(0, i - 22):i]) /
-                            np.maximum(close[max(0, i - 21):max(1, i - 1)], 1e-9))) if i > 2 else 0.02
+                vol = _windowed_vol(close, i)
                 desired = capital * 0.95 / price
                 fill = executor.execute_order(
                     "buy", desired, price, vol, 1e6, asset, capital, 0
@@ -424,8 +439,7 @@ class WalkForwardEngine:
 
             elif position > 0 and prev_fast >= prev_slow and fast_ma < slow_ma:
                 # Sell
-                vol = float(np.std(np.diff(close[max(0, i - 22):i]) /
-                            np.maximum(close[max(0, i - 21):max(1, i - 1)], 1e-9))) if i > 2 else 0.02
+                vol = _windowed_vol(close, i)
                 fill = executor.execute_order(
                     "sell", position, price, vol, 1e6, asset, capital, position
                 )

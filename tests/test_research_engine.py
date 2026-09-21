@@ -246,6 +246,18 @@ class TestStatTests:
         result = permutation_test(rets, n_permutations=500)
         assert result["p_value"] > 0.01
 
+    def test_permutation_has_power_against_real_skill(self):
+        # A naive reordering of returns cannot change mean/std, so a test
+        # built that way would report the same (non-)significance no
+        # matter how strong the underlying edge is. Verify the test has
+        # actual statistical power: a clearly skilled strategy (high
+        # true Sharpe) must be flagged significant.
+        rets = np.random.default_rng(7).normal(0.003, 0.01, 500)
+        result = permutation_test(rets, n_permutations=2000)
+        assert result["observed_sharpe"] > 2.0
+        assert result["p_value"] < 0.01
+        assert result["significant_1pct"] is True
+
     def test_ljung_box(self):
         rets = np.random.default_rng(42).normal(0, 0.01, 200)
         result = ljung_box_test(rets)

@@ -155,41 +155,57 @@ def _build_risk_decomposition(returns: np.ndarray) -> dict:
 
 
 def _build_wf_table(wf_result: dict) -> list[dict]:
-    """Convert walk-forward result into a clean per-fold table."""
+    """Convert walk-forward result into a clean per-fold table.
+
+    Reads the keys FoldResult.to_dict() (backend/services/walk_forward.py)
+    actually produces — a flat dict with "fold", "train_period",
+    "test_period", "oos_sharpe", "oos_return", "oos_max_dd",
+    "best_fast_window", "best_slow_window" — not the "fold_id" /
+    "train_start" / nested "oos_metrics" shape this previously assumed,
+    which doesn't exist anywhere in the real producer and silently made
+    every row read back as zero/empty regardless of the actual results.
+    """
     folds = wf_result.get("folds", [])
     if not folds:
         return []
     rows = []
     for f in folds:
-        oos = f.get("oos_metrics", {})
+        oos_sharpe = f.get("oos_sharpe", 0.0)
         rows.append({
-            "fold":       f.get("fold_id", 0),
-            "train_start": f.get("train_start", ""),
-            "train_end":   f.get("train_end",   ""),
-            "test_start":  f.get("test_start",  ""),
-            "test_end":    f.get("test_end",    ""),
-            "oos_sharpe":  round(oos.get("sharpe_ratio", 0.0), 4),
-            "oos_return":  round(oos.get("annual_return", 0.0), 4),
-            "oos_max_dd":  round(oos.get("max_drawdown",  0.0), 4),
-            "best_fast":   f.get("best_fast_window", None),
-            "best_slow":   f.get("best_slow_window", None),
-            "degraded":    oos.get("sharpe_ratio", 0.0) < 0,
+            "fold":         f.get("fold", 0),
+            "train_period": f.get("train_period", ""),
+            "test_period":  f.get("test_period", ""),
+            "oos_sharpe":   round(oos_sharpe, 4),
+            "oos_return":   round(f.get("oos_return", 0.0), 4),
+            "oos_max_dd":   round(f.get("oos_max_dd", 0.0), 4),
+            "best_fast":    f.get("best_fast_window", None),
+            "best_slow":    f.get("best_slow_window", None),
+            "degraded":     oos_sharpe < 0,
         })
     return rows
 
 
 def _build_factor_table(fm_result: dict) -> list[dict]:
-    """Convert Fama-MacBeth result into a clean factor premia table."""
+    """Convert Fama-MacBeth result into a clean factor premia table.
+
+    fama_macbeth() (backend/services/factor_model.py) annualises each
+    factor's premium under the key "lambda_annualised", not "premium_ann"
+    (which doesn't exist in the real output and previously made every row
+    read back as a 0.0 annualised premium regardless of the actual
+    result). It also already computes "significant_5pct" off the same
+    p-value the row reports, so that's read directly instead of
+    re-deriving a second, independent significance test here.
+    """
     premia = fm_result.get("factor_premia", {})
     rows = []
     for factor, stats in premia.items():
         t_stat = stats.get("t_stat", 0.0)
         rows.append({
             "factor":    factor,
-            "premium_ann": round(stats.get("premium_ann", 0.0), 4),
+            "premium_ann": round(stats.get("lambda_annualised", 0.0), 4),
             "t_stat":    round(t_stat, 4),
             "p_value":   round(stats.get("p_value", 1.0), 6),
-            "significant_5pct": abs(t_stat) > 1.96,
+            "significant_5pct": stats.get("significant_5pct", abs(t_stat) > 1.96),
             "newey_west_se": round(stats.get("nw_se", 0.0), 6),
         })
     # Sort by |t_stat| descending
@@ -293,13 +309,17 @@ def generate_report(
     # 2. Walk-forward table
     if wf_result is not None:
         report["walk_forward_table"] = _clean(_build_wf_table(wf_result))
-        summary_oos = wf_result.get("aggregated_oos", {})
+        folds = wf_result.get("folds", [])
+        n_folds = wf_result.get("n_folds", len(folds))
+        n_profitable = sum(1 for f in folds if f.get("oos_sharpe", 0.0) > 0)
+        agg_oos = wf_result.get("aggregated_oos", {})
+        overfit = wf_result.get("overfitting_analysis", {})
         report["walk_forward_summary"] = _clean({
-            "n_folds":          wf_result.get("n_folds", 0),
-            "pct_profitable_folds": wf_result.get("pct_profitable_folds", 0),
-            "mean_oos_sharpe":  summary_oos.get("mean_sharpe", 0.0),
-            "oos_degradation":  wf_result.get("sharpe_degradation_pct", 0.0),
-            "overfitting_flag": wf_result.get("overfitting_detected", False),
+            "n_folds":          n_folds,
+            "pct_profitable_folds": round(n_profitable / n_folds, 4) if n_folds else 0.0,
+            "mean_oos_sharpe":  agg_oos.get("sharpe", 0.0),
+            "oos_degradation":  overfit.get("overfitting_score", 0.0),
+            "overfitting_flag": overfit.get("likely_overfit", False),
         })
     else:
         report["walk_forward_table"] = {"status": "not_run"}
@@ -314,7 +334,7 @@ def generate_report(
                 1 for s in factor_result.get("factor_premia", {}).values()
                 if abs(s.get("t_stat", 0.0)) > 1.96
             ),
-            "avg_r_squared": factor_result.get("avg_r_squared", None),
+            "avg_r_squared": factor_result.get("mean_cross_sectional_r2", None),
         })
     else:
         report["factor_premia_table"] = {"status": "not_run"}

@@ -155,12 +155,16 @@ def bootstrap_sharpe_ci(returns: np.ndarray, n_bootstrap: int = 10_000,
 
 def permutation_test(returns: np.ndarray, n_permutations: int = 10_000,
                      seed: int = 42) -> dict:
-    """Permutation test for strategy significance.
+    """Sign-flip randomization test for strategy significance.
 
-    Shuffles return dates to destroy any signal-dependent structure,
-    then computes the Sharpe ratio under the null of no timing skill.
-    The p-value is the fraction of permuted Sharpes that exceed the
-    observed Sharpe.
+    Reordering the same set of return values (a naive permutation) cannot
+    change their mean or standard deviation, so it cannot change the
+    Sharpe ratio — that approach is a statistical no-op regardless of
+    strategy quality. Instead, each replicate randomly flips the sign of
+    every return (a Rademacher randomization), generating the null
+    distribution of the Sharpe ratio under H0: returns are symmetric
+    about zero (no directional skill). The p-value is the fraction of
+    sign-flipped Sharpes that exceed the observed Sharpe.
     """
     n = len(returns)
     if n < 10:
@@ -172,7 +176,8 @@ def permutation_test(returns: np.ndarray, n_permutations: int = 10_000,
 
     count_exceeding = 0
     for _ in range(n_permutations):
-        perm = rng.permutation(returns)
+        signs = rng.choice(np.array([-1.0, 1.0]), size=n)
+        perm = returns * signs
         perm_std = np.std(perm, ddof=1)
         perm_sharpe = float(np.mean(perm) / max(perm_std, 1e-9) * math.sqrt(252))
         if perm_sharpe >= observed_sharpe:

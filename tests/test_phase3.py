@@ -363,6 +363,25 @@ class TestPairsTradingSignals:
         result = pairs_trading_signals(y, x)
         assert len(result["signals"]) == len(y)
 
+    def test_kalman_spread_is_not_degenerate(self, cointegrated_pair):
+        # The tradeable spread must be built from the Kalman filter's PRIOR
+        # (pre-update) beta, not the posterior fit() returns. The posterior
+        # update is chosen specifically to explain away the very
+        # observation being tested, so using it makes y_t - beta_t|t*x_t
+        # collapse toward zero (empirically ~3 orders of magnitude smaller
+        # than the genuine one-step-ahead residual) — a regression here
+        # would silently make the strategy non-tradeable while still
+        # "looking" structurally fine (right shapes, finite numbers).
+        y, x = cointegrated_pair
+        result = pairs_trading_signals(y, x, use_kalman=True, window=60)
+        hedge_ratios = np.array([h for h in result["hedge_ratios"] if h is not None])
+        assert len(hedge_ratios) > 50
+        # cointegrated_pair is y = 2*x + N(0, 1.5); a genuine one-step-ahead
+        # spread should have a standard deviation on that order, not
+        # collapsed to near-zero.
+        spread = y[:len(hedge_ratios)] - hedge_ratios * x[:len(hedge_ratios)]
+        assert spread.std() > 0.5
+
     def test_entry_exit_z_respected(self, cointegrated_pair):
         y, x = cointegrated_pair
         result = pairs_trading_signals(y, x, entry_z=3.0, exit_z=1.0)

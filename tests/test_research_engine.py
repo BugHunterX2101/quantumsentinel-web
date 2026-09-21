@@ -149,7 +149,7 @@ class TestExecutionSimulator:
 
 from backend.services.backtest_service import (
     _sharpe, _sortino, _max_drawdown, _var_cvar, _calmar,
-    _alpha_beta, _omega_ratio,
+    _alpha_beta, _omega_ratio, _downside_deviation,
 )
 
 
@@ -169,6 +169,30 @@ class TestRiskHelpers:
         s = _sortino(rets)
         assert s > 0
 
+    def test_sortino_downside_deviation_divides_by_total_periods(self):
+        """Downside deviation must be RMS-shortfall-below-target averaged
+        over ALL periods, not just the periods that fall below target.
+        Dividing by only the downside count (dropping the zero terms from
+        periods at/above target) overstates the deviation and understates
+        the ratio — verified against the standard Sortino formula:
+        DD = sqrt(mean(min(r - target, 0)^2)) over the full sample."""
+        rets = np.array([0.02, 0.02, 0.02, 0.02, -0.01])
+        import math as _math
+        expected_dd = _math.sqrt(np.mean(np.minimum(rets, 0.0) ** 2))
+        expected_sortino = (np.mean(rets) / expected_dd) * _math.sqrt(252)
+        s = _sortino(rets)
+        assert s == pytest.approx(expected_sortino, rel=1e-9)
+        # The old (buggy) denominator used only the single downside period:
+        # dd_wrong = sqrt(mean((-0.01)**2)) is numerically the same here by
+        # coincidence (n=1 downside), so use a case with >1 downside period
+        # to actually discriminate between the two conventions.
+        rets2 = np.array([0.02, 0.02, 0.02, -0.01, -0.03])
+        dd_correct = _math.sqrt(np.mean(np.minimum(rets2, 0.0) ** 2))  # divide by 5
+        dd_wrong = _math.sqrt(np.mean(np.array([-0.01, -0.03]) ** 2))  # divide by 2 (buggy)
+        assert dd_correct != pytest.approx(dd_wrong)
+        expected_sortino2 = (np.mean(rets2) / dd_correct) * _math.sqrt(252)
+        assert _sortino(rets2) == pytest.approx(expected_sortino2, rel=1e-9)
+
     def test_max_drawdown(self):
         curve = [100, 110, 95, 105, 90]
         dd = _max_drawdown(curve)
@@ -187,6 +211,14 @@ class TestRiskHelpers:
         c = _calmar(rets, max_dd)
         expected = 0.001 * 252 / 0.05
         assert c == pytest.approx(expected, rel=0.01)
+
+    def test_downside_deviation_divides_by_total_periods(self):
+        rets = np.array([0.02, 0.02, 0.02, -0.01, -0.03])
+        dd = _downside_deviation(rets)
+        expected = float(np.sqrt(np.mean(np.minimum(rets, 0.0) ** 2)))  # divide by 5
+        wrong = float(np.sqrt(np.mean(np.array([-0.01, -0.03]) ** 2)))  # divide by 2
+        assert dd == pytest.approx(expected, rel=1e-9)
+        assert dd != pytest.approx(wrong)
 
     def test_omega_ratio(self):
         rets = np.array([0.01, 0.02, -0.005, 0.015, -0.01])

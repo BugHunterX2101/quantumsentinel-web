@@ -163,6 +163,22 @@ def test_bollinger_width_near_zero_for_flat_price():
     assert signal_engine._bollinger_width(close) < 1e-6
 
 
+def test_bollinger_width_uses_population_std():
+    """Bollinger's original definition uses population std (divide by N),
+    matching TA-Lib and standard charting platforms — not sample std
+    (divide by N-1), which overstates band width by a factor of
+    sqrt(N/(N-1))."""
+    close = np.array([100.0 + i * 0.5 + (i % 3) * 2 for i in range(30)])
+    window = 20
+    w = close[-window:]
+    mid = w.mean()
+    expected = 4.0 * w.std(ddof=0) / mid
+    wrong = 4.0 * w.std(ddof=1) / mid
+    result = signal_engine._bollinger_width(close, window=window)
+    assert result == pytest.approx(expected, rel=1e-9)
+    assert result != pytest.approx(wrong)
+
+
 def test_score_signal_buy_penalised_when_overbought():
     """score_signal: overbought RSI reduces BUY confidence."""
     _, conf_ok  = signal_engine.score_signal(0.8, 50.0)  # RSI neutral

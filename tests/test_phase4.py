@@ -359,6 +359,28 @@ class TestScipyStatTests:
 # ===========================================================================
 
 class TestReportGenerator:
+    def test_sortino_uses_rms_from_target_over_full_sample(self):
+        """report_generator._sortino must measure RMS shortfall below the
+        target (0) averaged over the full sample, not the standard
+        deviation of the negative-return subset around its own mean (a
+        different and incorrect quantity) nor divided by only the downside
+        count."""
+        import math
+        import numpy as np
+        from backend.services.report_generator import _sortino
+
+        rets = np.array([0.02, 0.02, 0.02, 0.02, -0.01, -0.05])
+        result = _sortino(rets)
+        expected_dsd = math.sqrt(np.mean(np.minimum(rets, 0.0) ** 2)) * math.sqrt(252)
+        expected = (np.mean(rets) * 252) / expected_dsd
+        assert result == pytest.approx(expected, rel=1e-9)
+
+        # The old implementation computed std(downside, ddof=1) around the
+        # downside subset's own mean instead — numerically different here.
+        wrong_dsd = float(np.std(rets[rets < 0], ddof=1)) * math.sqrt(252)
+        wrong = (np.mean(rets) * 252) / wrong_dsd
+        assert result != pytest.approx(wrong)
+
     def test_generate_report_all_sections(self, strategy_returns):
         from backend.services.report_generator import generate_report
         report = generate_report(returns=strategy_returns)

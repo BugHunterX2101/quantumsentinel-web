@@ -155,14 +155,19 @@ def _momentum(close: np.ndarray, lookback: int = 20) -> float:
 
 
 def _bollinger_width(close: np.ndarray, window: int = 20) -> float:
-    """Bollinger Band width = (upper - lower) / mid.  Normalised volatility proxy."""
+    """Bollinger Band width = (upper - lower) / mid.  Normalised volatility proxy.
+
+    Uses population standard deviation (ddof=0), matching Bollinger's original
+    definition (sigma = sqrt(1/n * sum((x-mean)^2))) and the convention used by
+    TA-Lib and other standard charting platforms — not the sample std (ddof=1).
+    """
     if len(close) < window:
         return 0.0
     w = close[-window:].astype(float)
     mid = w.mean()
     if mid < 1e-10:
         return 0.0
-    std = w.std(ddof=1)  # sample std
+    std = w.std(ddof=0)  # population std, per Bollinger's original definition
     return float(4.0 * std / mid)  # (upper-lower)/mid = 4σ/mid
 
 

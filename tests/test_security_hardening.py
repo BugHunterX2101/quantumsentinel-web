@@ -221,6 +221,52 @@ class TestHandshake:
             assert identity.fingerprint == expected
 
 
+class TestSessionExpiryConcurrency:
+    """perform_handshake() is a sync FastAPI route, so concurrent requests run
+    _expire_sessions() on separate threadpool threads. Without a lock, two
+    threads racing to delete the same expired/over-capacity key raise
+    KeyError. Reproduce with real threads hammering the shared SESSIONS dict."""
+
+    def test_expire_sessions_concurrent_no_keyerror(self):
+        import sys
+        import threading
+
+        # Tighten the GIL switch interval so threads actually interleave
+        # inside the dict iteration/deletion — at the default interval the
+        # race window is narrow enough that this test can pass even against
+        # the unpatched (unlocked) implementation.
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(0.00001)
+        try:
+            auth_service.SESSIONS.clear()
+            now = time.time()
+            for i in range(2000):
+                auth_service.SESSIONS[f"sess-{i}"] = {
+                    "created_at": now - i, "expires_at": now - 1,  # all expired
+                }
+
+            errors = []
+
+            def worker():
+                try:
+                    for _ in range(10):
+                        auth_service._expire_sessions()
+                except Exception as e:
+                    errors.append(e)
+
+            threads = [threading.Thread(target=worker) for _ in range(16)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert errors == [], f"_expire_sessions raced: {errors}"
+            assert len(auth_service.SESSIONS) == 0
+        finally:
+            sys.setswitchinterval(old_interval)
+            auth_service.SESSIONS.clear()
+
+
 # ===========================================================================
 # Item 5: Redis-backed kill switches (in-memory fallback tests)
 # ===========================================================================

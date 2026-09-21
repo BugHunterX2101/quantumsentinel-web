@@ -245,6 +245,15 @@ def write_audit_log(db: Session, user_id: str | None, action: str,
     # chain below additionally makes deletion, modification, and reordering
     # observable when the history is verified.
     sequence = _get_audit_sequence(db)
+    if _is_postgres:
+        # nextval() makes `sequence` unique but doesn't stop two concurrent
+        # writers from both reading the same "latest" link before either
+        # commits its own new one — that would make two links point at the
+        # same previous_hash and break the contiguity verify_audit_chain()
+        # relies on. Serialize this read+insert critical section with a
+        # transaction-scoped advisory lock, released automatically at the
+        # commit() below; unrelated writes elsewhere are unaffected.
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'))"))
     previous = db.execute(
         select(models.AuditChainLink).order_by(models.AuditChainLink.sequence.desc())
     ).scalars().first()

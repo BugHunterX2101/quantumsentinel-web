@@ -197,7 +197,14 @@
           const d2 = dx * dx + dy * dy + dz * dz;
           if (d2 < dist2) {
             const alpha = 1.0 - d2 / dist2;
-            const li = lineIdx / 3 * 6;
+            // FIX: each line segment occupies 6 floats (2 vertices * 3
+            // coords) and lineIdx advances by 2 per segment (a vertex
+            // counter), so the float offset is lineIdx * 3 — not
+            // lineIdx / 3 * 6 (== lineIdx * 2), which under-advanced the
+            // write pointer by 2 floats per segment and made every segment
+            // after the first overlap and corrupt the previous segment's
+            // tail coordinates in the shared position/color buffers.
+            const li = lineIdx * 3;
             // from
             lp[li]     = ix; lp[li + 1] = iy; lp[li + 2] = iz;
             // to

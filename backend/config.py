@@ -51,6 +51,12 @@ SERVER_DSA_CREATED_AT = _setting("SERVER_DSA_CREATED_AT")
 # --- Server identity pinning (Item 4) ----------------------------------------
 TRUSTED_SERVER_DSA_FINGERPRINT = _setting("TRUSTED_SERVER_DSA_FINGERPRINT")
 
+# Operators permitted to arm/clear platform-wide (global/asset) kill switches.
+# Deliberately config-driven rather than a DB flag: it fails closed when unset
+# (nobody holds the privilege) and the privileged set is fixed at deploy time
+# rather than mutable by anything the application itself can write to.
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+
 DATABASE_URL = _setting("DATABASE_URL", "sqlite:///./quantumsentinel.db")
 REDIS_URL = _setting("REDIS_URL")
 PQC_PROVIDER = _setting("PQC_PROVIDER", "reference")

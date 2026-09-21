@@ -47,7 +47,7 @@ from . import models, schemas
 from .database import get_db, init_db, SessionLocal
 from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS,
                      COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
-                     REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT)
+                     REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT, ADMIN_EMAILS)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service, order_security
 from .services import walk_forward as walk_forward_service
@@ -208,7 +208,16 @@ async def _lifespan(_app: FastAPI):
         redis_store.set_app_loop(None)
 
 
-app = FastAPI(title="QuantumSentinel API", version=APP_VERSION, lifespan=_lifespan)
+# /docs, /redoc and the raw OpenAPI schema disclose every route, request/
+# response model and field name. Fine for local development; an
+# unauthenticated map of the entire API is unnecessary exposure once live.
+_docs_enabled = ENVIRONMENT != "production"
+app = FastAPI(
+    title="QuantumSentinel API", version=APP_VERSION, lifespan=_lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+)
 
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -350,7 +359,14 @@ def get_current_user(
     # issued to some other account would otherwise satisfy the double-submit
     # check, which defeats the point of the pattern.
     if from_cookie and request.method not in ("GET", "HEAD", "OPTIONS"):
-        csrf_token = request.headers.get("X-CSRF-Token") or request.cookies.get("qs_csrf")
+        # The token MUST come from the custom header. Falling back to the
+        # qs_csrf cookie would validate the cookie against itself: a browser
+        # attaches cookies to cross-site requests automatically, so an
+        # attacker's forged form/fetch would satisfy the check with zero
+        # knowledge of the token. Only a header — which cross-origin callers
+        # cannot set without a passing CORS preflight — proves the request
+        # originated from our own JS.
+        csrf_token = request.headers.get("X-CSRF-Token")
         if not csrf_token or not auth_service.verify_csrf_token(csrf_token, session_id=payload["sub"]):
             raise HTTPException(403, "Invalid or missing CSRF token")
     user = db.get(models.User, payload["sub"])
@@ -2606,18 +2622,35 @@ def server_signing_keys(user: models.User = Depends(get_current_user), db: Sessi
 # --------------------------------------------------------------------------
 # Kill switch admin endpoints (Item 6)
 # --------------------------------------------------------------------------
+def _is_admin(user: models.User) -> bool:
+    return bool(user.email) and user.email.lower() in ADMIN_EMAILS
+
+
 @app.post("/api/risk/kill-switch")
 async def manage_kill_switch(
     body: dict,
     user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Set or clear a trading kill switch. Requires admin-level user."""
+    """Set or clear a trading kill switch.
+
+    Platform-wide (`global`) and per-asset switches halt trading for every
+    user, so they are restricted to configured operators. A `user`-scoped
+    switch is self-service: anyone may halt their OWN trading, but targeting
+    another account is an operator action.
+    """
     scope = body.get("scope", "global")
     identifier = body.get("identifier")
     enabled = body.get("enabled", True)
     if scope not in {"global", "user", "asset"}:
         raise HTTPException(400, "scope must be global, user, or asset")
+    if scope == "user":
+        if identifier is None:
+            identifier = user.id
+        if identifier != user.id and not _is_admin(user):
+            raise HTTPException(403, "not permitted to set a kill switch for another user")
+    elif not _is_admin(user):
+        raise HTTPException(403, f"{scope} kill switches require operator privileges")
     if _redis_client:
         await order_security.set_kill_switch_async(_redis_client, scope, identifier, enabled)
     else:
@@ -2630,12 +2663,22 @@ async def manage_kill_switch(
 
 @app.get("/api/risk/kill-switch")
 async def list_kill_switches_endpoint(user: models.User = Depends(get_current_user)):
-    """List all active kill switches."""
+    """List active kill switches.
+
+    Non-operators see only switches that affect them (global, their own
+    asset-agnostic user switch); the raw list is withheld because a
+    `user`-scoped entry discloses another account's id.
+    """
     if _redis_client:
         from .services import redis_store
         switches = await redis_store.list_kill_switches(_redis_client)
     else:
         switches = [{"scope": s, "identifier": i} for s, i in order_security._KILL_SWITCHES]
+    if not _is_admin(user):
+        switches = [
+            s for s in switches
+            if s.get("scope") != "user" or s.get("identifier") == user.id
+        ]
     return {"kill_switches": switches}
 
 

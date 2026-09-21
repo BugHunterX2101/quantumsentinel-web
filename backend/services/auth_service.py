@@ -41,12 +41,14 @@ from threading import Lock
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..crypto import pqc
 from ..config import (JWT_SIGNING_KEY, JWT_VERIFY_KEY, JWT_ALGORITHM, JWT_EXPIRE_SECONDS,
-                      REFRESH_TOKEN_SECRET, REFRESH_TOKEN_SECONDS, CSRF_SECRET)
+                      REFRESH_TOKEN_SECRET, REFRESH_TOKEN_SECONDS,
+                      REFRESH_ABSOLUTE_SESSION_SECONDS, CSRF_SECRET)
 
 log = logging.getLogger(__name__)
 
@@ -296,6 +298,22 @@ def rotate_refresh_token(db: Session, raw_token: str, redis_client=None) -> tupl
                      record.family_id, record.user_id)
         _revoke_family(db, record.family_id)
         return None
+
+    # ABSOLUTE SESSION LIFETIME: each rotation resets the sliding
+    # REFRESH_TOKEN_SECONDS expiry, so a session kept alive purely by
+    # periodic rotation (an open tab, or an attacker replaying a stolen
+    # token just often enough) would otherwise never force re-authentication.
+    # Cap the family's total age from its ORIGINAL token, not this rotation.
+    family_created_at = db.query(func.min(models.RefreshToken.created_at)).filter(
+        models.RefreshToken.family_id == record.family_id
+    ).scalar()
+    if family_created_at is not None:
+        if family_created_at.tzinfo is None:
+            family_created_at = family_created_at.replace(tzinfo=dt.timezone.utc)
+        family_age = (dt.datetime.now(dt.timezone.utc) - family_created_at).total_seconds()
+        if family_age > REFRESH_ABSOLUTE_SESSION_SECONDS:
+            _revoke_family(db, record.family_id)
+            return None
 
     # Mark old token as used
     record.is_used = True

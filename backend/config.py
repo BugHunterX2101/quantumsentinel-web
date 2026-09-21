@@ -33,6 +33,12 @@ REFRESH_SESSION_SECONDS = int(os.getenv("REFRESH_SESSION_SECONDS", "3600"))
 # --- Refresh-token rotation ---------------------------------------------------
 REFRESH_TOKEN_SECRET = _setting("REFRESH_TOKEN_SECRET") or secrets.token_hex(32)
 REFRESH_TOKEN_SECONDS = int(os.getenv("REFRESH_TOKEN_SECONDS", "86400"))
+# Absolute cap on a refresh-token family's total lifetime, independent of the
+# sliding REFRESH_TOKEN_SECONDS window each rotation grants. Without this, a
+# session that keeps getting silently rotated (a browser tab left open, or a
+# stolen token an attacker keeps refreshing) never expires and never forces
+# re-authentication with the password.
+REFRESH_ABSOLUTE_SESSION_SECONDS = int(os.getenv("REFRESH_ABSOLUTE_SESSION_SECONDS", str(30 * 86400)))
 
 # --- HttpOnly cookie settings -------------------------------------------------
 COOKIE_DOMAIN = _setting("COOKIE_DOMAIN")          # None = browser infers from origin

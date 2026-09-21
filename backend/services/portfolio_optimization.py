@@ -462,7 +462,7 @@ def run_portfolio_optimization(returns: np.ndarray,
         analytics[name] = portfolio_analytics(w, exp_ret, cov, rf_rate, names)
 
     # ── Efficient frontier (for chart) ──
-    frontier = _efficient_frontier(exp_ret, cov, con, n_points=30)
+    frontier = _efficient_frontier(exp_ret, cov, con, rf_rate, n_points=30)
 
     # ── Rank by Sharpe ──
     ranked = sorted(
@@ -492,6 +492,7 @@ def _corr_to_cov(corr: np.ndarray, returns: np.ndarray) -> np.ndarray:
 
 def _efficient_frontier(exp_ret: np.ndarray, cov: np.ndarray,
                         con: PortfolioConstraints,
+                        rf_rate: float = 0.0,
                         n_points: int = 30) -> list[dict]:
     """Trace the efficient frontier by targeting different return levels."""
     N = len(exp_ret)
@@ -517,10 +518,15 @@ def _efficient_frontier(exp_ret: np.ndarray, cov: np.ndarray,
 
         port_ret = float(w @ exp_ret)
         port_vol = math.sqrt(max(float(w @ cov @ w), 1e-12))
+        # Match portfolio_analytics()'s convention: (return - rf) / vol, annualised
+        # by sqrt(252) — dropping rf_rate here (as the old code did) understates
+        # the frontier's Sharpe relative to every other Sharpe in the same
+        # response whenever rf_rate != 0.
+        sharpe = (port_ret - rf_rate) / max(port_vol, 1e-9)
         frontier.append({
             "return": round(port_ret * 252, 4),
             "volatility": round(port_vol * math.sqrt(252), 4),
-            "sharpe": round(port_ret / max(port_vol, 1e-9) * math.sqrt(252), 4),
+            "sharpe": round(sharpe * math.sqrt(252), 4),
         })
 
     return frontier

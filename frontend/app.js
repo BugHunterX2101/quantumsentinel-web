@@ -1962,6 +1962,10 @@ function renderOrderList(orders) {
     const status = escapeHtml(String(o.status));
     const orderId = escapeHtml(String(o.order_id));
     const qty    = Number(o.quantity);
+    // FIX: was displaying raw `qty` below, which renders long floating-point
+    // artifacts (e.g. 0.30000000000000004) for fractional share quantities.
+    // qtyStr applies the same fractional-aware formatting used in the
+    // Portfolio positions list (see F10 above).
     const qtyStr = qty < 1 ? qty.toFixed(6) : qty % 1 === 0 ? qty.toFixed(0) : qty.toFixed(4);
     const type   = escapeHtml(String(o.order_type || 'market'));
     const fillPrice = o.filled_price != null
@@ -1973,7 +1977,7 @@ function renderOrderList(orders) {
     <div class="order-row" style="animation-delay:${i * 40}ms" data-order-id="${orderId}">
       <span class="asset-col">${asset}</span>
       <span class="side-col ${o.side?.toLowerCase()}">${side}</span>
-      <span class="qty-col">${qty}</span>
+      <span class="qty-col">${qtyStr}</span>
       <span class="price-col">${fillPrice}</span>
       <span class="status status-${status}">${status}</span>
       ${cancelBtn}
@@ -2443,8 +2447,17 @@ let _lastBacktestReturns = null;
 function metricCard(label, value, unit='', cls='') {
   let vStr;
   if (typeof value === 'number') {
-    // Auto-convert decimal fractions to percentage when unit='%' (backend returns 0.123 for 12.3%)
-    if (unit === '%' && Math.abs(value) <= 1 && value !== 0) {
+    // Auto-convert decimal fractions to percentage when unit='%' (backend
+    // always returns a fraction for these fields, e.g. 0.123 for 12.3%).
+    // FIX: this used to gate the conversion on Math.abs(value) <= 1, which
+    // silently broke for any legitimate percent-type metric whose magnitude
+    // exceeds 100% — e.g. a backtest total_return of 2.0 (a 200% gain, easily
+    // reached over a multi-year compounding run) rendered as "2%" (it's an
+    // integer, so it fell through to the plain-number branch), and 1.85
+    // (185%) rendered as "1.850%". avg_daily_turnover can likewise exceed 1
+    // for high-turnover strategies. The unit is the caller's declaration of
+    // intent — always convert when unit === '%', regardless of magnitude.
+    if (unit === '%') {
       vStr = (value * 100).toFixed(2) + '%';
     } else if (Number.isInteger(value)) {
       vStr = String(value) + (unit || '');

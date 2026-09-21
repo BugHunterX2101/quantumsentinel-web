@@ -333,3 +333,97 @@ class TestStatTests:
         assert "bootstrap_sharpe" in result
         assert "permutation_test" in result
         assert "deflated_sharpe" in result
+
+
+# ---------------------------------------------------------------------------
+# BacktestEngine._run_strategy — full bar-by-bar pipeline, no network.
+#
+# BacktestEngine.run() requires a live yfinance download, so (matching the
+# established pattern in tests/test_walk_forward.py for the sibling
+# WalkForwardEngine) this calls _run_strategy() directly with synthetic
+# price data. This is the exact same bug class already fixed once in
+# walk_forward.py's _windowed_vol() (see test_walk_forward.py's docstring):
+# a per-bar rolling-volatility window whose numerator (np.diff of a price
+# slice) and denominator (a second, independently-offset price slice) don't
+# derive from the same base window, so their lengths silently diverge near
+# array boundaries. backtest_service.py had its own, unfixed copy of the
+# same pattern, which crashed on 100% of real requests reaching this code
+# (any period beyond ~21 bars, i.e. every 6mo/1y/2y/3y/5y backtest).
+# ---------------------------------------------------------------------------
+
+from backend.services.backtest_service import (
+    BacktestEngine, BacktestConfig, StrategyConfig, StrategyType,
+)
+
+
+@pytest.fixture
+def trending_close_matrix():
+    """Two price series with clear swings so MA crossovers fire and hold
+    positions open at the end of the run (exercising the liquidation path)."""
+    rng = np.random.default_rng(7)
+    n = 300
+    trend = np.concatenate([
+        np.linspace(0, 25, n // 3),
+        np.linspace(25, -10, n // 3),
+        np.linspace(-10, 20, n - 2 * (n // 3)),
+    ])
+    noise_a = rng.normal(0, 0.5, n)
+    noise_b = rng.normal(0, 0.5, n)
+    return {
+        "TEST": 100.0 + trend + noise_a,
+        "SPY": 100.0 + trend * 0.6 + noise_b,
+    }
+
+
+class TestBacktestEngineRunStrategy:
+    def _engine(self, fast=20, slow=50):
+        cfg = BacktestConfig(
+            assets=["TEST"], benchmark="SPY",
+            strategy=StrategyConfig(strategy_type=StrategyType.MA_CROSSOVER,
+                                     fast_window=fast, slow_window=slow),
+        )
+        return BacktestEngine(cfg)
+
+    def _asset_data(self, closes: dict) -> dict:
+        return {
+            t: {"close": c, "volume": np.full_like(c, 1_000_000.0),
+                "high": c * 1.01, "low": c * 0.99}
+            for t, c in closes.items()
+        }
+
+    def test_runs_full_bar_range_without_shape_error(self, trending_close_matrix):
+        engine = self._engine()
+        asset_data = self._asset_data(trending_close_matrix)
+        n_bars = len(trending_close_matrix["TEST"])
+        start_bar = engine.config.strategy.slow_window + 5
+        # Must not raise "operands could not be broadcast together" (the
+        # returns_window numerator/denominator shape bug) nor NameError
+        # (the min_len/n_bars mismatch in the liquidation step below).
+        result = engine._run_strategy(asset_data, start_bar, n_bars)
+        assert len(result["equity_curve_net"]) > 0
+        assert result["final_capital"] > 0
+        assert np.isfinite(result["final_capital"])
+
+    def test_every_bar_index_reaches_returns_window_line(self, trending_close_matrix):
+        # Directly exercises every bar >= 2 (the guard in the buggy line),
+        # including the exact boundary (bar == 21/22) where the numerator
+        # and denominator window lengths first diverged.
+        engine = self._engine()
+        close = trending_close_matrix["TEST"]
+        asset_data = self._asset_data({"TEST": close})
+        for bar in range(2, len(close)):
+            win_start = max(0, bar - 21)
+            returns_window = np.diff(close[win_start:bar + 1]) / np.maximum(close[win_start:bar], 1e-9)
+            assert returns_window.shape == close[win_start:bar].shape
+            assert np.all(np.isfinite(returns_window))
+
+    def test_liquidation_uses_n_bars_not_undefined_min_len(self, trending_close_matrix):
+        # A short window that still leaves the MA-crossover strategy holding
+        # an open position at n_bars, forcing execution of the liquidation
+        # block (`final_bar = n_bars - 1`) that referenced the undefined
+        # name `min_len` before the fix.
+        engine = self._engine(fast=5, slow=10)
+        asset_data = self._asset_data(trending_close_matrix)
+        n_bars = 60
+        result = engine._run_strategy(asset_data, start_bar=15, n_bars=n_bars)
+        assert result["final_capital"] > 0

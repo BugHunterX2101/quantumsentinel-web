@@ -237,7 +237,19 @@ class BacktestEngine:
                     continue
                 price = float(ad["close"][bar])
                 volume = float(ad["volume"][bar]) if ad["volume"] is not None and bar < len(ad["volume"]) else 1e6
-                returns_window = np.diff(ad["close"][max(0, bar - 21):bar + 1]) / np.maximum(ad["close"][max(0, bar - 20):bar], 1e-9) if bar > 1 else np.array([0.01])
+                # FIX: the numerator diffs a 22-element window (bar-21..bar
+                # inclusive) into 21 returns, but the denominator sliced from
+                # bar-20 instead of bar-21, producing only 20 prices — a
+                # guaranteed "operands could not be broadcast together with
+                # shapes (21,) (20,)" crash on every real backtest, since any
+                # period longer than ~21 bars (i.e. essentially all of them:
+                # 1y/2y/3y/5y all run for hundreds of bars) reaches this line.
+                # Both slices must share the same start index so element i of
+                # the diff (close[s+i+1]-close[s+i]) divides by element i of
+                # the base-price window (close[s+i]) — the correct daily
+                # simple-return definition, not an arbitrary shift.
+                win_start = max(0, bar - 21)
+                returns_window = np.diff(ad["close"][win_start:bar + 1]) / np.maximum(ad["close"][win_start:bar], 1e-9) if bar > 1 else np.array([0.01])
                 daily_vol = float(np.std(returns_window)) if len(returns_window) > 1 else 0.02
                 avg_volume = float(np.mean(ad["volume"][max(0, bar - 21):bar + 1])) if ad["volume"] is not None and bar > 1 else 1e6
 
@@ -401,7 +413,13 @@ class BacktestEngine:
                     )
 
         # ── Liquidate remaining positions ──
-        final_bar = min_len - 1
+        # FIX: this method's length parameter is named n_bars (see the
+        # signature above) — min_len is the caller's (run()'s) local name for
+        # the same value and doesn't exist in this scope, so every backtest
+        # raised NameError here right after the bar loop finished, i.e. on
+        # essentially every successful run (any position still open at the
+        # end of the simulation window hits this liquidation step).
+        final_bar = n_bars - 1
         for ticker, shares in list(positions.items()):
             if abs(shares) > 1e-9 and ticker in asset_data:
                 ad = asset_data[ticker]

@@ -678,23 +678,53 @@ def latest_signals(
     Supports ETag / 304 Not Modified to minimise bandwidth at scale.
     """
     data = signal_engine.get_cached_signals()
-    # ETag includes both timestamp AND n_assets to correctly invalidate when
-    # signal count changes within the same second (e.g. after watchlist edit).
-    tag = _etag(str(data.get("generated_at", "")) + str(data.get("n_assets", "")))
-    if request.headers.get("if-none-match") == tag:
-        return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
 
     # Determine filter list: query param > user watchlist > exchange filter > all
     if assets:
         wanted = {t.strip().upper() for t in assets.split(",") if t.strip()}
     else:
         wl = _user_watchlist(user)
-        # Also apply exchange filter if user has preferences set
+        # Also apply exchange filter if user has preferences set.
+        # FIX: ASSET_EXCHANGE_MAP only covers the 20 preloaded TRACKED_ASSETS
+        # (see get_cached_signals below), so a watchlisted ticker outside that
+        # set used to silently resolve to "US" here regardless of its real
+        # exchange — infer_exchange() is the same suffix-based fallback
+        # search_assets()/compute_single_asset() already use for exactly this.
         preferred_ex = set(user.preferred_exchanges or ["US"])
         exchange_map = signal_engine.ASSET_EXCHANGE_MAP
-        wanted = {t for t in wl if exchange_map.get(t, "US") in preferred_ex} or set(wl)
+        wanted = {t for t in wl if (exchange_map.get(t) or signal_engine.infer_exchange(t)) in preferred_ex} or set(wl)
+
+    # FIX: the ETag previously hashed data.get("n_assets") — the SHARED
+    # preloaded-cache's asset count, which is always 20 and never changes —
+    # not the caller's actual filtered result. The comment above this used to
+    # claim it "correctly invalidates... after watchlist edit", but it never
+    # did: a browser's fetch() automatically sends If-None-Match with a
+    # previously-seen ETag, so after a user edited their watchlist or
+    # exchange preferences the server would still recognise the old tag
+    # (unchanged, since it never depended on `wanted`) and incorrectly
+    # answer 304 Not Modified, silently serving the pre-edit result until the
+    # shared cache happened to regenerate on its own ~30-60s cycle. Hashing
+    # the resolved `wanted` set alongside the cache generation timestamp
+    # makes the tag change exactly when the personalized response would.
+    tag = _etag(str(data.get("generated_at", "")) + "|" + ",".join(sorted(wanted)))
+    if request.headers.get("if-none-match") == tag:
+        return Response(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
 
     filtered_signals = [s for s in data.get("signals", []) if s.get("asset") in wanted]
+    # FIX: get_cached_signals() only ever computes the 20 preloaded
+    # TRACKED_ASSETS — any watchlisted ticker outside that set (the entire
+    # point of the search/watchlist feature, which explicitly supports any
+    # searchable ticker) was silently absent from `data["signals"]` and so
+    # could never appear here, vanishing from the dashboard on every reload,
+    # poll, or the next WebSocket push even though it was still watchlisted.
+    # compute_single_asset() is the same on-demand path the search bar
+    # already uses, cached for _ONDEMAND_TTL seconds, so this only pays the
+    # live-fetch cost once per ticker per cache window.
+    have = {s.get("asset") for s in filtered_signals}
+    for ticker in wanted - have:
+        extra = signal_engine.compute_single_asset(ticker)
+        if extra:
+            filtered_signals.append(extra)
     result = dict(data)
     result["signals"] = filtered_signals
     result["n_assets"] = len(filtered_signals)
@@ -847,6 +877,16 @@ async def signal_stream(websocket: WebSocket):
                 data = await asyncio.to_thread(signal_engine.get_cached_signals)
                 wanted = set(_user_watchlist(user))
                 filtered = [s for s in data.get("signals", []) if s.get("asset") in wanted]
+                # FIX: same gap as /api/signals/latest — get_cached_signals()
+                # only covers the 20 preloaded TRACKED_ASSETS, so a
+                # watchlisted ticker outside that set would never appear in
+                # `data["signals"]` and would silently drop out of every push
+                # on this stream even though it stayed watchlisted.
+                have = {s.get("asset") for s in filtered}
+                for ticker in wanted - have:
+                    extra = await asyncio.to_thread(signal_engine.compute_single_asset, ticker)
+                    if extra:
+                        filtered.append(extra)
                 ws_payload = dict(data)
                 ws_payload["signals"] = filtered
                 ws_payload["n_assets"] = len(filtered)
@@ -1818,7 +1858,15 @@ def _fetch_single_asset(asset: str, period: str) -> tuple[np.ndarray, np.ndarray
     close = data["Close"].dropna()
     if len(close) < 60:
         raise ValueError(f"Only {len(close)} trading days for {asset}")
-    prices = close.to_numpy(dtype=float)
+    # FIX: for a single-ticker yf.download() call, data["Close"] is a
+    # 1-column DataFrame in this yfinance version, not a Series — to_numpy()
+    # on it yields shape (T, 1), not (T,). np.diff() on that 2-D array
+    # diffs along the trivial size-1 last axis (shape (T, 1) -> (T, 0))
+    # instead of along time, so it silently produced a shape that could
+    # never broadcast against prices[:-1] (shape (T-1, 1)), crashing every
+    # single-asset regime-detection/trend request. reshape(-1) is a no-op
+    # for an already-1-D Series and flattens a (T, 1) DataFrame correctly.
+    prices = close.to_numpy(dtype=float).reshape(-1)
     returns = np.diff(prices) / np.maximum(prices[:-1], 1e-9)
     return returns, prices
 

@@ -422,42 +422,40 @@ def run_percentile_benchmark(return_matrix: np.ndarray,
     names = tickers or [f"Asset_{i}" for i in range(N)]
     rng_returns = return_matrix[:, 0]
 
-    stage_results = []
+    _factors = compute_factors(return_matrix)  # pre-compute once for Fama-MacBeth
 
-    # Feature engineering
-    stage_results.append(time_fn(
-        lambda: compute_factors(return_matrix), n_runs=n_runs,
-        label="Feature Engineering"
-    ))
+    stage_defs: list[tuple[str, Callable]] = [
+        ("Feature Engineering", lambda: compute_factors(return_matrix)),
+        ("Fama-MacBeth Regression", lambda: fama_macbeth(return_matrix, _factors)),
+        ("Correlation Engine", lambda: run_correlation_engine(return_matrix)),
+        ("Portfolio Optimisation", lambda: run_portfolio_optimization(return_matrix)),
+        ("Regime Detection", lambda: run_regime_detection(rng_returns)),
+    ]
 
-    # Fama-MacBeth
-    _factors = compute_factors(return_matrix)  # pre-compute once
-    stage_results.append(time_fn(
-        lambda: fama_macbeth(return_matrix, _factors), n_runs=n_runs,
-        label="Fama-MacBeth Regression"
-    ))
+    # Time every stage together within each run (rather than each stage in
+    # its own independent n_runs loop) so the aggregate pipeline percentile
+    # can be taken from actual per-run end-to-end totals. The percentile of
+    # a sum of independent random variables is not the sum of their
+    # marginal percentiles, so summing each stage's own p50/p99 would
+    # mischaracterize true end-to-end tail latency.
+    stage_stats = [TimerStats(label=label, n_runs=n_runs) for label, _ in stage_defs]
+    pipeline_totals: list[float] = []
 
-    # Correlation engine
-    stage_results.append(time_fn(
-        lambda: run_correlation_engine(return_matrix), n_runs=n_runs,
-        label="Correlation Engine"
-    ))
+    for _ in range(n_runs):
+        run_total_ms = 0.0
+        for stats, (_, fn) in zip(stage_stats, stage_defs):
+            t0 = time.perf_counter()
+            fn()
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            stats.record(elapsed_ms)
+            run_total_ms += elapsed_ms
+        pipeline_totals.append(run_total_ms)
 
-    # Portfolio optimisation
-    stage_results.append(time_fn(
-        lambda: run_portfolio_optimization(return_matrix), n_runs=n_runs,
-        label="Portfolio Optimisation"
-    ))
+    stage_results = [s.summary() for s in stage_stats]
 
-    # Regime detection
-    stage_results.append(time_fn(
-        lambda: run_regime_detection(rng_returns), n_runs=n_runs,
-        label="Regime Detection"
-    ))
-
-    # Aggregate
-    p50_total = sum(s["p50_ms"] for s in stage_results)
-    p99_total = sum(s["p99_ms"] for s in stage_results)
+    totals_arr = np.array(pipeline_totals, dtype=float)
+    p50_total = float(np.percentile(totals_arr, 50))
+    p99_total = float(np.percentile(totals_arr, 99))
 
     bottleneck = max(stage_results, key=lambda s: s["p99_ms"])
 

@@ -265,7 +265,18 @@ def rotate_refresh_token(db: Session, raw_token: str, redis_client=None) -> tupl
     """
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
 
-    record = db.query(models.RefreshToken).filter_by(token_hash=token_hash).first()
+    # Row-locked read: without FOR UPDATE, two concurrent rotations of the
+    # same not-yet-used token (e.g. a thief racing the legitimate client)
+    # can both read is_used=False before either commits, both mint a valid
+    # child token, and the reuse-detection family revocation below never
+    # fires. with_for_update() makes the second caller block until the
+    # first commits, so it then sees is_used=True and revokes the family.
+    record = (
+        db.query(models.RefreshToken)
+        .filter_by(token_hash=token_hash)
+        .with_for_update()
+        .first()
+    )
     if not record:
         return None
 
@@ -350,17 +361,26 @@ NONCES:   dict[str, float] = {}
 NONCE_TTL_SECONDS = 300
 MAX_SESSIONS = 10_000
 _NONCE_LOCK = Lock()
+_SESSIONS_LOCK = Lock()
 
 
 def _expire_sessions() -> None:
-    """Expire old sessions. Nonce dedup is now handled atomically by Redis/set_nx."""
+    """Expire old sessions. Nonce dedup is now handled atomically by Redis/set_nx.
+
+    perform_handshake() is a sync route, so FastAPI runs concurrent requests
+    to it on separate threadpool threads — without a lock, two threads can
+    each snapshot the same "expired"/over-capacity key list and the second
+    thread's `del SESSIONS[k]` then raises KeyError on a key the first
+    thread already removed.
+    """
     now = time.time()
-    for k in [k for k, v in SESSIONS.items() if v.get("expires_at", 0) < now]:
-        del SESSIONS[k]
-    if len(SESSIONS) > MAX_SESSIONS:
-        by_created = sorted(SESSIONS.items(), key=lambda x: x[1].get("created_at", 0))
-        for k, _ in by_created[:len(SESSIONS) - MAX_SESSIONS]:
-            del SESSIONS[k]
+    with _SESSIONS_LOCK:
+        for k in [k for k, v in SESSIONS.items() if v.get("expires_at", 0) < now]:
+            SESSIONS.pop(k, None)
+        if len(SESSIONS) > MAX_SESSIONS:
+            by_created = sorted(SESSIONS.items(), key=lambda x: x[1].get("created_at", 0))
+            for k, _ in by_created[:len(SESSIONS) - MAX_SESSIONS]:
+                SESSIONS.pop(k, None)
 
 
 def _consume_nonce_local(nonce_bytes: bytes) -> bool:

@@ -534,7 +534,18 @@ def run_event_backtest(
                 if fill.quantity < 0 and not portfolio.allow_short:
                     current_pos = portfolio.positions.get(order.ticker, 0.0)
                     if current_pos + fill.quantity < 0:
-                        fill.quantity = -current_pos  # flatten only, no new short
+                        # Flatten only, no new short. Recompute the fill
+                        # (not just quantity) so commission/slippage/borrow
+                        # reflect the capped size instead of the larger,
+                        # never-executed original order.
+                        capped_order = OrderEvent(
+                            timestamp=order.timestamp,
+                            ticker=order.ticker,
+                            quantity=-current_pos,
+                            order_type=order.order_type,
+                            limit_price=order.limit_price,
+                        )
+                        fill = cost_model.compute_fill(capped_order, mkt, daily_vol)
 
                 if abs(fill.quantity) > 1e-6:
                     portfolio.process_fill(fill)

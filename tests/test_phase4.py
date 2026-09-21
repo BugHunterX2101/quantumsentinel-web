@@ -469,47 +469,102 @@ class TestReportGenerator:
         assert "error" in result
 
     def test_walk_forward_table_with_real_wf(self):
+        # Build the WF result from the *actual* FoldResult dataclass
+        # (backend/services/walk_forward.py) instead of a hand-typed guess
+        # at its shape — a prior version of this test used a fabricated
+        # schema ("fold_id", "train_start", nested "oos_metrics") that
+        # didn't match FoldResult.to_dict() at all, so it kept passing
+        # while _build_wf_table silently read back zeros/blanks against
+        # the real producer.
         from backend.services.report_generator import _build_wf_table
-        # Synthetic WF result structure
-        wf = {
-            "folds": [
-                {
-                    "fold_id": 1,
-                    "train_start": "2020-01-01", "train_end": "2021-12-31",
-                    "test_start": "2022-01-01", "test_end": "2022-12-31",
-                    "oos_metrics": {"sharpe_ratio": 0.8, "annual_return": 0.06,
-                                    "max_drawdown": -0.12},
-                    "best_fast_window": 20, "best_slow_window": 50,
-                },
-                {
-                    "fold_id": 2,
-                    "train_start": "2021-01-01", "train_end": "2022-12-31",
-                    "test_start": "2023-01-01", "test_end": "2023-12-31",
-                    "oos_metrics": {"sharpe_ratio": -0.3, "annual_return": -0.02,
-                                    "max_drawdown": -0.25},
-                    "best_fast_window": 15, "best_slow_window": 45,
-                },
-            ]
-        }
+        from backend.services.walk_forward import FoldResult
+
+        fold1 = FoldResult(
+            fold_index=1, train_start=0, train_end=500,
+            test_start=500, test_end=750,
+            oos_sharpe=0.8, oos_return=0.06, oos_max_dd=-0.12,
+            best_fast_window=20, best_slow_window=50,
+        )
+        fold2 = FoldResult(
+            fold_index=2, train_start=250, train_end=750,
+            test_start=750, test_end=1000,
+            oos_sharpe=-0.3, oos_return=-0.02, oos_max_dd=-0.25,
+            best_fast_window=15, best_slow_window=45,
+        )
+        wf = {"folds": [fold1.to_dict(), fold2.to_dict()]}
+
         table = _build_wf_table(wf)
         assert len(table) == 2
         assert table[0]["fold"] == 1
+        assert table[0]["oos_sharpe"] == 0.8
         assert table[0]["degraded"] is False
+        assert table[1]["oos_sharpe"] == -0.3
         assert table[1]["degraded"] is True  # negative Sharpe
 
+    def test_walk_forward_summary_with_real_wf(self):
+        # aggregated_oos/overfitting_analysis field names must match
+        # WalkForwardEngine.run()'s actual output structure exactly.
+        from backend.services.report_generator import generate_report
+        from backend.services.walk_forward import FoldResult
+
+        folds = [
+            FoldResult(fold_index=0, train_start=0, train_end=500,
+                       test_start=500, test_end=750, oos_sharpe=0.8).to_dict(),
+            FoldResult(fold_index=1, train_start=250, train_end=750,
+                       test_start=750, test_end=1000, oos_sharpe=-0.3).to_dict(),
+        ]
+        wf_result = {
+            "n_folds": 2,
+            "folds": folds,
+            "aggregated_oos": {"sharpe": 0.42},
+            "overfitting_analysis": {"overfitting_score": 0.15, "likely_overfit": False},
+        }
+        report = generate_report(returns=np.random.default_rng(1).normal(0.0005, 0.01, 100),
+                                  wf_result=wf_result)
+        summary = report["walk_forward_summary"]
+        assert summary["n_folds"] == 2
+        assert summary["pct_profitable_folds"] == 0.5
+        assert summary["mean_oos_sharpe"] == 0.42
+        assert summary["oos_degradation"] == 0.15
+        assert summary["overfitting_flag"] is False
+
     def test_factor_table_sorted_by_t_stat(self):
+        # Built from the *actual* fama_macbeth() output structure — a prior
+        # version of this test used "premium_ann" as the per-factor key,
+        # which doesn't exist in fama_macbeth()'s real output (the actual
+        # key is "lambda_annualised"), so it kept passing while
+        # _build_factor_table silently read back 0.0 for every premium.
         from backend.services.report_generator import _build_factor_table
         fm = {
             "factor_premia": {
-                "momentum": {"premium_ann": 0.05, "t_stat": 2.1, "p_value": 0.04, "nw_se": 0.02},
-                "reversal": {"premium_ann": -0.02, "t_stat": -0.8, "p_value": 0.43, "nw_se": 0.025},
-                "volatility": {"premium_ann": 0.08, "t_stat": 3.5, "p_value": 0.001, "nw_se": 0.01},
+                "momentum": {"lambda_annualised": 0.05, "t_stat": 2.1, "p_value": 0.04,
+                             "nw_se": 0.02, "significant_5pct": True},
+                "reversal": {"lambda_annualised": -0.02, "t_stat": -0.8, "p_value": 0.43,
+                             "nw_se": 0.025, "significant_5pct": False},
+                "volatility": {"lambda_annualised": 0.08, "t_stat": 3.5, "p_value": 0.001,
+                               "nw_se": 0.01, "significant_5pct": True},
             }
         }
         table = _build_factor_table(fm)
         assert len(table) == 3
         # Sorted by |t_stat| descending: volatility (3.5), momentum (2.1), reversal (0.8)
         assert table[0]["factor"] == "volatility"
+        assert table[0]["premium_ann"] == 0.08
         assert table[0]["significant_5pct"] is True
         assert table[2]["factor"] == "reversal"
         assert table[2]["significant_5pct"] is False
+
+    def test_factor_model_summary_with_real_fama_macbeth(self):
+        # avg_r_squared must be read from fama_macbeth()'s real top-level
+        # key "mean_cross_sectional_r2", not a nonexistent "avg_r_squared".
+        from backend.services.report_generator import generate_report
+        factor_result = {
+            "factor_premia": {
+                "momentum": {"t_stat": 2.5, "lambda_annualised": 0.05},
+            },
+            "mean_cross_sectional_r2": 0.37,
+        }
+        report = generate_report(returns=np.random.default_rng(2).normal(0.0005, 0.01, 100),
+                                  factor_result=factor_result)
+        assert report["factor_model_summary"]["avg_r_squared"] == 0.37
+        assert report["factor_model_summary"]["n_significant"] == 1

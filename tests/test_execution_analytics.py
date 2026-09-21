@@ -144,6 +144,23 @@ class TestCapacityAnalysis:
         result = compute_capacity_analysis({})
         assert "error" in result
 
+    def test_negative_baseline_degradation_has_correct_sign(self):
+        """A negative baseline Sharpe that gets *more* negative at higher
+        capital is real degradation and must report a positive percentage,
+        not a sign-flipped "improvement" from naively dividing by a
+        negative baseline_sharpe."""
+        results = {
+            10_000: {"sharpe": -1.0, "total_return": -0.05, "max_drawdown": 0.1,
+                      "avg_slippage_bps": 2, "fill_rate": 0.99},
+            50_000: {"sharpe": -2.0, "total_return": -0.15, "max_drawdown": 0.2,
+                      "avg_slippage_bps": 8, "fill_rate": 0.9},
+        }
+        analysis = compute_capacity_analysis(results)
+        profiles = {p["capital"]: p for p in analysis["profiles"]}
+        assert profiles[10_000]["sharpe_degradation_pct"] == pytest.approx(0.0)
+        assert profiles[50_000]["sharpe_degradation_pct"] == pytest.approx(100.0)
+        assert analysis["capacity_estimate"] == 50_000
+
 
 # ---------------------------------------------------------------------------
 # Latency Model

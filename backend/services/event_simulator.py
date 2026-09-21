@@ -172,26 +172,35 @@ class Portfolio:
         ticker = fill.ticker
         qty = fill.quantity
         price = fill.fill_price
-        sign = 1 if qty > 0 else -1
 
         # Update position
         prev_qty = self.positions.get(ticker, 0.0)
         new_qty = prev_qty + qty
         self.positions[ticker] = new_qty
 
-        # Update average cost basis
+        # Update average cost basis. A fill can (a) open a position from
+        # flat, (b) extend an existing position in the same direction —
+        # weighted-average the cost basis, (c) partially close a position
+        # in the same direction — the shares that remain keep their
+        # existing cost basis (closing realises P&L, it doesn't move the
+        # basis of what's left), or (d) cross through zero in a single
+        # fill, fully closing the old position and opening a new one in
+        # the opposite direction — the new leg's basis is this fill's
+        # price. The previous version only handled (d) for buys flipping
+        # a short to long; a sell flipping a long to short (or a buy
+        # partially covering a short) fell through to "keep the old
+        # basis unchanged", silently carrying the closed position's cost
+        # basis onto the new, unrelated position.
         if new_qty == 0:
             self.avg_costs.pop(ticker, None)
-        elif sign > 0:
+        elif prev_qty == 0 or (prev_qty > 0) != (new_qty > 0):
+            self.avg_costs[ticker] = price
+        elif abs(new_qty) > abs(prev_qty):
             prev_cost = self.avg_costs.get(ticker, price)
-            if prev_qty >= 0:
-                self.avg_costs[ticker] = (
-                    prev_cost * prev_qty + price * qty
-                ) / max(abs(new_qty), 1e-9)
-            else:
-                self.avg_costs[ticker] = price
-        else:
-            self.avg_costs[ticker] = self.avg_costs.get(ticker, price)
+            self.avg_costs[ticker] = (
+                prev_cost * abs(prev_qty) + price * abs(qty)
+            ) / abs(new_qty)
+        # else: partial close in the same direction — cost basis unchanged.
 
         # Execution impact is embedded in fill_price. Borrow is a genuine cash
         # expense and must be debited as well as reported.

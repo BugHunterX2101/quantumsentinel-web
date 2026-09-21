@@ -600,6 +600,44 @@ class TestPortfolio:
         # Short-sale proceeds increase cash; commission and borrow reduce it.
         assert pf.cash == pytest.approx(10_998.5)
 
+    def test_avg_cost_resets_on_flip_long_to_short(self):
+        """A sell that crosses through zero opens a brand-new short leg —
+        its cost basis must be this fill's price, not the closed long's."""
+        pf = Portfolio(initial_capital=100_000.0, allow_short=True)
+        pf.process_fill(FillEvent(ticker="X", quantity=10.0, fill_price=100.0))
+        pf.process_fill(FillEvent(ticker="X", quantity=-15.0, fill_price=120.0))
+        assert pf.positions["X"] == pytest.approx(-5.0)
+        assert pf.avg_costs["X"] == pytest.approx(120.0)
+
+    def test_avg_cost_resets_on_flip_short_to_long(self):
+        pf = Portfolio(initial_capital=100_000.0, allow_short=True)
+        pf.process_fill(FillEvent(ticker="Y", quantity=-10.0, fill_price=100.0))
+        pf.process_fill(FillEvent(ticker="Y", quantity=15.0, fill_price=80.0))
+        assert pf.positions["Y"] == pytest.approx(5.0)
+        assert pf.avg_costs["Y"] == pytest.approx(80.0)
+
+    def test_avg_cost_unchanged_on_partial_short_cover(self):
+        """Partially covering a short must not move the remaining short's
+        cost basis to the cover price."""
+        pf = Portfolio(initial_capital=100_000.0, allow_short=True)
+        pf.process_fill(FillEvent(ticker="Y", quantity=-10.0, fill_price=100.0))
+        pf.process_fill(FillEvent(ticker="Y", quantity=4.0, fill_price=90.0))
+        assert pf.positions["Y"] == pytest.approx(-6.0)
+        assert pf.avg_costs["Y"] == pytest.approx(100.0)
+
+    def test_avg_cost_unchanged_on_partial_long_sell(self):
+        pf = Portfolio(initial_capital=100_000.0)
+        pf.process_fill(FillEvent(ticker="W", quantity=10.0, fill_price=100.0))
+        pf.process_fill(FillEvent(ticker="W", quantity=-4.0, fill_price=150.0))
+        assert pf.positions["W"] == pytest.approx(6.0)
+        assert pf.avg_costs["W"] == pytest.approx(100.0)
+
+    def test_avg_cost_weighted_average_on_same_direction_add(self):
+        pf = Portfolio(initial_capital=100_000.0)
+        pf.process_fill(FillEvent(ticker="Z", quantity=10.0, fill_price=100.0))
+        pf.process_fill(FillEvent(ticker="Z", quantity=10.0, fill_price=120.0))
+        assert pf.avg_costs["Z"] == pytest.approx(110.0)
+
 
 class TestStrategies:
     def test_ma_crossover_no_signal_insufficient_data(self):

@@ -118,18 +118,36 @@ class KalmanHedgeFilter:
 # Cointegration test (Engle-Granger two-step, pure Python)
 # ---------------------------------------------------------------------------
 
-# MacKinnon (1991/2010) asymptotic critical values for the Engle-Granger
-# residual-based cointegration test with n=2 (one regressor + a constant in
-# the first-stage OLS). These are NOT the plain Dickey-Fuller "with constant"
-# critical values (-3.43 / -2.86 / -2.57) — the EG test's critical values are
-# more negative because the residual series being tested was itself derived
-# from an estimated cointegrating vector, which adds estimation uncertainty
-# that the plain ADF table doesn't account for. Defined once here and reused
-# by both the cointegration-decision threshold and the p-value approximation
-# below so the two can never disagree with each other.
-_EG_CV_1PCT = -3.96
-_EG_CV_5PCT = -3.37
-_EG_CV_10PCT = -3.04
+# MacKinnon (2010) response-surface coefficients for the Engle-Granger
+# residual-based cointegration test with N=2 (one regressor + a constant in
+# the first-stage OLS), regression="c" (constant, no trend). These are NOT
+# the plain Dickey-Fuller "with constant" critical values (-3.43/-2.86/-2.57)
+# — the EG test's critical values are more negative because the residual
+# series being tested was itself derived from an estimated cointegrating
+# vector, which adds estimation uncertainty that the plain ADF table doesn't
+# account for.
+#
+# Finite-sample critical value: crit(T) = beta_inf + beta_1/T + beta_2/T^2.
+# Coefficients below are MacKinnon (2010, Queen's Economics WP 1227) Table 2,
+# N=2/"c" row — cross-checked against statsmodels' `tau_2010s['c'][1]` table,
+# which digitises the same paper. The asymptotic-only values previously
+# hardcoded here (-3.96/-3.37/-3.04) diverge from the true T→∞ limit
+# (-3.896/-3.336/-3.044 respectively) and, more importantly, ignore that the
+# finite-sample correction is large at the T~30-500 daily-bar windows this
+# module actually runs on (e.g. at T=60 the true 5% critical value is
+# -3.440, not -3.37 — a fixed asymptotic number understates how strict the
+# test should be for short lookback windows and overstates it for long ones).
+_EG_RS_COEFS = {
+    0.01: (-3.89644, -10.9519, -33.527),
+    0.05: (-3.33613, -6.1101, -6.823),
+    0.10: (-3.04445, -4.2412, -2.72),
+}
+
+
+def _eg_critical_value(T: int, pct: float) -> float:
+    """MacKinnon (2010) finite-sample-adjusted Engle-Granger critical value."""
+    b_inf, b1, b2 = _EG_RS_COEFS[pct]
+    return b_inf + b1 / T + b2 / T ** 2
 
 
 def engle_granger_cointegration(y: np.ndarray, x: np.ndarray,
@@ -156,16 +174,25 @@ def engle_granger_cointegration(y: np.ndarray, x: np.ndarray,
     hedge_ratio = float(beta[1])
     alpha = float(beta[0])
 
+    # Finite-sample-adjusted critical values (MacKinnon 2010 response
+    # surface) computed from the original cointegrating-regression sample
+    # size T — the convention the response surface itself was fit against.
+    cv_1pct = _eg_critical_value(T, 0.01)
+    cv_5pct = _eg_critical_value(T, 0.05)
+    cv_10pct = _eg_critical_value(T, 0.10)
+
     # Step 2: ADF test on spread (no-constant, no-trend — the residual is
     # already mean-zero by construction from the step-1 OLS with intercept).
-    adf_stat, adf_p = _eg_residual_adf_test(spread, max_lag=max_lag)
+    adf_stat, adf_p = _eg_residual_adf_test(spread, cv_1pct, cv_5pct, cv_10pct, max_lag=max_lag)
 
     return {
-        "cointegrated": adf_stat < _EG_CV_5PCT,
-        "cointegrated_1pct": adf_stat < _EG_CV_1PCT,
+        "cointegrated": adf_stat < cv_5pct,
+        "cointegrated_1pct": adf_stat < cv_1pct,
         "adf_stat": round(adf_stat, 4),
         "adf_p_approx": round(adf_p, 4),
-        "critical_value_5pct": _EG_CV_5PCT,
+        "critical_value_1pct": round(cv_1pct, 4),
+        "critical_value_5pct": round(cv_5pct, 4),
+        "critical_value_10pct": round(cv_10pct, 4),
         "hedge_ratio": round(hedge_ratio, 6),
         "alpha": round(alpha, 6),
         "spread_mean": round(float(spread.mean()), 6),
@@ -174,7 +201,8 @@ def engle_granger_cointegration(y: np.ndarray, x: np.ndarray,
     }
 
 
-def _eg_residual_adf_test(series: np.ndarray, max_lag: int = 1) -> tuple[float, float]:
+def _eg_residual_adf_test(series: np.ndarray, cv_1pct: float, cv_5pct: float,
+                           cv_10pct: float, max_lag: int = 1) -> tuple[float, float]:
     """(Augmented) Dickey-Fuller t-statistic for a unit root in an
     Engle-Granger cointegrating residual series, with a p-value
     approximation against the Engle-Granger (not plain-ADF) critical
@@ -182,8 +210,9 @@ def _eg_residual_adf_test(series: np.ndarray, max_lag: int = 1) -> tuple[float, 
 
     This is deliberately not a general-purpose ADF test: the regression run
     here has no constant term (see below) and the p-value bucketing uses
-    _EG_CV_1PCT/5PCT/10PCT — the correct table for testing residuals of an
-    estimated cointegrating relationship, not the plain "no constant"
+    the same finite-sample-adjusted cv_1pct/5pct/10pct the caller used for
+    the "cointegrated" decision — the correct table for testing residuals of
+    an estimated cointegrating relationship, not the plain "no constant"
     Dickey-Fuller table (whose asymptotic 5% value is ≈ -1.95, a very
     different number). Reusing this helper for a standalone unit-root test
     on a raw (non-residual) series would silently apply the wrong table.
@@ -222,14 +251,13 @@ def _eg_residual_adf_test(series: np.ndarray, max_lag: int = 1) -> tuple[float, 
     # different table here (as a previous version of this function did, with
     # the plain "constant, no trend" ADF critical values -3.48/-2.87/-2.57)
     # let adf_p_approx contradict the cointegrated flag: a spread could be
-    # flagged cointegrated at 5% (t_stat < -3.37) while its own reported
-    # p-value read back as > 5% (since -3.37 > -2.87), because the two
-    # thresholds weren't the same test.
-    if t_stat < _EG_CV_1PCT:
+    # flagged cointegrated at 5% while its own reported p-value read back
+    # as > 5%, because the two thresholds weren't the same test.
+    if t_stat < cv_1pct:
         p = 0.005
-    elif t_stat < _EG_CV_5PCT:
+    elif t_stat < cv_5pct:
         p = 0.025
-    elif t_stat < _EG_CV_10PCT:
+    elif t_stat < cv_10pct:
         p = 0.075
     else:
         p = 0.20

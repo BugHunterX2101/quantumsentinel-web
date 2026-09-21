@@ -342,6 +342,39 @@ class TestEngleGrangerCointegration:
         assert "spread" in result
         assert len(result["spread"]) == len(y)
 
+    def test_critical_values_match_mackinnon_2010_response_surface(self, cointegrated_pair):
+        """Finite-sample critical values must match the primary source exactly.
+
+        Independently verified against statsmodels' `mackinnoncrit(N=2,
+        regression="c")`, itself the digitised MacKinnon (2010) Table 2 (N=2,
+        "c") response surface: crit(T) = beta_inf + beta_1/T + beta_2/T^2.
+        A single fixed asymptotic constant (the pre-fix behaviour) would fail
+        this for any T far from infinity, such as the T=200 fixture here.
+        """
+        from backend.services.neutral_strategies import _eg_critical_value
+
+        y, x = cointegrated_pair
+        T = len(y)
+        result = engle_granger_cointegration(y, x)
+
+        expected_1pct = -3.89644 + -10.9519 / T + -33.527 / T ** 2
+        expected_5pct = -3.33613 + -6.1101 / T + -6.823 / T ** 2
+        expected_10pct = -3.04445 + -4.2412 / T + -2.72 / T ** 2
+
+        assert result["critical_value_1pct"] == pytest.approx(expected_1pct, abs=1e-4)
+        assert result["critical_value_5pct"] == pytest.approx(expected_5pct, abs=1e-4)
+        assert result["critical_value_10pct"] == pytest.approx(expected_10pct, abs=1e-4)
+        # Sanity: finite-sample critical values must be strictly ordered and
+        # more negative than the T-> infinity asymptote for this T.
+        assert result["critical_value_1pct"] < result["critical_value_5pct"] < result["critical_value_10pct"]
+        assert result["critical_value_5pct"] < -3.33613
+
+        # The decision flags and the p-value bucketing must agree with the
+        # same T-adjusted thresholds (never a different table).
+        assert result["cointegrated"] == (result["adf_stat"] < result["critical_value_5pct"])
+        assert result["cointegrated_1pct"] == (result["adf_stat"] < result["critical_value_1pct"])
+        assert _eg_critical_value(T, 0.05) == pytest.approx(result["critical_value_5pct"], abs=1e-4)
+
 
 class TestPairsTradingSignals:
     def test_basic_structure(self, cointegrated_pair):

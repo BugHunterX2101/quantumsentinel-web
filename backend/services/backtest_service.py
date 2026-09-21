@@ -653,14 +653,19 @@ def _sharpe(returns: np.ndarray, rf: float = 0.0) -> float:
 
 def _sortino(returns: np.ndarray, rf: float = 0.0,
              target: float = 0.0) -> float:
-    """Annualised Sortino ratio."""
+    """Annualised Sortino ratio.
+
+    Downside deviation = sqrt(mean(min(r - target, 0)^2)) over ALL periods
+    (not just the subset below target) — periods at/above target contribute
+    a zero term rather than being dropped from the average. Dividing by only
+    the count of downside periods (dropping the zero terms) overstates the
+    downside deviation and understates the ratio.
+    """
     if len(returns) < 2:
         return 0.0
     excess = returns - rf / 252
-    downside = returns[returns < target] - target
-    if len(downside) < 1:
-        return 0.0
-    dd = np.sqrt(np.mean(downside ** 2))
+    downside_sq = np.minimum(returns - target, 0.0) ** 2
+    dd = np.sqrt(np.mean(downside_sq))
     if dd < 1e-9:
         return 0.0
     return float(np.mean(excess) / dd * math.sqrt(252))
@@ -702,13 +707,16 @@ def _var_cvar(returns: np.ndarray, alpha: float) -> tuple[float, float]:
 
 
 def _downside_deviation(returns: np.ndarray, target: float = 0.0) -> float:
-    """Downside deviation below target return."""
+    """Downside deviation below target return.
+
+    RMS shortfall below target averaged over ALL periods (periods at/above
+    target contribute a zero term) — not averaged over only the subset of
+    periods that fall below target, which would overstate the deviation.
+    """
     if len(returns) < 2:
         return 0.0
-    downside = returns[returns < target] - target
-    if len(downside) < 1:
-        return 0.0
-    return float(np.sqrt(np.mean(downside ** 2)))
+    downside_sq = np.minimum(returns - target, 0.0) ** 2
+    return float(np.sqrt(np.mean(downside_sq)))
 
 
 def _alpha_beta(strategy_returns: np.ndarray,

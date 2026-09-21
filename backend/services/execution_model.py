@@ -92,8 +92,11 @@ class SlippageModel:
 class SpreadModel:
     """Bid/ask spread estimation from daily volatility.
 
-    Uses the Corwin-Schultz (2012) high-low spread estimator principle:
-    wider spreads for more volatile / less liquid assets.
+    A simplified linear proxy inspired by the *qualitative* relationship
+    documented in Corwin & Schultz (2012) — spreads widen with volatility
+    for less liquid assets — but this is NOT their high-low estimator
+    (which infers spread from consecutive daily high/low ranges via a
+    closed-form beta/gamma statistic). No high/low data is used here.
     """
     base_spread_bps: float = 2.0   # minimum spread in bps
     vol_multiplier: float = 0.5     # spread widens with volatility

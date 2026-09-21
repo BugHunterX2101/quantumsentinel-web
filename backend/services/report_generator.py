@@ -62,10 +62,19 @@ def _cvar(returns: np.ndarray, pct: float = 5.0) -> float:
 
 
 def _sortino(returns: np.ndarray) -> float:
-    downside = returns[returns < 0]
-    if len(downside) < 2:
+    """Annualised Sortino ratio (target = 0).
+
+    Downside deviation is the RMS of shortfalls below the target (0) over
+    ALL periods, not the standard deviation of the negative-return subset
+    around its own mean — that would measure dispersion of the losses
+    relative to each other rather than the actual downside risk relative to
+    the target, and would also drop the zero-contribution periods at/above
+    target, overstating the deviation.
+    """
+    if len(returns) < 2:
         return 0.0
-    dsd = float(np.std(downside, ddof=1) * math.sqrt(252))
+    downside_sq = np.minimum(returns, 0.0) ** 2
+    dsd = float(np.sqrt(np.mean(downside_sq)) * math.sqrt(252))
     if dsd < 1e-9:
         return 0.0
     return float(np.mean(returns) * 252 / dsd)

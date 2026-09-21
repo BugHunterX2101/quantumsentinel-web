@@ -371,7 +371,10 @@ class MeanReversionStrategy(BaseStrategy):
             return []
         w = np.array(prices[-self.window:])
         mu = float(np.mean(w))
-        sd = float(np.std(w, ddof=1))
+        # Population std (ddof=0), matching Bollinger's original band definition
+        # rather than the sample std — keeps the z-score threshold consistent
+        # with the canonical n_std=2.0 band width used elsewhere in the codebase.
+        sd = float(np.std(w, ddof=0))
         if sd < 1e-9:
             return []
         z = (prices[-1] - mu) / sd

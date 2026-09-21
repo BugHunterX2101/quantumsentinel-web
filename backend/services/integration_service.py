@@ -5,6 +5,7 @@ Item 7 enhancements:
 - verify_hmac_request() validates X-QS-SIGNATURE headers
 - Signature = HMAC-SHA256(secret, method || path || timestamp || nonce || SHA256(body))
 """
+import contextlib
 import datetime as dt
 import hashlib
 import hmac as hmac_mod
@@ -12,6 +13,7 @@ import ipaddress
 import json
 import secrets
 import socket
+import threading
 from urllib.parse import urlparse
 
 import requests
@@ -118,16 +120,83 @@ def verify_hmac_request(db: Session, key_id: str, timestamp: str, nonce: str,
     return key
 
 
+def _is_public_address(addr: str) -> bool:
+    ip = ipaddress.ip_address(addr)
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified)
+
+
+def _resolve_public_addresses(hostname: str, port: int) -> list[str] | None:
+    """Resolve hostname:port and return its IPs iff every one is public.
+
+    Returns None (not eligible for delivery) if resolution fails or ANY
+    resolved address is private/loopback/link-local/etc — a hostname that
+    round-robins between a public and an internal IP must not be trusted.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, ValueError):
+        return None
+    addresses = sorted({info[4][0] for info in infos})
+    if not addresses or not all(_is_public_address(a) for a in addresses):
+        return None
+    return addresses
+
+
 def _is_public_https(url: str) -> bool:
+    """Cheap eligibility check used at webhook-registration time.
+
+    This alone is NOT sufficient to authorize the actual outbound delivery —
+    see _pin_dns_to below, which re-resolves and pins the connection so the
+    delivery can't be redirected by DNS changing between check and use.
+    """
     parsed = urlparse(url)
     if parsed.scheme != "https" or not parsed.hostname:
         return False
+    return _resolve_public_addresses(parsed.hostname, parsed.port or 443) is not None
+
+
+_real_getaddrinfo = socket.getaddrinfo
+_dns_pins = threading.local()
+
+
+def _patched_getaddrinfo(host, port, *args, **kwargs):
+    pinned = getattr(_dns_pins, "map", None)
+    if pinned is not None:
+        addresses = pinned.get((host, port))
+        if addresses is not None:
+            return [(socket.AF_INET6 if ":" in a else socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, port))
+                    for a in addresses]
+    return _real_getaddrinfo(host, port, *args, **kwargs)
+
+
+socket.getaddrinfo = _patched_getaddrinfo
+
+
+@contextlib.contextmanager
+def _pin_dns_to(hostname: str, port: int, addresses: list[str]):
+    """Force DNS resolution of exactly (hostname, port) on THIS thread to the
+    already-validated `addresses` for the duration of the block, closing the
+    TOCTOU window between _resolve_public_addresses's check and the real
+    connection a moment later (an attacker controlling the webhook's DNS with
+    a low TTL could otherwise return a public IP for the check and a private/
+    internal IP for the real request — "DNS rebinding").
+
+    Scoped via thread-local storage (not a process-wide lock) so it never
+    affects DNS lookups for any other host, and concurrent webhook deliveries
+    on other threads are unaffected. TLS SNI/certificate hostname validation
+    is untouched: urllib3 still uses `hostname` (never the resolved IP) for
+    the Host header and TLS handshake — only the underlying socket connect
+    target changes.
+    """
+    pinned = getattr(_dns_pins, "map", None)
+    if pinned is None:
+        pinned = _dns_pins.map = {}
+    pinned[(hostname, port)] = addresses
     try:
-        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
-        return all(not ipaddress.ip_address(item[4][0]).is_private and not ipaddress.ip_address(item[4][0]).is_loopback
-                   and not ipaddress.ip_address(item[4][0]).is_link_local for item in addresses)
-    except (socket.gaierror, ValueError):
-        return False
+        yield
+    finally:
+        pinned.pop((hostname, port), None)
 
 
 def emit_webhooks(db: Session, user_id: str, event_type: str, payload: dict) -> None:
@@ -137,13 +206,21 @@ def emit_webhooks(db: Session, user_id: str, event_type: str, payload: dict) -> 
     envelope = json.dumps({"event": event_type, "data": payload}, sort_keys=True, separators=(",", ":"))
     for hook in hooks:
         try:
-            if event_type not in (hook.event_types or []) or not _is_public_https(hook.url):
+            if event_type not in (hook.event_types or []):
+                continue
+            parsed = urlparse(hook.url)
+            if parsed.scheme != "https" or not parsed.hostname:
+                continue
+            port = parsed.port or 443
+            addresses = _resolve_public_addresses(parsed.hostname, port)
+            if addresses is None:
                 continue
             secret = _FERNET.decrypt(hook.secret_hash.encode())
             signature = hmac_mod.new(secret, envelope.encode(), hashlib.sha256).hexdigest()
-            requests.post(hook.url, data=envelope, timeout=3, allow_redirects=False,
-                          headers={"Content-Type": "application/json", "X-QS-Event": event_type,
-                                   "X-QS-Signature": f"sha256={signature}"}).raise_for_status()
+            with _pin_dns_to(parsed.hostname, port, addresses):
+                requests.post(hook.url, data=envelope, timeout=3, allow_redirects=False,
+                              headers={"Content-Type": "application/json", "X-QS-Event": event_type,
+                                       "X-QS-Signature": f"sha256={signature}"}).raise_for_status()
             hook.last_delivery_at = dt.datetime.now(dt.timezone.utc)
         except Exception:
             # Webhook delivery is explicitly best-effort and must never turn

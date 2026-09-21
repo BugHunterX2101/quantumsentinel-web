@@ -41,6 +41,13 @@ services:
       DATABASE_URL: postgresql+psycopg://quantumsentinel:${POSTGRES_PASSWORD}@postgres:5432/quantumsentinel
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      # Safe as "*" only because this service uses `expose` (below), not `ports`:
+      # it is unreachable from outside the compose network, so every peer that
+      # can connect to it at all is a container on this stack, and nginx is the
+      # sole proxy_pass target that forwards real client IPs. If this service is
+      # ever given a published port or a different network topology, replace "*"
+      # with the reverse proxy's actual container IP/CIDR.
+      FORWARDED_ALLOW_IPS: "*"
     expose: ["8000"]
     depends_on:
       postgres:

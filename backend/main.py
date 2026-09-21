@@ -443,10 +443,22 @@ def metrics(user: models.User = Depends(get_current_user)):
 @app.post("/api/auth/register")
 def register(req: schemas.RegisterRequest, request: Request, db: Session = Depends(get_db)):
     existing = db.execute(select(models.User).where(models.User.email == req.email)).scalar_one_or_none()
+
+    # Pay the same Argon2id + PQC keygen cost whether or not the email is
+    # taken. Login already does the equivalent (hash a dummy value when the
+    # user doesn't exist, see the "Constant-time" comment below) so that
+    # response latency can't be used to enumerate accounts; before this fix,
+    # register's existing-email path returned near-instantly while the
+    # new-account path spent ~100ms+ on this work, making the two paths
+    # distinguishable purely by timing even if the 409 message were removed.
+    password_hash = auth_service.hash_password(req.password)
+    kem_pk, kem_sk, kem_ms = pqc.kem_keygen()
+    dsa_pk, dsa_sk, dsa_ms = pqc.dsa_keygen()
+
     if existing:
         raise HTTPException(409, "Email already registered")
 
-    user = models.User(email=req.email, password_hash=auth_service.hash_password(req.password))
+    user = models.User(email=req.email, password_hash=password_hash)
     db.add(user)
     try:
         db.commit()
@@ -460,9 +472,7 @@ def register(req: schemas.RegisterRequest, request: Request, db: Session = Depen
         raise HTTPException(409, "Email already registered")
     db.refresh(user)
 
-    # Generate the user's PQC identity keys
-    kem_pk, kem_sk, kem_ms = pqc.kem_keygen()
-    dsa_pk, dsa_sk, dsa_ms = pqc.dsa_keygen()
+    # PQC identity keys were already generated above (kem_pk/kem_sk/dsa_pk/dsa_sk).
     db.add(models.KeyPair(user_id=user.id, algorithm="ML-KEM-768",
                            public_key=pqc.b64(kem_pk), private_key=security_service.protect_private_key(pqc.b64(kem_sk))))
     db.add(models.KeyPair(user_id=user.id, algorithm="ML-DSA-65",
@@ -642,6 +652,25 @@ def logout(request: Request, db: Session = Depends(get_db)):
             token_hash = hashlib.sha256(refresh_raw.encode()).hexdigest()
             redis_store.run_sync(redis_store.invalidate_refresh_token(_redis_client, token_hash))
     response = JSONResponse({"status": "logged_out"})
+    response.delete_cookie("qs_access", path="/")
+    response.delete_cookie("qs_refresh", path="/api/auth/")
+    response.delete_cookie("qs_csrf", path="/")
+    return response
+
+
+@app.post("/api/auth/logout-all")
+def logout_all(request: Request, user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    """Revoke every refresh-token family for this account ("log out everywhere"),
+    e.g. after a stolen device or a shared-computer login. Requires the same
+    authenticated session (JWT + CSRF) as any other state-changing endpoint —
+    unlike plain /api/auth/logout, this also invalidates OTHER active sessions,
+    not just the caller's own cookies."""
+    client_ip = request.client.host if request.client else None
+    revoked = auth_service.revoke_user_refresh_tokens(db, user.id)
+    security_service.write_audit_log(db, user.id, "USER_LOGOUT_ALL", "user", user.id,
+                                      {"ip": client_ip, "revoked_families": revoked})
+    response = JSONResponse({"status": "logged_out_all", "revoked_sessions": revoked})
     response.delete_cookie("qs_access", path="/")
     response.delete_cookie("qs_refresh", path="/api/auth/")
     response.delete_cookie("qs_csrf", path="/")
@@ -1186,7 +1215,8 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
         except Exception as e:
             trade.status = "REJECTED"
             db.commit()
-            raise HTTPException(502, f"Alpaca order failed: {e}") from e
+            log.exception("Alpaca order submission failed for trade %s", trade.id)
+            raise HTTPException(502, "Alpaca order failed") from e
     else:
         # Cast SQLAlchemy Numeric columns to float before passing to simulate_fill.
         # Passing Decimal objects causes TypeError in comparison operators inside
@@ -1552,7 +1582,8 @@ def advanced_backtest(req: schemas.AdvancedBacktestRequest,
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(500, f"Backtest failed: {exc}") from exc
+        log.exception("Advanced backtest failed")
+        raise HTTPException(500, "Backtest failed") from exc
 
     security_service.write_audit_log(
         db, user.id, "ADVANCED_BACKTEST", "research", None,
@@ -1593,7 +1624,8 @@ def walk_forward_validation(req: schemas.WalkForwardRequest,
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(500, f"Walk-forward failed: {exc}") from exc
+        log.exception("Walk-forward validation failed")
+        raise HTTPException(500, "Walk-forward failed") from exc
 
     security_service.write_audit_log(
         db, user.id, "WALK_FORWARD", "research", None,
@@ -1722,7 +1754,8 @@ def alpha_research_endpoint(req: schemas.AlphaResearchRequest,
         result = run_alpha_research(signal_matrix, return_matrix,
                                     max_horizon=req.max_horizon)
     except Exception as exc:
-        raise HTTPException(500, f"Alpha research failed: {exc}")
+        log.exception("Alpha research failed")
+        raise HTTPException(500, "Alpha research failed") from exc
 
     result["asset_names"] = names
     result["signal_type"] = req.signal_type
@@ -1762,7 +1795,8 @@ def factor_model_endpoint(req: schemas.FactorModelRequest,
                                   newey_west_lags=req.newey_west_lags)
         risk_result = barra_risk_decomposition(return_matrix, requested)
     except Exception as exc:
-        raise HTTPException(500, f"Factor model failed: {exc}")
+        log.exception("Factor model failed")
+        raise HTTPException(500, "Factor model failed") from exc
 
     security_service.write_audit_log(
         db, user.id, "FACTOR_MODEL", "research", None,
@@ -1797,7 +1831,8 @@ def correlation_endpoint(req: schemas.CorrelationRequest,
             pca_components=req.pca_components,
         )
     except Exception as exc:
-        raise HTTPException(500, f"Correlation engine failed: {exc}")
+        log.exception("Correlation engine failed")
+        raise HTTPException(500, "Correlation engine failed") from exc
 
     security_service.write_audit_log(
         db, user.id, "CORRELATION_ANALYSIS", "research", None,
@@ -1850,7 +1885,8 @@ def portfolio_optimize_endpoint(req: schemas.PortfolioOptRequest,
             sba_signals=sba_signals,
         )
     except Exception as exc:
-        raise HTTPException(500, f"Optimisation failed: {exc}")
+        log.exception("Portfolio optimisation failed")
+        raise HTTPException(500, "Optimisation failed") from exc
 
     security_service.write_audit_log(
         db, user.id, "PORTFOLIO_OPT", "research", None,
@@ -1944,7 +1980,8 @@ def event_backtest_endpoint(req: schemas.EventBacktestRequest,
             sizing_method=req.sizing_method,
         )
     except Exception as exc:
-        raise HTTPException(500, f"Event backtest failed: {exc}")
+        log.exception("Event backtest failed")
+        raise HTTPException(500, "Event backtest failed") from exc
 
     security_service.write_audit_log(
         db, user.id, "EVENT_BACKTEST", "research", None,
@@ -1972,7 +2009,8 @@ def regime_detection_endpoint(req: schemas.RegimeDetectionRequest,
         result = run_regime_detection(returns, prices=prices,
                                        hmm_iters=req.hmm_iters)
     except Exception as exc:
-        raise HTTPException(500, f"Regime detection failed: {exc}")
+        log.exception("Regime detection failed")
+        raise HTTPException(500, "Regime detection failed") from exc
 
     result["asset"] = req.asset
     result["period"] = req.period
@@ -2037,7 +2075,8 @@ def neutral_strategy_endpoint(req: schemas.NeutralStrategyRequest,
             factor_exposures=factor_exposures,
         )
     except Exception as exc:
-        raise HTTPException(500, f"Neutral strategy failed: {exc}")
+        log.exception("Neutral strategy failed")
+        raise HTTPException(500, "Neutral strategy failed") from exc
 
     result["asset_names"] = names
     result["signal_type"] = req.signal_type
@@ -2097,7 +2136,8 @@ def pairs_trading_endpoint(req: schemas.PairsTradingRequest,
             use_kalman=req.use_kalman,
         )
     except Exception as exc:
-        raise HTTPException(500, f"Pairs trading failed: {exc}")
+        log.exception("Pairs trading failed")
+        raise HTTPException(500, "Pairs trading failed") from exc
 
     result["asset_y"] = req.asset_y
     result["asset_x"] = req.asset_x
@@ -2144,7 +2184,8 @@ def latency_benchmark_endpoint(req: schemas.LatencyBenchmarkRequest,
         else:
             results = run_full_benchmark(return_matrix, price_matrix, tickers=names)
     except Exception as exc:
-        raise HTTPException(500, f"Benchmark failed: {exc}")
+        log.exception("Latency benchmark failed")
+        raise HTTPException(500, "Benchmark failed") from exc
 
     if req.cpp_vs_python:
         try:
@@ -2195,7 +2236,8 @@ def research_report_endpoint(req: schemas.ReportRequest,
             run_regime=req.include_regime,
         )
     except Exception as exc:
-        raise HTTPException(500, f"Report generation failed: {exc}")
+        log.exception("Research report generation failed")
+        raise HTTPException(500, "Report generation failed") from exc
 
     if "error" in report:
         raise HTTPException(422, report["error"])

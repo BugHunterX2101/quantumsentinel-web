@@ -153,6 +153,20 @@ def build_manifest(experiment: Experiment) -> dict:
     }
 
 
+def _fallback_hmac_key() -> bytes:
+    """Derive the dev/test fallback signing key from the deployment's own
+    CSRF_SECRET rather than a fixed literal — a hardcoded key would let
+    anyone who has read the (public) source code forge a manifest signature,
+    which defeats the entire point of a "provable link between this P&L and
+    this exact dataset/strategy/code version". CSRF_SECRET is random per
+    deployment (and required to be explicitly set in production, see
+    backend/config.py), so this key can't be derived without server-side
+    secret material even though the derivation formula itself is public.
+    """
+    from backend.config import CSRF_SECRET
+    return hashlib.sha256(f"qs-experiment-manifest-hmac:{CSRF_SECRET}".encode()).digest()
+
+
 def sign_manifest(manifest: dict) -> str:
     """Sign an experiment manifest with the server's ML-DSA-65 key.
 
@@ -169,10 +183,11 @@ def sign_manifest(manifest: dict) -> str:
         return f"ml-dsa:{sig_hex}"
     except Exception:
         pass
-    # Fallback: HMAC-SHA256 with a fixed key for dev/test
+    # Fallback: HMAC-SHA256 keyed off the deployment's own secret (see
+    # _fallback_hmac_key) for dev/test, or if ML-DSA signing ever fails.
     import hmac
     sig = hmac.new(
-        b"qs-experiment-signing-key",
+        _fallback_hmac_key(),
         canonical.encode(),
         hashlib.sha256,
     ).hexdigest()
@@ -189,11 +204,11 @@ def verify_manifest_signature(manifest: dict, signature: str) -> bool:
     if signature.startswith("hmac-sha256:"):
         import hmac
         expected = hmac.new(
-            b"qs-experiment-signing-key",
+            _fallback_hmac_key(),
             canonical.encode(),
             hashlib.sha256,
         ).hexdigest()
-        return signature == f"hmac-sha256:{expected}"
+        return hmac.compare_digest(signature, f"hmac-sha256:{expected}")
 
     if signature.startswith("ml-dsa:"):
         try:

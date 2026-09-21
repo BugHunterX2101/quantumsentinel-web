@@ -79,6 +79,7 @@ class Order:
     queue_ahead_at_entry: float = 0.0
     queue_ahead_peak: float = 0.0
     entered_book_at: float | None = None
+    filled_at: float | None = None
 
     @property
     def remaining_quantity(self) -> float:
@@ -234,8 +235,15 @@ class OrderBook:
 
     # ---- Order management -----------------------------------------------
 
-    def add_order(self, order: Order) -> None:
-        """Add a resting order to the book."""
+    def add_order(self, order: Order, timestamp: float | None = None) -> None:
+        """Add a resting order to the book.
+
+        ``timestamp``, when given, should be on the same clock as the
+        caller's other order timestamps (e.g. simulated replay time during
+        a backtest) so that later fill-time analytics aren't comparing
+        wall-clock and simulated time. Defaults to wall-clock for callers
+        that don't track their own clock.
+        """
         side_book = self._bids if order.side == TradeSide.BUY else self._asks
         price = order.limit_price
         if price is None:
@@ -249,8 +257,11 @@ class OrderBook:
         order.queue_ahead = queue_ahead
         order.queue_ahead_at_entry = queue_ahead
         order.queue_ahead_peak = queue_ahead
-        order.entered_book_at = time.time()
-        order.status = OrderStatus.QUEUED
+        order.entered_book_at = timestamp if timestamp is not None else time.time()
+        # A marketable limit order can partially fill before resting the
+        # remainder — don't stomp that PARTIALLY_FILLED status with QUEUED.
+        if order.filled_quantity <= 0:
+            order.status = OrderStatus.QUEUED
 
         side_book[price].add(order)
         self._orders[order.order_id] = order
@@ -281,11 +292,17 @@ class OrderBook:
         side: TradeSide,
         quantity: float,
         timestamp: float,
+        limit_price: float | None = None,
     ) -> list[Fill]:
         """Consume liquidity from the opposite side of the book.
 
         For a BUY aggressor, consume from asks (ascending price).
         For a SELL aggressor, consume from bids (descending price).
+
+        ``limit_price``, when given, bounds the sweep: a BUY will never
+        consume a level priced above it, and a SELL will never consume a
+        level priced below it (a limit order must never trade through its
+        own limit). Leave it ``None`` for an unbounded market-order sweep.
 
         Returns a list of fills generated.
         """
@@ -296,6 +313,11 @@ class OrderBook:
         for level in levels:
             if remaining <= 0:
                 break
+            if limit_price is not None:
+                if side == TradeSide.BUY and level.price > limit_price:
+                    break
+                if side == TradeSide.SELL and level.price < limit_price:
+                    break
 
             orders_to_remove = []
             for order in level.orders:
@@ -312,6 +334,7 @@ class OrderBook:
                     orders_to_remove.append(order.order_id)
                 else:
                     order.status = OrderStatus.PARTIALLY_FILLED
+                order.filled_at = timestamp
 
                 order.avg_fill_price = (
                     (order.avg_fill_price * (order.filled_quantity - fill_qty) +
@@ -349,12 +372,18 @@ class OrderBook:
         price: float,
         executed_volume: float,
         side: TradeSide,
+        timestamp: float | None = None,
     ) -> list[Fill]:
         """Update queue positions when an external trade occurs at a level.
 
         When an execution event arrives at a price on our side, we
         decrement ``queue_ahead`` for each resting order.  If queue_ahead
         drops to zero, the order fills.
+
+        ``timestamp`` should be on the same clock the caller used for
+        ``entered_book_at`` (see ``add_order``), so fill-time analytics
+        aren't comparing wall-clock and simulated time. Defaults to
+        wall-clock when not given.
         """
         side_book = self._bids if side == TradeSide.BUY else self._asks
         if price not in side_book:
@@ -363,6 +392,7 @@ class OrderBook:
         level = side_book[price]
         fills: list[Fill] = []
         remaining_exec = executed_volume
+        ts = timestamp if timestamp is not None else time.time()
 
         for order in list(level.orders):
             if remaining_exec <= 0:
@@ -374,14 +404,23 @@ class OrderBook:
                 remaining_exec -= deducted
 
                 if order.queue_ahead <= 0:
-                    # Our order is at the front — fill it
-                    fill_qty = min(order.remaining_quantity, remaining_exec + deducted)
+                    # Our order is at the front. Only the trade volume left
+                    # over *after* clearing the phantom queue ahead of us
+                    # can fill us — adding `deducted` back here would count
+                    # that volume twice (once against the queue, once
+                    # against our own order), fabricating fills beyond what
+                    # the trade actually executed.
+                    fill_qty = min(order.remaining_quantity, remaining_exec)
                     if fill_qty <= 0:
-                        fill_qty = order.remaining_quantity
+                        # Queue exactly cleared with no leftover volume —
+                        # we're now at the front but not yet executed.
+                        continue
 
                     order.filled_quantity += fill_qty
+                    remaining_exec -= fill_qty
                     is_full = order.remaining_quantity <= 0
                     order.status = OrderStatus.FILLED if is_full else OrderStatus.PARTIALLY_FILLED
+                    order.filled_at = ts
 
                     order.avg_fill_price = (
                         (order.avg_fill_price * (order.filled_quantity - fill_qty) +
@@ -393,7 +432,7 @@ class OrderBook:
                         order_id=order.order_id,
                         fill_price=price,
                         fill_quantity=fill_qty,
-                        timestamp=time.time(),
+                        timestamp=ts,
                         is_partial=not is_full,
                     ))
 
@@ -408,12 +447,13 @@ class OrderBook:
                 is_full = order.remaining_quantity <= 0
                 order.status = OrderStatus.FILLED if is_full else OrderStatus.PARTIALLY_FILLED
                 order.avg_fill_price = price
+                order.filled_at = ts
 
                 fills.append(Fill(
                     order_id=order.order_id,
                     fill_price=price,
                     fill_quantity=fill_qty,
-                    timestamp=time.time(),
+                    timestamp=ts,
                     is_partial=not is_full,
                 ))
 

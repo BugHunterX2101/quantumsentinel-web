@@ -193,7 +193,7 @@ class PaperExchange:
         )
         self.order_history.append(order)
 
-        events = self.engine.submit_order(order)
+        events = self.engine.submit_order(order, timestamp=self._current_time)
         self.event_log.extend(events)
 
         # Process any fills from immediate execution

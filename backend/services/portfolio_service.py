@@ -127,13 +127,24 @@ def equity_curve_from_trades(
 
     for t in trades:
         qty, price = float(t.quantity), float(t.filled_price or 0)
-        notional = qty * price
         if t.side == "buy":
-            equity -= notional
+            equity -= qty * price
             book[t.asset] = book.get(t.asset, 0.0) + qty
         else:
-            equity += notional
-            book[t.asset] = book.get(t.asset, 0.0) - qty
+            # Clamp sell qty to available holding, mirroring
+            # recompute_positions(): the HTTP-layer oversell guard is a
+            # check-then-act race (held qty is checked, then the trade is
+            # recorded), so a stale/concurrent fill can still slip an
+            # oversell into the trade history. Without this clamp, that
+            # trade would credit full sale notional and push book negative
+            # here while recompute_positions silently discards the same
+            # excess — the equity curve (and every risk metric derived
+            # from it) would then reflect a phantom short position that
+            # disagrees with the user's actual (flat) position row.
+            held_qty = book.get(t.asset, 0.0)
+            sell_qty = min(qty, held_qty)
+            equity += sell_qty * price
+            book[t.asset] = held_qty - sell_qty
 
         # Mark open positions to market using the pre-fetched current prices
         open_value = sum(

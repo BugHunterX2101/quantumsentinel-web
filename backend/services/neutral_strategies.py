@@ -84,10 +84,33 @@ class KalmanHedgeFilter:
         return self.beta
 
     def fit(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:
-        """Fit to full time series. Returns hedge ratio history."""
+        """Fit to full time series. Returns the posterior hedge-ratio
+        history beta_{t|t} — the estimate *after* incorporating (y_t, x_t).
+        Useful for reporting/diagnostics (e.g. convergence to a true beta),
+        but NOT for building a tradeable spread — see fit_predictive().
+        """
         betas = np.zeros(len(y))
         for t in range(len(y)):
             betas[t] = self.update(float(y[t]), float(x[t]))
+        return betas
+
+    def fit_predictive(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:
+        """Fit to full time series. Returns the PRIOR hedge-ratio history
+        beta_{t|t-1} — the estimate as of just *before* observing (y_t, x_t).
+
+        This is what a tradeable spread must be built from. The posterior
+        beta_{t|t} (returned by fit()) is chosen by the Kalman update
+        specifically to explain away the very observation being tested, so
+        using it makes the residual y_t - x_t*beta_{t|t} self-referential:
+        algebraically it equals the true one-step-ahead innovation scaled
+        by R/(x_t^2*P_pred+R) < 1, which collapses toward zero (empirically
+        by ~3 orders of magnitude with typical delta/R) rather than
+        reflecting a genuine, live-tradeable mispricing signal.
+        """
+        betas = np.zeros(len(y))
+        for t in range(len(y)):
+            betas[t] = self.beta  # prior, before this step's update
+            self.update(float(y[t]), float(x[t]))
         return betas
 
 
@@ -243,7 +266,10 @@ def pairs_trading_signals(y: np.ndarray, x: np.ndarray,
     # Hedge ratio time series
     if use_kalman:
         kf = KalmanHedgeFilter(delta=1e-4, R=1e-3)
-        hedge_ratios = kf.fit(y, x)
+        # Use the PRIOR (pre-update) beta for each step, not the posterior
+        # fit() would return — see fit_predictive()'s docstring for why the
+        # posterior makes the spread self-referential and non-tradeable.
+        hedge_ratios = kf.fit_predictive(y, x)
     else:
         hedge_ratios = np.full(T, np.nan)
         for t in range(window, T):

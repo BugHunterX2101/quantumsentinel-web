@@ -6,6 +6,7 @@
 
 **Open-source quantitative research and paper-trading platform with post-quantum security primitives**
 
+[![CI](https://github.com/BugHunterX2101/quantumsentinel-web/actions/workflows/ci.yml/badge.svg)](https://github.com/BugHunterX2101/quantumsentinel-web/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.12+-blue?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Tests](https://img.shields.io/badge/Tests-pytest-blue)](tests/)
@@ -352,6 +353,25 @@ Order request → risk gate → canonical QS-ORDER-V1 payload → signature chec
   projected gross leverage. Development paper trading uses visibly labelled
   server attestation for compatibility; it is not client order authorisation.
 
+### Quant-Math Correctness Auditing
+
+The research engine has been through repeated, source-verified correctness
+passes rather than a single review: every formula is checked against its
+primary reference (NIST FIPS text, the original paper, or a textbook
+derivation) and, where practical, against an independent numerical
+reproduction — not accepted on the strength of a code review alone. Past
+rounds have caught and fixed, among others, a Sortino downside-deviation
+denominator error, an inconsistent Bollinger Band `ddof` convention, a
+sign-flip in capacity-degradation analysis, MacKinnon (2010) finite-sample
+critical values for Engle-Granger cointegration, a Deflated Sharpe Ratio
+variance-formula error, a risk-free-rate omission in the efficient-frontier
+Sharpe calculation, and event-driven cost-basis corruption on position
+flips — each with a regression test that is verified to fail against the
+pre-fix code before being accepted. Concurrency-safety issues (unlocked
+shared-state mutation, TOCTOU races on token rotation, and an audit
+hash-chain append race) have received the same treatment. `git log` is the
+source of truth for the full history of these fixes.
+
 ### Research Reproducibility
 
 `research_metadata.py` provides versioned experiment records and dataset
@@ -455,7 +475,7 @@ quantumsentinel-web/
 │
 ├── frontend/                            ← Vanilla JS SPA (zero build step)
 │   ├── index.html                       ← App shell · 9-tab navigation · all forms
-│   ├── app.js                           ← ~3300-line SPA: auth · trading · portfolio · research · lab · WS
+│   ├── app.js                           ← ~3500-line SPA: auth · trading · portfolio · research · lab · WS
 │   ├── bg3d.js                          ← Three.js 3D particle background engine
 │   ├── styles.css                       ← Glassmorphism · micro-animations · mobile-first
 │   ├── robots.txt                       ← Search engine crawl policy
@@ -474,7 +494,9 @@ quantumsentinel-web/
 │   ├── test_microstructure.py           ← L2 analytics · OBI · microprice · synthetic L2 replay
 │   ├── test_paper_exchange.py           ← Order book · matching engine · paper exchange · FIFO
 │   ├── test_execution_analytics.py      ← Implementation shortfall · capacity · latency model
-│   └── test_experiment_registry.py      ← Experiment provenance · signed manifests · gates
+│   ├── test_experiment_registry.py      ← Experiment provenance · signed manifests · gates
+│   ├── test_portfolio_service.py        ← recompute_positions() · equity curve · oversell edge cases
+│   └── test_walk_forward.py             ← Offline walk-forward fold logic (rolling/expanding, degradation)
 │
 ├── deploy/
 │   ├── nginx.conf                       ← TLS 1.3 reverse proxy with HSTS
@@ -800,6 +822,24 @@ python -c "from backend.services.cpp_ext import CPP_AVAILABLE; print('C++ kernel
 # Docker health check
 docker compose up --build -d && curl http://localhost:8000/health/ready
 ```
+
+### Continuous Integration & Security Scanning
+
+Every push and pull request runs the full test matrix — **Ubuntu, Windows, and
+macOS**, each on **Python 3.12 and 3.13** — followed by five independent
+security-scanning jobs, all defined in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+| Stage | Tool | Checks |
+|---|---|---|
+| `security-bandit` | [Bandit](https://bandit.readthedocs.io/) | Python SAST — common Python security anti-patterns |
+| `security-pip-audit` | [pip-audit](https://github.com/pypa/pip-audit) | Known CVEs in pinned dependencies |
+| `security-gitleaks` | [Gitleaks](https://github.com/gitleaks/gitleaks) | Committed secrets / credential leaks across full history |
+| `security-semgrep` | [Semgrep](https://semgrep.dev/) | `p/python` · `p/security-audit` · `p/owasp-top-ten` rule sets |
+| `security-trivy` | [Trivy](https://aquasecurity.github.io/trivy/) | Container image vulnerability scan (builds the `Dockerfile` image) |
+
+The C++ extension is also built and its import verified as an optional CI step,
+falling back cleanly to NumPy when unavailable.
 
 ---
 

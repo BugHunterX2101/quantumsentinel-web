@@ -545,6 +545,33 @@ class TestRunPortfolioOptimization:
             assert "volatility" in point
             assert "sharpe" in point
 
+    def test_efficient_frontier_sharpe_uses_risk_free_rate(self, large_returns):
+        """The frontier's Sharpe must subtract rf_rate like every other Sharpe
+        in the same response (portfolio_analytics: (ret - rf) / vol) — it must
+        not silently compute plain ret/vol regardless of rf_rate."""
+        rf_rate = 0.0003  # ~7.5%/yr daily rate, large enough to be unmissable
+        zero_rf = run_portfolio_optimization(large_returns, rf_rate=0.0)
+        pos_rf = run_portfolio_optimization(large_returns, rf_rate=rf_rate)
+
+        f0 = zero_rf["efficient_frontier"]
+        f1 = pos_rf["efficient_frontier"]
+        assert len(f0) == len(f1) > 0
+
+        for p0, p1 in zip(f0, f1):
+            # Same return/vol grid regardless of rf_rate (rf only affects Sharpe)
+            assert p0["return"] == pytest.approx(p1["return"], rel=1e-6)
+            assert p0["volatility"] == pytest.approx(p1["volatility"], rel=1e-6)
+            # sharpe(rf) - sharpe(0) = -rf_rate * sqrt(252) / vol_daily exactly
+            # (only the numerator changes) — compare the delta rather than an
+            # absolute recompute, so rounding on "return"/"volatility" (4dp)
+            # doesn't get amplified into a false failure.
+            port_vol_daily = p0["volatility"] / math.sqrt(252)
+            expected_delta = -rf_rate * math.sqrt(252) / port_vol_daily
+            actual_delta = p1["sharpe"] - p0["sharpe"]
+            assert actual_delta == pytest.approx(expected_delta, rel=1e-2)
+            # A positive rf_rate must lower the reported Sharpe vs. the rf=0 case
+            assert p1["sharpe"] < p0["sharpe"]
+
     def test_weight_constraints_respected(self, large_returns):
         con = PortfolioConstraints(long_only=True, max_weight=0.25)
         result = run_portfolio_optimization(

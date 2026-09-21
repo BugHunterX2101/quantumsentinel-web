@@ -101,7 +101,17 @@ function api(path, opts = {}, opts2 = {}) {
     const etag = r.headers.get('ETag');
     if (etag) state._lastEtag = etag;
     const body = await r.json().catch(() => ({}));
-    if (r.status === 401) { handleTokenExpiry(); throw new Error('Session expired. Please log in again.'); }
+    if (r.status === 401) {
+      // A 401 from login/register means the credentials were rejected, not
+      // that an existing session expired — there is no session to expire
+      // yet. Surface the backend's actual reason instead of mislabeling
+      // every failed login attempt as an expired session.
+      if (path === '/api/auth/login' || path === '/api/auth/register') {
+        throw new Error(body.detail || 'Invalid credentials');
+      }
+      handleTokenExpiry();
+      throw new Error('Session expired. Please log in again.');
+    }
     if (!r.ok) throw new Error(body.detail || r.statusText);
     return body;
   }).catch((err) => {
@@ -1897,8 +1907,18 @@ document.getElementById('order-type').addEventListener('change', (e) => {
   document.getElementById('stop-price-wrap').classList.toggle('hidden', !['stop', 'stop_limit'].includes(type));
 });
 
+// Closes a proven gap: two structurally-identical concurrent order POSTs
+// (rapid double-click, a network-level retry, or a raw script bypassing the
+// DOM entirely) previously both executed as separate real trades — the
+// server had no deduplication because this form never sent an
+// Idempotency-Key. The in-flight guard below is a synchronous boolean check
+// (no `await` before it's set), so it closes the race regardless of any
+// button-disabled timing nuance; the Idempotency-Key header makes retries of
+// the exact same attempt return the original cached result server-side.
+let _orderSubmitInFlight = false;
 document.getElementById('order-form').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (_orderSubmitInFlight) return;
   const errEl = document.getElementById('order-error');
   const btn = document.getElementById('order-submit-btn');
   errEl.textContent = '';
@@ -1925,16 +1945,27 @@ document.getElementById('order-form').addEventListener('submit', async (e) => {
   if (['stop','stop_limit'].includes(body.order_type) && (!isFinite(body.stop_price) || body.stop_price <= 0)) {
     errEl.textContent = 'Please enter a valid stop price > 0.'; return;
   }
+  _orderSubmitInFlight = true;
   setButtonLoading(btn, true, 'Signing with ML-DSA-65…');
   try {
-    const order = await api('/api/trading/orders', { method: 'POST', body: JSON.stringify(body) }, { silent: true });
+    const idempotencyKey = window.crypto?.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const order = await api('/api/trading/orders', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(body),
+    }, { silent: true });
     await refreshOrders();
     toast(
       order.status === 'FILLED' ? 'Order filled' : 'Order submitted',
       `${body.side.toUpperCase()} ${body.quantity} ${body.asset}${order.filled_price != null ? ' @ $' + Number(order.filled_price).toFixed(2) : ''}`,
       order.status === 'FILLED' ? 'success' : 'info'
     );
-  } catch (err) { errEl.textContent = err.message; } finally { setButtonLoading(btn, false); }
+  } catch (err) { errEl.textContent = err.message; } finally {
+    setButtonLoading(btn, false);
+    _orderSubmitInFlight = false;
+  }
 });
 
 async function cancelOrder(orderId, btn) {

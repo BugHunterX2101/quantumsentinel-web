@@ -315,8 +315,13 @@ def compute_capacity_analysis(
     for cap in capitals:
         r = strategy_results_by_capital[cap]
         sharpe = r.get("sharpe", 0)
+        # Normalize by |baseline_sharpe|, not baseline_sharpe itself — a
+        # negative baseline would otherwise flip the sign, reporting a
+        # genuine degradation (sharpe getting more negative) as a
+        # "negative degradation" (i.e. an apparent improvement). E.g.
+        # baseline -1.0 -> -2.0 is real degradation but (−1−−2)/−1*100 = −100%.
         degradation = (
-            (baseline_sharpe - sharpe) / baseline_sharpe * 100
+            (baseline_sharpe - sharpe) / abs(baseline_sharpe) * 100
             if baseline_sharpe != 0 else 0
         )
         rows.append({

@@ -44,17 +44,28 @@ class VolRegime(str, Enum):
     HIGH = "high_vol"
     CRISIS = "crisis"
 
+    def __str__(self) -> str:
+        # Enum.__str__ takes priority over the str mixin and would
+        # otherwise render as "VolRegime.LOW" instead of "low_vol".
+        return self.value
+
 
 class TrendRegime(str, Enum):
     BULL = "bull"
     BEAR = "bear"
     SIDEWAYS = "sideways"
 
+    def __str__(self) -> str:
+        return self.value
+
 
 class RiskRegime(str, Enum):
     RISK_ON = "risk_on"
     RISK_OFF = "risk_off"
     NEUTRAL = "neutral"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 # ---------------------------------------------------------------------------
@@ -258,14 +269,21 @@ def volatility_regime(returns: np.ndarray,
     if len(valid) < 5:
         return {"error": "Not enough vol data"}
 
-    # Percentile thresholds
-    p25, p75, p95 = np.percentile(valid, list(percentiles))
-
+    # Percentile thresholds — computed on an expanding, causal window so
+    # that the regime label assigned at time t never uses volatility data
+    # from t's future (a full-sample threshold would leak look-ahead bias
+    # into every historical label, not just the current one).
     labels = []
-    for v in rolling_vol:
-        if not np.isfinite(v):
+    p25 = p75 = p95 = float("nan")
+    for t, v in enumerate(rolling_vol):
+        hist = rolling_vol[:t + 1]
+        hist_valid = hist[np.isfinite(hist)]
+        if not np.isfinite(v) or len(hist_valid) < 5:
             labels.append("unknown")
-        elif v <= p25:
+            continue
+
+        p25, p75, p95 = np.percentile(hist_valid, list(percentiles))
+        if v <= p25:
             labels.append(VolRegime.LOW)
         elif v <= p75:
             labels.append(VolRegime.MED)

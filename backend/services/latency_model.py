@@ -127,8 +127,12 @@ def latency_sensitivity_analysis(
 
     for name, result in strategy_results.items():
         sharpe = result.get("sharpe", 0)
+        # Normalize by |baseline_sharpe|, not baseline_sharpe itself — a
+        # negative baseline would otherwise flip the sign, reporting a
+        # genuine degradation (sharpe getting more negative) as a
+        # "negative degradation" (i.e. an apparent improvement).
         degradation = (
-            (baseline_sharpe - sharpe) / baseline_sharpe * 100
+            (baseline_sharpe - sharpe) / abs(baseline_sharpe) * 100
             if baseline_sharpe != 0 else 0
         )
         rows.append({

@@ -203,11 +203,10 @@ def compute_queue_analytics(orders: Sequence[Order]) -> dict:
 
     fill_times = []
     for o in filled:
-        if o.entered_book_at is not None:
-            ft = (o.submitted_at or 0) - o.entered_book_at
-            if ft < 0:
-                ft = abs(ft)
-            fill_times.append(ft)
+        if o.entered_book_at is not None and o.filled_at is not None:
+            ft = o.filled_at - o.entered_book_at
+            if ft >= 0:
+                fill_times.append(ft)
 
     partial_fills = [o for o in filled if o.status == OrderStatus.PARTIALLY_FILLED]
 

@@ -96,13 +96,18 @@ class MatchingEngine:
 
     # ---- Order submission -----------------------------------------------
 
-    def submit_order(self, order: Order) -> list[ExchangeEvent]:
+    def submit_order(self, order: Order, timestamp: float | None = None) -> list[ExchangeEvent]:
         """Process an incoming order.
+
+        ``timestamp``, when given, is used for this order's events and its
+        ``entered_book_at`` if it rests — pass the caller's simulated clock
+        during a backtest/replay so it stays comparable to fill timestamps
+        recorded via ``on_market_event``. Defaults to wall-clock.
 
         Returns a list of exchange events produced.
         """
         events: list[ExchangeEvent] = []
-        now = time.time()
+        now = timestamp if timestamp is not None else time.time()
 
         # Emit submission event
         events.append(ExchangeEvent(
@@ -269,6 +274,7 @@ class MatchingEngine:
                 side=order.side,
                 quantity=order.quantity,
                 timestamp=now,
+                limit_price=order.limit_price,
             )
             for fill in fills:
                 fill.order_id = order.order_id
@@ -328,7 +334,19 @@ class MatchingEngine:
 
         # Rest remaining quantity on the book
         if order.remaining_quantity > 0:
-            self.book.add_order(order)
+            if order.filled_quantity > 0:
+                # Marketable limit that partially filled against the book
+                # before its unfilled remainder rests — surface the fill
+                # that already happened, not just the queue event.
+                events.append(ExchangeEvent(
+                    timestamp=now,
+                    event_type=ExchangeEventType.ORDER_PARTIALLY_FILLED,
+                    order_id=order.order_id,
+                    symbol=order.symbol,
+                    details={"filled": order.filled_quantity,
+                              "remaining": order.remaining_quantity},
+                ))
+            self.book.add_order(order, timestamp=now)
             events.append(ExchangeEvent(
                 timestamp=now,
                 event_type=ExchangeEventType.ORDER_QUEUED,
@@ -368,10 +386,10 @@ class MatchingEngine:
             # Trades on the ask side affect BUY orders; trades on bid side affect SELL orders
             if event.side == TradeSide.BUY:
                 # Buyer aggressed → ask liquidity consumed → our SELL orders at this price may fill
-                fills = self.book.update_queue_positions(event.price, event.size, TradeSide.SELL)
+                fills = self.book.update_queue_positions(event.price, event.size, TradeSide.SELL, timestamp=now)
             else:
                 # Seller aggressed → bid liquidity consumed → our BUY orders may fill
-                fills = self.book.update_queue_positions(event.price, event.size, TradeSide.BUY)
+                fills = self.book.update_queue_positions(event.price, event.size, TradeSide.BUY, timestamp=now)
 
             for fill in fills:
                 etype = ExchangeEventType.ORDER_FILLED if not fill.is_partial else ExchangeEventType.ORDER_PARTIALLY_FILLED

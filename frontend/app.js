@@ -881,7 +881,16 @@ function _applyDashboardFilter() {
   cards.forEach(card => {
     const ticker = card.id.replace('signal-', '');
     const matchesSearch = !query || ticker.toLowerCase().includes(query);
-    const matchesExch = !exchFilter || (assetExchMap[ticker] || 'US') === exchFilter;
+    // FIX: asset_exchange_map only covers the 20 preloaded TRACKED_ASSETS —
+    // any watchlisted or on-demand-searched ticker outside that set was
+    // falling back to 'US' here regardless of its real exchange, so it would
+    // silently vanish under a non-US filter pill (or wrongly appear under
+    // the US pill). Read the exchange the card was actually rendered with
+    // first; only fall back to the static map/default for cards that
+    // predate this attribute (there shouldn't be any at runtime, but keep
+    // the old lookup as a defensive fallback).
+    const cardExch = card.dataset.exch || assetExchMap[ticker] || 'US';
+    const matchesExch = !exchFilter || cardExch === exchFilter;
     if (matchesSearch && matchesExch) {
       card.style.display = '';
       visible++;
@@ -1046,7 +1055,7 @@ function _renderDropdownItems(items, liveSignal) {
     const price = rawLivePrice.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: rawLivePrice < 1 ? 6 : 2 });
     const ex = sig.exchange || 'US';
     html += `<div class="asd-group-label">Live result — fetched from Yahoo Finance</div>
-      <div class="asd-item" data-ticker="${escapeHtml(sig.asset)}" data-live="1">
+      <div class="asd-item" data-ticker="${escapeHtml(sig.asset)}" data-live="1" role="option">
         <span class="asd-ticker">${escapeHtml(sig.asset)}</span>
         <span class="asd-exch">${exchFlags[ex] || ''} ${escapeHtml(ex)}</span>
         <span class="asd-price">${price}</span>
@@ -1146,6 +1155,11 @@ function _injectOnDemandCard(sig) {
   const div = document.createElement('div');
   div.className = `signal-card sig-${sigType} on-demand-card flash-update`;
   div.id = `signal-${rawAsset}`;
+  // See the matching comment in _renderSignalGrid — on-demand tickers are by
+  // definition outside the 20 preloaded TRACKED_ASSETS, so the static
+  // asset_exchange_map has no entry for them and _applyDashboardFilter must
+  // read the exchange straight off the card instead.
+  div.dataset.exch = sig.exchange || 'US';
   div.innerHTML = `
     <div class="sig-header">
       <div>
@@ -1664,7 +1678,12 @@ function _renderSignalGrid(grid, signals, fromCache) {
     const changePct = s.change_pct != null ? Number(s.change_pct) : null;
     const changeStr = changePct != null ? `${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%` : null;
 
-    const card = makeEl('div', { cls: `signal-card sig-${sigType}`, attrs: { id: `signal-${asset}` }, style: { animationDelay: (i * 40) + 'ms' } });
+    // data-exch is read by _applyDashboardFilter() — it must come from the
+    // signal's own exchange field, not looked up later from the static
+    // asset_exchange_map (which only covers the 20 preloaded TRACKED_ASSETS).
+    // A watchlisted ticker outside that set would otherwise silently fall
+    // back to 'US' in the filter and vanish under any other exchange pill.
+    const card = makeEl('div', { cls: `signal-card sig-${sigType}`, attrs: { id: `signal-${asset}` }, data: { exch: s.exchange || 'US' }, style: { animationDelay: (i * 40) + 'ms' } });
 
     // Header
     const headerLeft = makeEl('div');

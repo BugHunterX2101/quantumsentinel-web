@@ -19,6 +19,7 @@ Usage
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Sequence
 
@@ -54,11 +55,24 @@ class L2EventStream:
 
     def __post_init__(self):
         if not self.dataset_hash:
-            raw = "".join(
-                f"{e.timestamp}:{e.event_type.value}:{e.price}:{e.size}"
-                for e in self.events[:1000]  # Hash first 1000 for speed
-            )
-            self.dataset_hash = hashlib.sha256(raw.encode()).hexdigest()
+            # Hash the complete, canonical replay input. A prefix hash could
+            # attest two streams that diverge after event 1,000, while a
+            # concatenated string omitted fields (side/order identity) that
+            # affect book state and matching. JSON framing also avoids field
+            # boundary ambiguities inherent in simple string concatenation.
+            canonical_events = [
+                {
+                    "timestamp": event.timestamp,
+                    "event_type": event.event_type.value,
+                    "side": event.side.value,
+                    "price": event.price,
+                    "size": event.size,
+                    "order_id": event.order_id,
+                }
+                for event in self.events
+            ]
+            raw = json.dumps(canonical_events, separators=(",", ":"), ensure_ascii=False)
+            self.dataset_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def __iter__(self) -> Iterator[BookEvent]:
         return iter(self.events)

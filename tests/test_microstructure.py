@@ -264,6 +264,28 @@ class TestL2Replay:
         s2 = L2EventStream.from_synthetic(bars, seed=42)
         assert s1.dataset_hash == s2.dataset_hash
 
+    def test_dataset_hash_covers_every_event_and_all_replay_fields(self):
+        """A provenance hash must change for any event that changes replay."""
+        events = [
+            BookEvent(float(i), BookEventType.ADD, TradeSide.BUY, 100.0, 1.0,
+                      order_id=f"order-{i}")
+            for i in range(1_001)
+        ]
+        changed_tail = list(events)
+        changed_tail[-1] = BookEvent(1000.0, BookEventType.ADD, TradeSide.BUY,
+                                      101.0, 1.0, order_id="order-1000")
+        changed_side = list(events)
+        changed_side[0] = BookEvent(0.0, BookEventType.ADD, TradeSide.SELL,
+                                     100.0, 1.0, order_id="order-0")
+        changed_order_id = list(events)
+        changed_order_id[0] = BookEvent(0.0, BookEventType.ADD, TradeSide.BUY,
+                                         100.0, 1.0, order_id="different-order")
+
+        stream = L2EventStream.from_events(events)
+        assert stream.dataset_hash != L2EventStream.from_events(changed_tail).dataset_hash
+        assert stream.dataset_hash != L2EventStream.from_events(changed_side).dataset_hash
+        assert stream.dataset_hash != L2EventStream.from_events(changed_order_id).dataset_hash
+
     def test_replay_session_basic(self):
         bars = _make_ohlcv_bars(3)
         stream = L2EventStream.from_synthetic(bars, seed=42, events_per_bar=20)

@@ -199,6 +199,32 @@ class IdempotencyRecord(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
 
+class ResearchExperiment(Base):
+    """Durable, user-owned research experiment and its immutable inputs."""
+    __tablename__ = "research_experiments"
+
+    id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    strategy_id = Column(String, nullable=False)
+    strategy_version = Column(String, nullable=False)
+    dataset_id = Column(String, nullable=False)
+    dataset_json = Column(JSON, nullable=True)
+    dataset_hash = Column(String(64), nullable=False)
+    parameters_json = Column(JSON, nullable=False, default=dict)
+    parameter_hash = Column(String(64), nullable=False)
+    code_commit = Column(String, nullable=False)
+    random_seed = Column(Integer, nullable=False)
+    execution_model = Column(String, nullable=False)
+    latency_model = Column(String, nullable=False)
+    status = Column(String(32), nullable=False)
+    result_hash = Column(String(64), nullable=False, default="")
+    results_json = Column(JSON, nullable=False, default=dict)
+    validation_gates_json = Column(JSON, nullable=False, default=dict)
+    manifest_signature = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class AuditChainLink(Base):
     """Hash-chain link for tamper-evident audit history."""
     __tablename__ = "audit_chain_links"

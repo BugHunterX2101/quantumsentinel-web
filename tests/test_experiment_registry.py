@@ -10,9 +10,16 @@ Covers:
 """
 
 import pytest
+from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from backend import models
+from backend.database import Base
 from backend.services.experiment_registry import (
     Experiment,
     ExperimentRegistry,
+    PersistentExperimentRegistry,
     ExperimentStatus,
     build_manifest,
     hash_dataset,
@@ -22,6 +29,15 @@ from backend.services.experiment_registry import (
     validate_for_deployment,
     verify_manifest_signature,
 )
+
+
+@pytest.fixture
+def db():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    yield session
+    session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +181,50 @@ class TestValidationGates:
 # ---------------------------------------------------------------------------
 
 class TestExperimentRegistry:
+
+    def test_persistent_registry_survives_a_new_service_instance(self, db):
+        user = models.User(email="research-owner@example.com", password_hash="x")
+        db.add(user)
+        db.commit()
+
+        created = PersistentExperimentRegistry(db, user.id).create(
+            strategy_id="OBI-v3", strategy_version="3.1", dataset_id="synthetic-AAPL",
+            dataset=[{"timestamp": 1, "price": 100.0}], parameters={"threshold": 0.3},
+            random_seed=7,
+        )
+        restored = PersistentExperimentRegistry(db, user.id).get(created.experiment_id)
+
+        assert restored is not None
+        assert restored.experiment_id == created.experiment_id
+        assert restored.dataset_hash == created.dataset_hash
+        assert restored.parameter_hash == created.parameter_hash
+        assert restored.random_seed == 7
+
+    def test_experiment_endpoints_use_the_durable_user_owned_registry(self, db):
+        """Create → retrieve → replay works across independently built registries."""
+        from backend import main
+
+        owner = models.User(email="research-endpoint-owner@example.com", password_hash="x")
+        other_user = models.User(email="research-endpoint-other@example.com", password_hash="x")
+        db.add_all([owner, other_user])
+        db.commit()
+        request = {
+            "strategy_id": "OBI-v3", "strategy_version": "3.1",
+            "dataset_id": "synthetic-AAPL",
+            "dataset": [{"timestamp": 1, "price": 100.0}],
+            "parameters": {"threshold": 0.3}, "random_seed": 7,
+        }
+
+        created = main.experiment_create(request, owner, db)
+        restored = main.experiment_get(created["experiment_id"], owner, db)
+        replay = main.experiment_replay(created["experiment_id"], {}, owner, db)
+
+        assert restored["dataset_hash"] == created["dataset_hash"]
+        assert replay["matches_experiment"] is True
+        with pytest.raises(HTTPException) as exc:
+            main.experiment_get(created["experiment_id"], other_user, db)
+        assert exc.value.status_code == 404
+
     def test_create_experiment(self):
         registry = ExperimentRegistry()
         exp = registry.create(

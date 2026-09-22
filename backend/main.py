@@ -1086,6 +1086,17 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     if req.order_type in ("stop", "stop_limit") and req.stop_price is None:
         raise HTTPException(400, "stop_price required for stop orders")
 
+    # A completed retry is a read-only operation: return it before deriving
+    # positions or retrieving a fresh market price. This prevents a previously
+    # completed order from becoming unavailable merely because a downstream
+    # market-data dependency is unavailable on the retry.
+    payload_hash = order_security.request_hash(req.model_dump(exclude={"signature"}))
+    cached_response = order_security.get_completed_idempotency_response(
+        db, user.id, idempotency_key, payload_hash,
+    )
+    if cached_response is not None:
+        return cached_response
+
     # Paper account guardrails from the architecture: no naked shorting,
     # duplicate submissions, and a 5% initial-capital concentration cap.
     existing_positions = {p["asset"]: p for p in portfolio_service.get_positions_with_pnl(db, user.id)}
@@ -1166,7 +1177,6 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     # Idempotency binds the caller's business payload. In development the
     # server creates envelope fields, so hashing the generated nonce/order ID
     # would make an otherwise identical retry look different.
-    payload_hash = order_security.request_hash(req.model_dump(exclude={"signature"}))
     signer_key_id, signature, signature_mode = order_security.verify_or_attest(
         db, user.id, canonical, req.key_id, req.signature,
     )
@@ -2464,10 +2474,11 @@ def execution_capacity(request_body: dict, user: models.User = Depends(get_curre
 # --------------------------------------------------------------------------
 
 @app.post("/api/experiments/create", status_code=201)
-def experiment_create(request_body: dict, user: models.User = Depends(get_current_user)):
+def experiment_create(request_body: dict, user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
     """Create a new experiment with full provenance tracking."""
-    from .services.experiment_registry import ExperimentRegistry
-    registry = ExperimentRegistry()
+    from .services.experiment_registry import PersistentExperimentRegistry
+    registry = PersistentExperimentRegistry(db, user.id)
     exp = registry.create(
         strategy_id=request_body.get("strategy_id", ""),
         strategy_version=request_body.get("strategy_version", "1.0"),
@@ -2482,10 +2493,11 @@ def experiment_create(request_body: dict, user: models.User = Depends(get_curren
 
 
 @app.get("/api/experiments/{experiment_id}", status_code=200)
-def experiment_get(experiment_id: str, user: models.User = Depends(get_current_user)):
+def experiment_get(experiment_id: str, user: models.User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
     """Get experiment details with signed manifest."""
-    from .services.experiment_registry import ExperimentRegistry
-    registry = ExperimentRegistry()
+    from .services.experiment_registry import PersistentExperimentRegistry
+    registry = PersistentExperimentRegistry(db, user.id)
     exp = registry.get(experiment_id)
     if not exp:
         raise HTTPException(404, f"Experiment {experiment_id} not found")
@@ -2493,23 +2505,33 @@ def experiment_get(experiment_id: str, user: models.User = Depends(get_current_u
 
 
 @app.post("/api/experiments/{experiment_id}/replay", status_code=200)
-def experiment_replay(experiment_id: str, request_body: dict, user: models.User = Depends(get_current_user)):
+def experiment_replay(experiment_id: str, request_body: dict, user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
     """Deterministic replay of an experiment.
 
     Verifies that the same dataset + parameters + seed produces
     the same result hash.
     """
-    from .services.experiment_registry import hash_dataset, hash_parameters
-    dataset = request_body.get("dataset")
-    parameters = request_body.get("parameters", {})
-    seed = request_body.get("random_seed", 42)
-    d_hash = hash_dataset(dataset) if dataset else ""
+    from .services.experiment_registry import PersistentExperimentRegistry, hash_dataset, hash_parameters
+    registry = PersistentExperimentRegistry(db, user.id)
+    exp = registry.get(experiment_id)
+    inputs = registry.inputs(experiment_id)
+    if not exp or inputs is None:
+        raise HTTPException(404, f"Experiment {experiment_id} not found")
+    stored_dataset, stored_parameters, stored_seed = inputs
+    dataset = request_body.get("dataset", stored_dataset)
+    parameters = request_body.get("parameters", stored_parameters)
+    seed = request_body.get("random_seed", stored_seed)
+    d_hash = hash_dataset(dataset) if dataset is not None else ""
     p_hash = hash_parameters(parameters)
     return {
         "experiment_id": experiment_id,
         "dataset_hash": d_hash,
         "parameter_hash": p_hash,
         "random_seed": seed,
+        "matches_experiment": (
+            d_hash == exp.dataset_hash and p_hash == exp.parameter_hash and seed == exp.random_seed
+        ),
         "replay_status": "deterministic_hashes_computed",
     }
 

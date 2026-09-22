@@ -74,6 +74,14 @@ def test_order_endpoint_returns_original_response_for_idempotent_retry(db, monke
     monkeypatch.setattr(main.trading_service, "alpaca_enabled", lambda: False)
     request = schemas.OrderRequest(asset="AAPL", side="buy", quantity=10, order_type="market")
     first = main.place_order(request, user, db, "retry_key_12345")
+
+    # A completed retry must not depend on fresh position marking or market
+    # data. Both calls would make the retry fragile when an external provider
+    # is unavailable.
+    monkeypatch.setattr(main.portfolio_service, "get_positions_with_pnl",
+                        lambda *_: pytest.fail("completed retry read positions"))
+    monkeypatch.setattr(main.trading_service, "get_last_price",
+                        lambda *_: pytest.fail("completed retry fetched price"))
     second = main.place_order(request, user, db, "retry_key_12345")
     assert first["order_id"] == second["order_id"]
     assert db.query(models.Trade).count() == 1
@@ -93,5 +101,10 @@ def test_sdk_order_forwards_idempotency_key(db, monkeypatch):
     monkeypatch.setattr(main.trading_service, "alpaca_enabled", lambda: False)
     request = schemas.OrderRequest(asset="MSFT", side="buy", quantity=10, order_type="market")
     first = main.sdk_order(request, key, db, "sdk_retry_12345")
+
+    monkeypatch.setattr(main.portfolio_service, "get_positions_with_pnl",
+                        lambda *_: pytest.fail("completed SDK retry read positions"))
+    monkeypatch.setattr(main.trading_service, "get_last_price",
+                        lambda *_: pytest.fail("completed SDK retry fetched price"))
     second = main.sdk_order(request, key, db, "sdk_retry_12345")
     assert first["order_id"] == second["order_id"]

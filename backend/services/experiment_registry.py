@@ -27,6 +27,7 @@ import json
 import subprocess
 import time
 import uuid
+import datetime as dt
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -324,7 +325,7 @@ class ExperimentRegistry:
             strategy_id=strategy_id,
             strategy_version=strategy_version,
             dataset_id=dataset_id,
-            dataset_hash=hash_dataset(dataset) if dataset else "",
+            dataset_hash=hash_dataset(dataset) if dataset is not None else "",
             parameter_hash=hash_parameters(parameters or {}),
             code_commit=get_code_commit(),
             random_seed=random_seed,
@@ -398,4 +399,122 @@ class ExperimentRegistry:
             {k: v for k, v in manifest.items() if k not in ("signature", "signature_valid")},
             exp.manifest_signature,
         ) if exp.manifest_signature else False
+        return manifest
+
+
+# ---------------------------------------------------------------------------
+# Durable experiment registry
+# ---------------------------------------------------------------------------
+
+class PersistentExperimentRegistry:
+    """Database-backed experiment registry scoped to one authenticated user.
+
+    The in-memory registry above remains useful for isolated unit experiments;
+    API requests must use this registry so a create request is retrievable by
+    a later request and survives an application restart.
+    """
+
+    def __init__(self, db, user_id: str):
+        self.db = db
+        self.user_id = user_id
+
+    @staticmethod
+    def _epoch(value: dt.datetime | None) -> float | None:
+        return value.timestamp() if value is not None else None
+
+    @classmethod
+    def _to_experiment(cls, row) -> Experiment:
+        return Experiment(
+            experiment_id=row.id,
+            strategy_id=row.strategy_id,
+            strategy_version=row.strategy_version,
+            dataset_id=row.dataset_id,
+            dataset_hash=row.dataset_hash,
+            parameter_hash=row.parameter_hash,
+            code_commit=row.code_commit,
+            random_seed=row.random_seed,
+            execution_model=row.execution_model,
+            latency_model=row.latency_model,
+            status=ExperimentStatus(row.status),
+            created_at=cls._epoch(row.created_at) or 0.0,
+            completed_at=cls._epoch(row.completed_at),
+            result_hash=row.result_hash,
+            results=row.results_json or {},
+            validation_gates=row.validation_gates_json or {},
+            manifest_signature=row.manifest_signature or "",
+        )
+
+    def _row(self, experiment_id: str):
+        from backend import models
+        return self.db.get(models.ResearchExperiment, experiment_id)
+
+    def create(self, strategy_id: str, strategy_version: str, dataset_id: str,
+               dataset: Any = None, parameters: dict | None = None,
+               random_seed: int = 42, execution_model: str = "LOB_QUEUE_V2",
+               latency_model: str = "zero") -> Experiment:
+        from backend import models
+        exp = Experiment(
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            dataset_id=dataset_id,
+            dataset_hash=hash_dataset(dataset) if dataset is not None else "",
+            parameter_hash=hash_parameters(parameters or {}),
+            code_commit=get_code_commit(),
+            random_seed=random_seed,
+            execution_model=execution_model,
+            latency_model=latency_model,
+        )
+        self.db.add(models.ResearchExperiment(
+            id=exp.experiment_id, user_id=self.user_id,
+            strategy_id=exp.strategy_id, strategy_version=exp.strategy_version,
+            dataset_id=exp.dataset_id, dataset_json=dataset,
+            dataset_hash=exp.dataset_hash, parameters_json=parameters or {},
+            parameter_hash=exp.parameter_hash, code_commit=exp.code_commit,
+            random_seed=exp.random_seed, execution_model=exp.execution_model,
+            latency_model=exp.latency_model, status=exp.status.value,
+        ))
+        self.db.commit()
+        return self.get(exp.experiment_id)  # type: ignore[return-value]
+
+    def get(self, experiment_id: str) -> Experiment | None:
+        row = self._row(experiment_id)
+        if not row or row.user_id != self.user_id:
+            return None
+        return self._to_experiment(row)
+
+    def inputs(self, experiment_id: str) -> tuple[Any, dict, int] | None:
+        """Return the immutable stored inputs for deterministic verification."""
+        row = self._row(experiment_id)
+        if not row or row.user_id != self.user_id:
+            return None
+        return row.dataset_json, row.parameters_json or {}, row.random_seed
+
+    def complete(self, experiment_id: str, results: dict, sign: bool = True) -> Experiment | None:
+        row = self._row(experiment_id)
+        if not row or row.user_id != self.user_id:
+            return None
+        exp = self._to_experiment(row)
+        exp.results = results
+        exp.result_hash = hash_results(results)
+        exp.completed_at = time.time()
+        exp.status = ExperimentStatus.COMPLETED
+        if sign:
+            exp.manifest_signature = sign_manifest(build_manifest(exp))
+        row.results_json = results
+        row.result_hash = exp.result_hash
+        row.completed_at = dt.datetime.fromtimestamp(exp.completed_at, tz=dt.timezone.utc)
+        row.status = exp.status.value
+        row.manifest_signature = exp.manifest_signature
+        self.db.commit()
+        return self._to_experiment(row)
+
+    def get_manifest(self, experiment_id: str) -> dict | None:
+        exp = self.get(experiment_id)
+        if not exp:
+            return None
+        manifest = build_manifest(exp)
+        manifest["signature"] = exp.manifest_signature
+        manifest["signature_valid"] = bool(exp.manifest_signature) and verify_manifest_signature(
+            build_manifest(exp), exp.manifest_signature,
+        )
         return manifest

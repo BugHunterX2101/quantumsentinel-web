@@ -103,12 +103,9 @@ def verify_or_attest(db: Session, user_id: str, canonical: str,
 def reserve_idempotency(db: Session, user_id: str, key: str | None,
                         payload_hash: str) -> dict | None:
     """Return the original response for a safe retry, or reserve a new key."""
+    _validate_idempotency_key(key)
     if not key:
-        if ENVIRONMENT == "production":
-            raise HTTPException(400, "Idempotency-Key is required for order submission")
         return None
-    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", key):
-        raise HTTPException(400, "invalid Idempotency-Key")
     existing = db.query(models.IdempotencyRecord).filter_by(user_id=user_id, idempotency_key=key).first()
     if existing:
         if existing.request_hash != payload_hash:
@@ -123,6 +120,38 @@ def reserve_idempotency(db: Session, user_id: str, key: str | None,
         db.rollback()
         return reserve_idempotency(db, user_id, key, payload_hash)
     return None
+
+
+def get_completed_idempotency_response(db: Session, user_id: str, key: str | None,
+                                       payload_hash: str) -> dict | None:
+    """Return a completed idempotent response without reserving a new key.
+
+    This is deliberately read-only so the order route can check a completed
+    retry before doing position marking, price retrieval, risk evaluation, or
+    cryptographic attestation. New submissions still use
+    :func:`reserve_idempotency` only after their normal authorization checks.
+    """
+    _validate_idempotency_key(key)
+    if not key:
+        return None
+    existing = db.query(models.IdempotencyRecord).filter_by(user_id=user_id, idempotency_key=key).first()
+    if not existing:
+        return None
+    if existing.request_hash != payload_hash:
+        raise HTTPException(409, "Idempotency-Key was already used with different payload")
+    if existing.response_json is not None:
+        return existing.response_json
+    raise HTTPException(409, "an order with this Idempotency-Key is in progress")
+
+
+def _validate_idempotency_key(key: str | None) -> None:
+    """Apply the shared idempotency-key policy without creating state."""
+    if not key:
+        if ENVIRONMENT == "production":
+            raise HTTPException(400, "Idempotency-Key is required for order submission")
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", key):
+        raise HTTPException(400, "invalid Idempotency-Key")
 
 
 def complete_idempotency(db: Session, user_id: str, key: str | None, response: dict) -> None:

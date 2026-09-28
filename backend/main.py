@@ -47,9 +47,11 @@ from . import models, schemas
 from .database import get_db, init_db, SessionLocal
 from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS,
                      COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
-                     REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT, ADMIN_EMAILS)
+                     REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT, ADMIN_EMAILS,
+                     PAPER_MAX_POSITION_FRACTION, ORDER_SWEEPER_ENABLED, ORDER_SWEEP_INTERVAL_SECONDS)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service, order_security
+from .services import paper_broker
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -202,10 +204,42 @@ async def _lifespan(_app: FastAPI):
         except Exception as exc:
             if ENVIRONMENT == "production":
                 raise RuntimeError("Redis is required and unavailable") from exc
+    sweeper = asyncio.create_task(_order_sweeper()) if ORDER_SWEEPER_ENABLED else None
     try:
         yield  # ── application runs here ──
     finally:
+        if sweeper:
+            sweeper.cancel()
         redis_store.set_app_loop(None)
+
+
+async def _order_sweeper() -> None:
+    """Fill resting paper orders as the market moves.
+
+    Fills are driven by this clock, never by a client reading its order list.
+    Each worker may run one; paper_broker's compare-and-set transitions make
+    concurrent sweeps safe.
+    """
+    while True:
+        await asyncio.sleep(ORDER_SWEEP_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(sweep_open_orders_once)
+        except Exception:
+            log.exception("order sweeper iteration failed")
+
+
+def sweep_open_orders_once() -> int:
+    db = SessionLocal()
+    try:
+        settled = 0
+        for trade, outcome in paper_broker.process_open_orders(db):
+            if outcome.status == "NOT_OPEN":
+                continue
+            _record_order_outcome(db, trade, outcome.reason)
+            settled += 1
+        return settled
+    finally:
+        db.close()
 
 
 # /docs, /redoc and the raw OpenAPI schema disclose every route, request/
@@ -1097,68 +1131,65 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     if cached_response is not None:
         return cached_response
 
-    # Paper account guardrails from the architecture: no naked shorting,
-    # duplicate submissions, and a 5% initial-capital concentration cap.
-    existing_positions = {p["asset"]: p for p in portfolio_service.get_positions_with_pnl(db, user.id)}
-    held = existing_positions.get(req.asset, {}).get("quantity", 0.0)
-    if req.side == "sell" and req.quantity > held:
-        raise HTTPException(400, "sell quantity exceeds the available paper position")
-    # Use `is not None` not `or` -- `or` evaluates 0.0 as falsy (impossible here since gt=0,
-    # but defensive coding prevents future regressions if schema changes).
+    # One strict price observation drives both the risk checks and the fill
+    # decision. Without a real price the order is refused — the paper broker
+    # never substitutes a guessed price.
+    try:
+        last_price = trading_service.get_last_price(req.asset)
+    except trading_service.MarketDataUnavailable as exc:
+        raise HTTPException(503, f"no current market price for {req.asset}; order not accepted") from exc
+
+    positions = portfolio_service.get_positions_with_pnl(db, user.id)
+    position = next((p for p in positions if p["asset"] == req.asset), None)
+    held = position["quantity"] if position else 0.0
+    buy_reserved, pending_sell = paper_broker.open_order_exposure(db, user.id)
+    # Shares already promised to open sell orders cannot be sold twice.
+    sellable = held - pending_sell.get(req.asset, 0.0)
+    if req.side == "sell" and req.quantity > sellable + 1e-9:
+        raise HTTPException(400, "sell quantity exceeds the available paper position "
+                                 "(held quantity minus open sell orders)")
+
+    account = paper_broker.account_snapshot(db, user.id, positions)
+    reserve = paper_broker.reservation_micros(
+        req.side, req.quantity, req.order_type, req.limit_price, req.stop_price, market_price=last_price,
+    )
+    # Buys are sized at the price they reserve (their worst-case cost).
     if req.limit_price is not None:
         price_for_risk = float(req.limit_price)
     elif req.stop_price is not None:
         price_for_risk = float(req.stop_price)
     else:
-        price_for_risk = trading_service.get_last_price(req.asset)
+        price_for_risk = last_price
+    equity = account["equity"]
+    if req.side == "buy":
+        cap = equity * PAPER_MAX_POSITION_FRACTION
+        projected = ((position["market_value"] if position else 0.0)
+                     + paper_broker.from_micros(buy_reserved.get(req.asset, 0))
+                     + req.quantity * price_for_risk)
+        if projected > cap + 1e-6:
+            raise HTTPException(
+                400,
+                f"order would take the {req.asset} position to ${projected:,.2f}, above the "
+                f"{PAPER_MAX_POSITION_FRACTION:.0%} per-asset limit (${cap:,.2f} of account equity)",
+            )
+        if reserve > paper_broker.to_micros(account["available_cash"]):
+            raise HTTPException(
+                400, f"insufficient available cash: order needs ${paper_broker.from_micros(reserve):,.2f}, "
+                     f"${account['available_cash']:,.2f} available",
+            )
 
-    # FIX: Compute real account cash from FILLED trades instead of using the
-    # static subtraction (100k - notional_held) which goes negative when
-    # holdings exceed $100k and floors position_cap at an unusable $250.
-    filled_trades = db.execute(
-        select(models.Trade).where(
-            models.Trade.user_id == user.id, models.Trade.status == "FILLED"
-        )
-    ).scalars().all()
-    cash = 100_000.0
-    for ft in filled_trades:
-        notional = float(ft.quantity) * float(ft.filled_price or 0)
-        if ft.side == "buy":
-            cash -= notional  # buying costs cash
-        else:
-            cash += notional  # selling returns cash
-    # Floor cash at zero — a negative balance means over-leveraged. Use the
-    # larger of actual cash and a $5k minimum for equity so the 5% cap
-    # doesn't collapse to zero but also doesn't create phantom buying power.
-    cash = max(0.0, cash)
-    account_equity = max(5_000.0, cash)
-    position_cap = account_equity * 0.05
-    if req.side == "buy" and req.quantity * price_for_risk > position_cap:
-        raise HTTPException(
-            400,
-            f"order exceeds the 5% paper-account position limit "
-            f"(${position_cap:,.0f} based on current account equity)",
-        )
-
-    current_gross_exposure = sum(
-        abs(float(ft.quantity)) * float(ft.filled_price or 0)
-        for ft in filled_trades
-    )
-    # Mandatory boundary between order construction and paper/broker execution.
-    # Passing _redis_client makes kill-switch checks consistent across
-    # worker processes instead of only the process that received the
-    # POST /api/risk/kill-switch request.
+    # Mandatory boundary between order construction and paper execution.
+    # Exposure is today's positions at mark plus cash already committed to
+    # open buy orders; passing _redis_client makes kill switches consistent
+    # across worker processes.
     order_security.assert_risk_gate(
         user_id=user.id, asset=req.asset, side=req.side, quantity=req.quantity,
-        price=price_for_risk, held_quantity=held, account_equity=account_equity,
-        current_gross_exposure=current_gross_exposure, redis_client=_redis_client,
+        price=price_for_risk, held_quantity=sellable, account_equity=equity,
+        current_gross_exposure=account["gross_exposure"] + account["reserved_cash"],
+        redis_client=_redis_client,
     )
 
-    # FIX: 30-second duplicate window (was 15s) — Alpaca round-trips can take
-    # 5-10s and a 15s window caused legitimate retry orders to be blocked.
-    # ML-DSA-65 signs the order payload before it is accepted — persisted for audit.
-    # NOTE: renamed from 'payload' to 'order_payload' to avoid shadowing the JWT
-    # payload dict used earlier in the WebSocket handler and auth dependency.
+    # ML-DSA-65 signs the canonical order before it is accepted — persisted for audit.
     supplied_envelope = [req.order_id, req.timestamp, req.expires_at, req.nonce]
     if any(value is not None for value in supplied_envelope) and not all(value is not None for value in supplied_envelope):
         raise HTTPException(400, "order_id, timestamp, expires_at, and nonce must be supplied together")
@@ -1185,15 +1216,23 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     if cached_response is not None:
         return cached_response
     if db.get(models.Trade, order_id):
+        order_security.release_idempotency(db, user.id, idempotency_key)
         raise HTTPException(409, "order_id was already used")
 
     trade = models.Trade(
         id=order_id,
-        user_id=user.id, asset=req.asset.upper(), side=req.side, quantity=req.quantity,
+        user_id=user.id, asset=req.asset, side=req.side, quantity=req.quantity,
         order_type=req.order_type, limit_price=req.limit_price, time_in_force=req.time_in_force,
         stop_price=req.stop_price,
         status="PENDING", pqc_signature=signature,
     )
+    # The cash reservation is an atomic compare-and-set committed together
+    # with the order row: two concurrent orders can never both spend the
+    # same available cash, and a failed insert rolls the reservation back.
+    if not paper_broker.try_reserve(db, user.id, reserve):
+        db.rollback()
+        order_security.release_idempotency(db, user.id, idempotency_key)
+        raise HTTPException(400, "insufficient available cash for this order")
     db.add(trade)
     db.add(models.OrderSecurityRecord(
         trade_id=order_id, user_id=user.id, canonical_order=canonical,
@@ -1205,61 +1244,47 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
         db.commit()
     except Exception as exc:
         db.rollback()
+        order_security.release_idempotency(db, user.id, idempotency_key)
         raise HTTPException(409, "order nonce has already been used") from exc
     db.refresh(trade)
 
-    if trading_service.alpaca_enabled():
-        try:
-            resp = trading_service.submit_alpaca_order(
-                trade.asset, trade.side, trade.quantity, trade.order_type,
-                trade.limit_price, trade.stop_price, trade.time_in_force,
-            )
-            trade.alpaca_order_id = resp.get("id")
-            trade.status = resp.get("status", "ACCEPTED").upper()
-            if trade.status == "FILLED":
-                # FIX: float(x or 0) or None is wrong — if filled_avg_price is "0"
-                # the result is None (discards a valid zero fill). Use explicit None check.
-                raw_price = resp.get("filled_avg_price")
-                trade.filled_price = float(raw_price) if raw_price else None
-                trade.filled_at = dt.datetime.now(dt.timezone.utc)
-        except Exception as e:
-            trade.status = "REJECTED"
-            db.commit()
-            log.exception("Alpaca order submission failed for trade %s", trade.id)
-            raise HTTPException(502, "Alpaca order failed") from e
+    fill = trading_service.simulate_fill(
+        trade.asset, trade.side, float(trade.quantity), trade.order_type,
+        float(trade.limit_price) if trade.limit_price is not None else None,
+        float(trade.stop_price) if trade.stop_price is not None else None,
+        last_price=last_price,
+    )
+    reason = None
+    if fill["status"] == "FILLED":
+        reason = paper_broker.fill_order(db, trade, fill["filled_price"], reserved=reserve).reason
+    elif trade.time_in_force == "ioc":
+        paper_broker.close_order(db, trade, "EXPIRED", reserve)
     else:
-        # Cast SQLAlchemy Numeric columns to float before passing to simulate_fill.
-        # Passing Decimal objects causes TypeError in comparison operators inside
-        # simulate_fill (e.g. last_price <= limit_price where limit_price is Decimal).
-        fill = trading_service.simulate_fill(
-            trade.asset, trade.side, float(trade.quantity),
-            trade.order_type,
-            float(trade.limit_price) if trade.limit_price is not None else None,
-            float(trade.stop_price) if trade.stop_price is not None else None,
-        )
-        trade.status = fill["status"]
-        if trade.status == "ACCEPTED" and trade.time_in_force == "ioc":
-            trade.status = "EXPIRED"
-        if fill["status"] == "FILLED":
-            trade.filled_price = fill["filled_price"]
-            trade.filled_at = dt.datetime.now(dt.timezone.utc)
-
-    db.commit()
+        if trade.order_type == "stop_limit" and paper_broker.stop_triggered(
+                trade.side, float(trade.stop_price), last_price):
+            # Triggered on arrival but not marketable: it rests as a limit order.
+            trade.order_type = "limit"
+            db.commit()
+        paper_broker.accept_order(db, trade)
     db.refresh(trade)
 
-    if trade.status == "FILLED":
-        portfolio_service.recompute_positions(db, user.id)
-
-    security_service.write_audit_log(db, user.id, f"ORDER_{trade.status}", "trade", trade.id, {
-        "asset": trade.asset, "side": trade.side, "quantity": float(trade.quantity),
-    })
-    event = {"FILLED": "order.filled", "REJECTED": "order.rejected"}.get(trade.status)
-    if event:
-        integration_service.emit_webhooks(db, user.id, event, _serialize_trade(trade))
-
+    _record_order_outcome(db, trade, reason)
     response = _serialize_trade(trade)
     order_security.complete_idempotency(db, user.id, idempotency_key, response)
     return response
+
+
+def _record_order_outcome(db: Session, trade: models.Trade, reason: str | None = None) -> None:
+    """Audit-log an order state change and notify subscribed webhooks."""
+    metadata = {"asset": trade.asset, "side": trade.side, "quantity": float(trade.quantity)}
+    if trade.filled_price is not None:
+        metadata["filled_price"] = float(trade.filled_price)
+    if reason:
+        metadata["reason"] = reason
+    security_service.write_audit_log(db, trade.user_id, f"ORDER_{trade.status}", "trade", trade.id, metadata)
+    event = {"FILLED": "order.filled", "REJECTED": "order.rejected"}.get(trade.status)
+    if event:
+        integration_service.emit_webhooks(db, trade.user_id, event, _serialize_trade(trade))
 
 
 def _serialize_trade(t: models.Trade) -> dict:
@@ -1276,7 +1301,6 @@ def _serialize_trade(t: models.Trade) -> dict:
         "limit_price": float(t.limit_price) if t.limit_price is not None else None,
         "stop_price": float(t.stop_price) if t.stop_price is not None else None,
         "status": t.status,
-        "alpaca_order_id": t.alpaca_order_id,
         "filled_price": float(t.filled_price) if t.filled_price is not None else None,
         "pqc_signature_preview": (
             (t.pqc_signature or "")[:32] + "..." if t.pqc_signature else None
@@ -1288,43 +1312,7 @@ def _serialize_trade(t: models.Trade) -> dict:
 
 @app.get("/api/trading/orders")
 def list_orders(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Opportunistically fill locally simulated conditional orders. Alpaca
-    # orders are reconciled by the broker and must never be locally filled.
-    pending = db.execute(
-        select(models.Trade).where(
-            models.Trade.user_id == user.id, models.Trade.status == "ACCEPTED",
-            models.Trade.alpaca_order_id.is_(None),
-        )
-    ).scalars().all()
-    changed = False
-    for t in pending:
-        fill_price = None
-        if t.order_type == "limit" and t.limit_price is not None:
-            # Use the lightweight price-check helper — no full simulate_fill overhead
-            fill_price = trading_service.check_pending_limit_fill(
-                t.asset, t.side, float(t.limit_price)
-            )
-        elif t.order_type in ("stop", "stop_limit") and t.stop_price is not None:
-            # Stop/stop_limit: check if market price has crossed the stop trigger
-            fill = trading_service.simulate_fill(
-                t.asset, t.side, float(t.quantity), t.order_type,
-                float(t.limit_price) if t.limit_price else None,
-                float(t.stop_price),
-            )
-            fill_price = fill["filled_price"] if fill["status"] == "FILLED" else None
-        # market orders in ACCEPTED state are filled immediately on placement;
-        # they should not appear in pending — but guard against stale rows
-        elif t.order_type == "market":
-            fill_price = trading_service.get_last_price(t.asset)
-        if fill_price is not None:
-            t.status = "FILLED"
-            t.filled_price = fill_price
-            t.filled_at = dt.datetime.now(dt.timezone.utc)
-            changed = True
-    if changed:
-        db.commit()
-        portfolio_service.recompute_positions(db, user.id)
-
+    # Read-only: resting orders are filled by the background order sweeper.
     trades = db.execute(
         select(models.Trade).where(models.Trade.user_id == user.id).order_by(models.Trade.submitted_at.desc())
     ).scalars().all()
@@ -1336,10 +1324,14 @@ def cancel_order(order_id: str, user: models.User = Depends(get_current_user), d
     trade = db.get(models.Trade, order_id)
     if not trade or trade.user_id != user.id:
         raise HTTPException(404, "Order not found")
-    if trade.status in ("FILLED", "CANCELLED", "REJECTED"):
+    if trade.status == "PENDING":
+        raise HTTPException(409, "order is still being placed; retry the cancel")
+    if trade.status != "ACCEPTED":
         raise HTTPException(400, f"Cannot cancel order in status {trade.status}")
-    trade.status = "CANCELLED"
-    db.commit()
+    # Compare-and-set: loses cleanly to a fill that landed first.
+    if not paper_broker.close_order(db, trade, "CANCELLED"):
+        db.refresh(trade)
+        raise HTTPException(409, f"order is no longer open (status {trade.status})")
     security_service.write_audit_log(db, user.id, "ORDER_CANCELLED", "trade", trade.id, {})
     integration_service.emit_webhooks(db, user.id, "order.cancelled", _serialize_trade(trade))
     return _serialize_trade(trade)
@@ -1350,7 +1342,9 @@ def cancel_order(order_id: str, user: models.User = Depends(get_current_user), d
 # --------------------------------------------------------------------------
 @app.get("/api/sdk/portfolio")
 def sdk_portfolio(key: models.ApiKey = Depends(require_api_scope("read")), db: Session = Depends(get_db)):
-    return {"positions": portfolio_service.get_positions_with_pnl(db, key.user_id),
+    positions = portfolio_service.get_positions_with_pnl(db, key.user_id)
+    return {"positions": positions,
+            "account": paper_broker.account_snapshot(db, key.user_id, positions),
             "risk_metrics": portfolio_service.risk_metrics(db, key.user_id)}
 
 
@@ -1431,6 +1425,12 @@ def delete_webhook(hook_id: str, user: models.User = Depends(get_current_user), 
 @app.get("/api/portfolio/positions")
 def positions(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     return portfolio_service.get_positions_with_pnl(db, user.id)
+
+
+@app.get("/api/portfolio/account")
+def portfolio_account(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Server-side paper account: cash, reserved cash, buying power, equity, exposure."""
+    return paper_broker.account_snapshot(db, user.id, portfolio_service.get_positions_with_pnl(db, user.id))
 
 
 @app.get("/api/portfolio/risk-metrics")
@@ -2569,7 +2569,7 @@ def security_health(user: models.User = Depends(get_current_user), db: Session =
         "quantum_safety_score": quantum_safety_score,
         "fips_203_compliant": True,
         "fips_204_compliant": True,
-        "alpaca_live": trading_service.alpaca_enabled(),
+        "execution_venue": "internal_paper_broker",
         "server_dsa_key_age_days": key_age_days,
     }
 
@@ -2765,7 +2765,7 @@ def meta():
         "tracked_assets": signal_engine.TRACKED_ASSETS,
         "asset_exchange_map": signal_engine.ASSET_EXCHANGE_MAP,
         "exchanges": exchanges_with_status,
-        "alpaca_live": trading_service.alpaca_enabled(),
+        "execution_venue": "internal_paper_broker",
     }
 
 

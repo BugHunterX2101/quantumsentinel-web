@@ -71,7 +71,6 @@ def test_order_endpoint_returns_original_response_for_idempotent_retry(db, monke
     db.commit()
 
     monkeypatch.setattr(main.trading_service, "get_last_price", lambda _: 100.0)
-    monkeypatch.setattr(main.trading_service, "alpaca_enabled", lambda: False)
     request = schemas.OrderRequest(asset="AAPL", side="buy", quantity=10, order_type="market")
     first = main.place_order(request, user, db, "retry_key_12345")
 
@@ -98,7 +97,6 @@ def test_sdk_order_forwards_idempotency_key(db, monkeypatch):
     db.add(key)
     db.commit()
     monkeypatch.setattr(main.trading_service, "get_last_price", lambda _: 100.0)
-    monkeypatch.setattr(main.trading_service, "alpaca_enabled", lambda: False)
     request = schemas.OrderRequest(asset="MSFT", side="buy", quantity=10, order_type="market")
     first = main.sdk_order(request, key, db, "sdk_retry_12345")
 

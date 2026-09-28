@@ -77,7 +77,7 @@ flowchart TB
     subgraph CoreSvcs["Core Services"]
         AUTH["auth_service\nHttpOnly cookie auth · Argon2id\nPQC Handshake V2 · Refresh rotation\nCSRF · Atomic nonce replay"]
         SIG["signal_engine\nSBA · RSI-14 · MACD 12/26/9\nLive price · 20s/15s cache"]
-        TRADE["trading_service\nOrder lifecycle · Alpaca Paper API\nMarket simulator · Fill logic"]
+        TRADE["paper_broker + trading_service\nServer-side cash ledger · Atomic reservations\nOrder sweeper · Fill rules"]
         PORT["portfolio_service\nPositions · Equity curve\nSharpe · VaR · Drawdown"]
         SEC["security_service\nServer ML-DSA identity\nAudit chain · Key history\n90-day rotation · Kill switches"]
         INTG["integration_service\nScoped API keys\nHMAC-SHA256 request signing\nFernet-encrypted secrets"]
@@ -105,7 +105,6 @@ flowchart TB
 
     subgraph External["External APIs"]
         YF["Yahoo Finance\n3-month OHLCV · fast_info"]
-        ALPACA["Alpaca Paper API\npaper-api.alpaca.markets"]
     end
 
     Client <-->|"HTTPS / WSS · HttpOnly cookies"| Gateway
@@ -122,7 +121,7 @@ flowchart TB
     CoreSvcs --> REDIS
 
     SIG --> YF
-    TRADE --> ALPACA
+    TRADE --> YF
 
     Research --> CPP
     REPORT --> WF & FACTOR & REGIME & STAT & OPT & ALPHA
@@ -404,7 +403,7 @@ data is explicitly labelled as not survivorship-free or point-in-time validated.
 - **Signal Engine** — SBA + RSI-14 + MACD 12/26/9 + 20-day momentum + Bollinger Band Width + AI-generated insight text
 - **Live Prices** — 5s micro-cached `fast_info` prices for any world ticker via Yahoo Finance
 - **Asset Intelligence** — Instrument type · exchange · market open/closed status · fractional & 24/7 flags
-- **Paper Trading** — Alpaca paper API integration + built-in Yahoo Finance price simulator
+- **Paper Trading** — internal paper broker only (no external broker client): server-side cash ledger with atomic cash reservation for open orders, fills against live Yahoo Finance prices, orders rejected when no current price exists, resting orders filled by a background sweeper
 - **Order Types** — Market / Limit / Stop / Stop-Limit · Day / GTC / IOC · 30s duplicate guard · oversell prevention · dynamic 5% cap
 - **Global Markets** — 9 exchanges: NYSE/NASDAQ, NSE/BSE, LSE, Xetra, TSE, HKEX, ASX, TSX, Crypto — with live market-hours detection
 - **Portfolio Risk** — Mark-to-market positions · unrealised/realised P&L · equity curve · Sharpe · VaR 95/99 · CSV export
@@ -434,7 +433,8 @@ quantumsentinel-web/
 │       │   ── Core Services ─────────────────────────────────────────────
 │       ├── auth_service.py              ← JWT · Argon2id · PQC handshake · nonce TTL store
 │       ├── signal_engine.py             ← SBA · RSI · MACD · live price · asset info · caching
-│       ├── trading_service.py           ← Order lifecycle · Alpaca Paper API · local simulator
+│       ├── paper_broker.py              ← Paper cash ledger · atomic reservations · fills · order sweeper
+│       ├── trading_service.py           ← Strict market prices · paper fill rules
 │       ├── portfolio_service.py         ← Positions · mark-to-market · equity curve · Sharpe · VaR
 │       ├── order_security.py            ← canonical orders · nonce/idempotency · risk gate
 │       ├── research_metadata.py         ← experiment manifests · data lineage
@@ -550,8 +550,7 @@ copy .env.example .env
 cp .env.example .env
 ```
 
-- Set `ALPACA_API_KEY` + `ALPACA_SECRET_KEY` for Alpaca paper execution
-- Without them, orders settle against the latest Yahoo Finance price in the built-in simulator
+- Orders settle in the internal paper broker against the latest Yahoo Finance price; each account starts with `PAPER_INITIAL_CASH` (server-side, default $100,000)
 
 ### 3 — Run
 
@@ -752,8 +751,9 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `CORS_ORIGINS` | Prod | Comma-separated allowed origins (no wildcards) |
 | `ALLOWED_HOSTS` | Prod | Comma-separated allowed hostnames |
 | `REDIS_URL` | Prod | For distributed rate limiting and session storage |
-| `ALPACA_API_KEY` | No | Alpaca paper trading key |
-| `ALPACA_SECRET_KEY` | No | Alpaca paper trading secret |
+| `PAPER_INITIAL_CASH` | No | Starting cash of every paper account (default 100000) |
+| `PAPER_MAX_POSITION_FRACTION` | No | Per-asset concentration cap as a fraction of equity (default 0.05) |
+| `ORDER_SWEEP_INTERVAL_SECONDS` | No | How often resting orders are checked for fills (default 5) |
 
 ---
 

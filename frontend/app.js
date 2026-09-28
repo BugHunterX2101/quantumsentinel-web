@@ -1542,7 +1542,7 @@ const onboardingSteps = [
   ['Welcome to QuantumSentinel', 'This five-step tour shows how to read signals, test a strategy, place a paper order, review risk, and check cryptographic health.'],
   ['1 · Read signals', 'The dashboard combines market indicators with a quantum-inspired optimizer. Confidence describes model conviction, not certainty.'],
   ['2 · Test before trading', 'Use Strategies to tune a moving-average template and validate it against historical data.'],
-  ['3 · Paper trade only', 'Orders are simulated or routed only to an Alpaca paper account. No real-money brokerage is included.'],
+  ['3 · Paper trade only', 'Orders fill against live market prices in an internal paper account. No real-money brokerage is included.'],
   ['4 · Monitor safety', 'Portfolio shows risk metrics and Security shows key freshness plus verifiable audit records.'],
 ];
 let onboardingIndex = 0;
@@ -2005,7 +2005,8 @@ function filterOrderList() {
 
 function renderOrderList(orders) {
   const list = document.getElementById('order-list');
-  const cancellable = new Set(['PENDING', 'ACCEPTED', 'SUBMITTED']);
+  // Only resting orders can be cancelled; PENDING is a sub-second placement state.
+  const cancellable = new Set(['ACCEPTED']);
   list.innerHTML = orders.map((o, i) => {
     const side   = escapeHtml(String(o.side || '')).toUpperCase();
     const asset  = escapeHtml(String(o.asset));
@@ -2047,11 +2048,13 @@ async function loadPortfolio(isPoll) {
   if (!isPoll && !metricsEl.children.length) skeletonGrid(metricsEl, 5, 'skeleton-card');
 
   // Use allSettled so one failing endpoint doesn't crash the entire portfolio view.
-  const [posResult, metResult] = await Promise.allSettled([
+  const [posResult, metResult, acctResult] = await Promise.allSettled([
     api('/api/portfolio/positions', {}, { silent: isPoll }),
     api('/api/portfolio/risk-metrics', {}, { silent: isPoll }),
+    api('/api/portfolio/account', {}, { silent: isPoll }),
   ]);
   const positions = posResult.status === 'fulfilled' ? posResult.value : [];
+  const account   = acctResult.status === 'fulfilled' ? acctResult.value : null;
   const metrics   = metResult.status === 'fulfilled' ? metResult.value :
     { sharpe_ratio: 0, max_drawdown: 0, win_rate: 0, total_trades: 0, var_95: 0, var_99: 0, equity_curve: [] };
   if (posResult.status === 'rejected' && !isPoll) toast('Portfolio unavailable', 'Could not load positions — try again.', 'error', 4000);
@@ -2063,7 +2066,16 @@ async function loadPortfolio(isPoll) {
     <div class="metric-box"><div class="val" id="m-trades" data-raw-value="0">0</div><div class="lbl">Filled Trades</div></div>
     <div class="metric-box"><div class="val" id="m-var" data-raw-value="0">0%</div><div class="lbl">VaR 95%</div></div>
     <div class="metric-box"><div class="val" id="m-var99" data-raw-value="0">0%</div><div class="lbl">VaR 99%</div></div>
+    <div class="metric-box"><div class="val" id="m-cash">&mdash;</div><div class="lbl">Cash</div></div>
+    <div class="metric-box"><div class="val" id="m-buying-power">&mdash;</div><div class="lbl">Buying Power</div></div>
   `;
+  const usd = (v, opts = {}) => Number(v).toLocaleString('en-US', { style: 'currency', currency: 'USD', ...opts });
+  if (account) {
+    document.getElementById('m-cash').textContent = usd(account.cash);
+    const bp = document.getElementById('m-buying-power');
+    bp.textContent = usd(account.available_cash);
+    bp.title = `${usd(account.reserved_cash)} reserved by open buy orders`;
+  }
   animateCounter(document.getElementById('m-sharpe'), metrics.sharpe_ratio, { decimals: 2 });
   animateCounter(document.getElementById('m-dd'), metrics.max_drawdown * 100, { decimals: 1, suffix: '%' });
   animateCounter(document.getElementById('m-win'), metrics.win_rate * 100, { decimals: 0, suffix: '%' });
@@ -2071,19 +2083,20 @@ async function loadPortfolio(isPoll) {
   animateCounter(document.getElementById('m-var'), metrics.var_95 * 100, { decimals: 2, suffix: '%' });
   animateCounter(document.getElementById('m-var99'), metrics.var_99 * 100, { decimals: 2, suffix: '%' });
 
-  // Total portfolio value
-  // Include realized_pnl so sold gains are not erased from the display total.
-  // F3 FIX: sum unrealized from open positions + realized from ALL positions.
-  // Realized PnL from fully-sold (qty=0) positions is NOT in the positions array
-  // (server excludes zero-qty rows). We still show it if it was previously loaded
-  // from risk_metrics (via equity_curve / trades). For open positions, realized
-  // comes from partial sells tracked per-asset.
-  const totalUnrealized = positions.reduce((s, p) => s + Number(p.unrealized_pnl || 0), 0);
-  const totalRealized   = positions.reduce((s, p) => s + Number(p.realized_pnl  || 0), 0);
-  const totalPnl = totalUnrealized + totalRealized;
+  // Total P&L comes from the server-side ledger (equity − starting cash), so
+  // realized gains on fully closed positions are included. Summing the
+  // positions array cannot do that: closed positions have no row.
+  const totalPnl = account
+    ? Number(account.total_pnl)
+    : positions.reduce((s, p) => s + Number(p.unrealized_pnl || 0) + Number(p.realized_pnl || 0), 0);
   const totalEl = document.getElementById('portfolio-total');
   if (totalEl) {
-    totalEl.textContent = totalPnl.toLocaleString('en-US', { style: 'currency', currency: 'USD', signDisplay: 'always' });
+    if (account) {
+      totalEl.textContent = `${usd(account.equity)} (${usd(totalPnl, { signDisplay: 'always' })})`;
+      totalEl.title = account.prices_stale ? 'Some positions are marked at a stale price' : '';
+    } else {
+      totalEl.textContent = '—';
+    }
     totalEl.style.color = totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
   }
   // Update topbar PnL chip

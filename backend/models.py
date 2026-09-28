@@ -253,6 +253,26 @@ class ResearchExperiment(Base):
     approved_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class ResearchTrial(Base):
+    """One distinct strategy configuration a user has evaluated.
+
+    A "family" is one research question (the same strategy on the same
+    assets); every distinct parameter set tried for it is a trial. The
+    Deflated Sharpe test must discount a result by at least this many
+    trials, however few the user declares.
+    """
+    __tablename__ = "research_trials"
+    __table_args__ = (UniqueConstraint("user_id", "family_hash", "config_hash",
+                                       name="uq_research_trial_config"),)
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    family_hash = Column(String(64), nullable=False, index=True)
+    config_hash = Column(String(64), nullable=False)
+    source = Column(String(32), nullable=False)  # backtest | walk_forward | event_backtest
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
 class AuditChainLink(Base):
     """Hash-chain link for tamper-evident audit history."""
     __tablename__ = "audit_chain_links"

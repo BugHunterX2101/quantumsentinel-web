@@ -394,7 +394,7 @@ def run_full_report_pipeline(
     do not abort the whole report.
     """
     import yfinance as yf
-    from .alpha_research import compute_signal_matrix
+    from . import historical_data
     from .factor_model import compute_factors, fama_macbeth
     from .regime_detection import run_regime_detection
     from .walk_forward import WalkForwardConfig, WalkForwardEngine
@@ -411,16 +411,16 @@ def run_full_report_pipeline(
 
     # ── Fetch data ──
     try:
-        raw = yf.download(tickers, period=period, auto_adjust=True,
-                          progress=False, group_by="ticker")
-        if len(tickers) == 1:
-            prices = raw["Close"].values
-            price_matrix = prices.reshape(-1, 1)
-        else:
-            close_df = raw.xs("Close", axis=1, level=0)[tickers]
-            close_df = close_df.dropna(how="all").ffill().bfill()
-            price_matrix = close_df.values
-            prices = price_matrix[:, 0]
+        raw = yf.download(tickers, period=period, auto_adjust=True, progress=False)
+        # Common trading days only: filling gaps backwards would copy a
+        # ticker's first future price into dates before it had any.
+        panel = historical_data.aligned_panel(raw, tickers)
+        if not panel.tickers or len(panel) < 3:
+            raise ValueError("no common price history for the requested tickers")
+        tickers = panel.tickers
+        metadata["tickers_used"] = tickers
+        price_matrix = panel.close.to_numpy(dtype=float)
+        prices = price_matrix[:, 0]
 
         return_matrix = np.diff(price_matrix, axis=0) / np.maximum(
             price_matrix[:-1], 1e-9

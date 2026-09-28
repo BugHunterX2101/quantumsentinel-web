@@ -9,6 +9,7 @@ Item 8 enhancements:
 """
 import json
 import hashlib
+import threading
 import datetime as dt
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
@@ -203,23 +204,10 @@ class ServerIdentity:
 server_identity = ServerIdentity()
 
 
-def _get_audit_sequence(db: Session) -> int:
-    """Get the next audit chain sequence number.
-
-    On PostgreSQL: uses nextval() for atomic ordering (no race condition).
-    On SQLite: uses MAX()+1 (safe because single-writer).
-    """
-    if _is_postgres:
-        # Create sequence if it doesn't exist (idempotent)
-        try:
-            db.execute(text("CREATE SEQUENCE IF NOT EXISTS audit_chain_sequence"))
-            db.commit()
-        except Exception:
-            db.rollback()
-        result = db.execute(text("SELECT nextval('audit_chain_sequence')")).scalar()
-        return int(result)
-    else:
-        return (db.execute(select(func.max(models.AuditChainLink.sequence))).scalar() or 0) + 1
+# Orders chain appends between threads of this process. SQLite has no
+# advisory locks and is a single-process deployment, so this alone suffices
+# there; on PostgreSQL the advisory lock below extends it across processes.
+_audit_chain_lock = threading.Lock()
 
 
 def write_audit_log(db: Session, user_id: str | None, action: str,
@@ -234,46 +222,55 @@ def write_audit_log(db: Session, user_id: str | None, action: str,
     }, sort_keys=True).encode()
     signature = server_identity.sign(payload)
     signing_key_id = server_identity.key_id
-    entry = models.AuditLog(
-        user_id=user_id, action=action, resource_type=resource_type,
-        resource_id=resource_id, metadata_json=metadata,
-        pqc_signature=pqc.b64(signature),
-        signing_key_id=signing_key_id,
-    )
-    db.add(entry)
+    # Persist whatever the caller left pending first, so a failed audit write
+    # can never roll the caller's own changes back with it.
     db.commit()
+
+    # The ML-DSA signature protects an individual event; the hash chain makes
+    # deletion, modification and reordering observable when the history is
+    # verified. Each link must point at the link sequenced immediately before
+    # it, so choosing the sequence number, reading the chain head and
+    # inserting the new link form one critical section: the lock is taken
+    # before any of them, and the event and its link commit together.
+    with _audit_chain_lock:
+        try:
+            if _is_postgres:
+                # Transaction-scoped: released by the commit below.
+                db.execute(text("SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'))"))
+            previous = db.execute(
+                select(models.AuditChainLink).order_by(models.AuditChainLink.sequence.desc()).limit(1)
+            ).scalars().first()
+            sequence = (previous.sequence + 1) if previous else 1
+            previous_hash = previous.entry_hash if previous else "0" * 64
+            entry = models.AuditLog(
+                user_id=user_id, action=action, resource_type=resource_type,
+                resource_id=resource_id, metadata_json=metadata,
+                pqc_signature=pqc.b64(signature),
+                signing_key_id=signing_key_id,
+            )
+            db.add(entry)
+            db.flush()
+            # Hash created_at exactly as the database returns it, which is
+            # what verify_audit_chain will read back.
+            db.refresh(entry)
+            chain_payload = json.dumps({
+                "audit_log_id": entry.id,
+                "created_at": entry.created_at.isoformat() if entry.created_at else "",
+                "payload": json.loads(payload.decode()),
+                "previous_hash": previous_hash,
+            }, sort_keys=True, separators=(",", ":")).encode()
+            entry_hash = hashlib.sha256(chain_payload).hexdigest()
+            checkpoint = pqc.b64(server_identity.sign(entry_hash.encode()))
+            db.add(models.AuditChainLink(
+                sequence=sequence, audit_log_id=entry.id, previous_hash=previous_hash,
+                entry_hash=entry_hash, checkpoint_signature=checkpoint,
+                signing_key_id=signing_key_id,
+            ))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
     db.refresh(entry)
-    # The regular ML-DSA signature protects an individual event. The hash
-    # chain below additionally makes deletion, modification, and reordering
-    # observable when the history is verified.
-    sequence = _get_audit_sequence(db)
-    if _is_postgres:
-        # nextval() makes `sequence` unique but doesn't stop two concurrent
-        # writers from both reading the same "latest" link before either
-        # commits its own new one — that would make two links point at the
-        # same previous_hash and break the contiguity verify_audit_chain()
-        # relies on. Serialize this read+insert critical section with a
-        # transaction-scoped advisory lock, released automatically at the
-        # commit() below; unrelated writes elsewhere are unaffected.
-        db.execute(text("SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'))"))
-    previous = db.execute(
-        select(models.AuditChainLink).order_by(models.AuditChainLink.sequence.desc())
-    ).scalars().first()
-    previous_hash = previous.entry_hash if previous else "0" * 64
-    chain_payload = json.dumps({
-        "audit_log_id": entry.id,
-        "created_at": entry.created_at.isoformat() if entry.created_at else "",
-        "payload": json.loads(payload.decode()),
-        "previous_hash": previous_hash,
-    }, sort_keys=True, separators=(",", ":")).encode()
-    entry_hash = hashlib.sha256(chain_payload).hexdigest()
-    checkpoint = pqc.b64(server_identity.sign(entry_hash.encode()))
-    db.add(models.AuditChainLink(
-        sequence=sequence, audit_log_id=entry.id, previous_hash=previous_hash,
-        entry_hash=entry_hash, checkpoint_signature=checkpoint,
-        signing_key_id=signing_key_id,
-    ))
-    db.commit()
     return entry
 
 
@@ -308,29 +305,45 @@ def verify_audit_log(db: Session, log_id: str) -> bool:
     return pqc.dsa_verify(verification_pk, payload, pqc.unb64(entry.pqc_signature))
 
 
-def verify_audit_chain(db: Session) -> bool:
-    """Verify link ordering, hashes, and ML-DSA checkpoint signatures."""
+def audit_chain_status(db: Session) -> dict:
+    """Verify link ordering, hashes and ML-DSA checkpoint signatures.
+
+    Returns ``valid`` plus, when invalid, the first failing sequence number
+    and why. ``unchained_events`` counts audit events with no chain link,
+    which the chain alone cannot vouch for.
+    """
     links = db.execute(select(models.AuditChainLink).order_by(models.AuditChainLink.sequence)).scalars().all()
+    unchained = int(db.execute(
+        select(func.count()).select_from(models.AuditLog).where(
+            ~models.AuditLog.id.in_(select(models.AuditChainLink.audit_log_id)))
+    ).scalar() or 0)
+    status = {"valid": True, "links": len(links), "unchained_events": unchained,
+              "first_invalid_sequence": None, "reason": None}
+
+    def fail(link, reason: str) -> dict:
+        status.update(valid=False, first_invalid_sequence=link.sequence, reason=reason)
+        return status
+
+    keys: dict[str, bytes | None] = {}
     previous_hash = "0" * 64
     for link in links:
         entry = db.get(models.AuditLog, link.audit_log_id)
-        if not entry or link.previous_hash != previous_hash:
-            return False
+        if not entry:
+            return fail(link, "audit event missing")
+        if link.previous_hash != previous_hash:
+            return fail(link, "link does not point at the preceding link")
 
         # Determine verification key for this chain link
-        verification_pk = None
-        if link.signing_key_id:
+        if link.signing_key_id not in keys:
             key_record = db.execute(
                 select(models.ServerSigningKey).where(
                     models.ServerSigningKey.key_id == link.signing_key_id
                 )
-            ).scalars().first()
-            if key_record:
-                verification_pk = pqc.unb64(key_record.public_key)
+            ).scalars().first() if link.signing_key_id else None
+            keys[link.signing_key_id] = pqc.unb64(key_record.public_key) if key_record else None
+        verification_pk = keys[link.signing_key_id] or server_identity.dsa_pk
         if verification_pk is None:
-            if server_identity.dsa_pk is None:
-                return False
-            verification_pk = server_identity.dsa_pk
+            return fail(link, "no verification key")
 
         event_payload = {
             "action": entry.action, "user_id": entry.user_id,
@@ -342,13 +355,18 @@ def verify_audit_chain(db: Session) -> bool:
             "created_at": entry.created_at.isoformat() if entry.created_at else "",
             "payload": event_payload, "previous_hash": previous_hash,
         }, sort_keys=True, separators=(",", ":")).encode()
-        calculated = hashlib.sha256(chain_payload).hexdigest()
-        if calculated != link.entry_hash or not pqc.dsa_verify(
-            verification_pk, link.entry_hash.encode(), pqc.unb64(link.checkpoint_signature)
-        ):
-            return False
+        if hashlib.sha256(chain_payload).hexdigest() != link.entry_hash:
+            return fail(link, "event content does not match its link hash")
+        if not pqc.dsa_verify(verification_pk, link.entry_hash.encode(),
+                              pqc.unb64(link.checkpoint_signature)):
+            return fail(link, "checkpoint signature invalid")
         previous_hash = link.entry_hash
-    return True
+    return status
+
+
+def verify_audit_chain(db: Session) -> bool:
+    """True when every chain link verifies (see audit_chain_status)."""
+    return audit_chain_status(db)["valid"]
 
 
 def key_health(db: Session, user_id: str) -> dict:

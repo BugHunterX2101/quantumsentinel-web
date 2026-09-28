@@ -73,6 +73,11 @@ PAPER_MAX_POSITION_FRACTION = float(os.getenv("PAPER_MAX_POSITION_FRACTION", "0.
 # Resting conditional orders are filled by a background sweeper, never by reads.
 ORDER_SWEEPER_ENABLED = os.getenv("ORDER_SWEEPER_ENABLED", "true").lower() == "true"
 ORDER_SWEEP_INTERVAL_SECONDS = float(os.getenv("ORDER_SWEEP_INTERVAL_SECONDS", "5"))
+# An order only executes against a quote whose last trade is at most this old
+# (by the exchange's own trade timestamp, not when it was fetched). 20 minutes
+# admits exchanges whose feed is delayed ~15 minutes, and excludes a closed
+# market's last close.
+MAX_QUOTE_AGE_SECONDS = float(os.getenv("MAX_QUOTE_AGE_SECONDS", "1200"))
 
 DATABASE_URL = _setting("DATABASE_URL", "sqlite:///./quantumsentinel.db")
 REDIS_URL = _setting("REDIS_URL")

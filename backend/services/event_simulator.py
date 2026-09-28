@@ -33,6 +33,8 @@ from typing import Any
 
 import numpy as np
 
+from .strategy_signals import ma_crossover_series
+
 log = logging.getLogger(__name__)
 
 
@@ -273,6 +275,9 @@ class Portfolio:
 class BaseStrategy:
     """Base class for event-driven strategies."""
 
+    def prepare(self, price_data: dict[str, np.ndarray]) -> None:
+        """Called once with the full (date-aligned) price arrays before bar 0."""
+
     def on_market(self, event: MarketEvent,
                   portfolio: Portfolio,
                   history: dict[str, list[float]]) -> list[SignalEvent]:
@@ -281,24 +286,34 @@ class BaseStrategy:
 
 
 class MACrossoverStrategy(BaseStrategy):
-    """Moving average crossover — fast/slow SMA signal."""
+    """Moving average crossover — the shared definition in strategy_signals,
+    so this is the same strategy the backtester and walk-forward evaluate.
+
+    Each series element t depends only on closes up to t, so precomputing it
+    from the full arrays reads no future data; the signal at bar t is acted
+    on at bar t + 1 like every other signal here."""
 
     def __init__(self, fast: int = 20, slow: int = 50):
         self.fast = fast
         self.slow = slow
+        self._series: dict[str, np.ndarray] = {}
+
+    def prepare(self, price_data: dict[str, np.ndarray]) -> None:
+        self._series = {t: ma_crossover_series(np.asarray(p, dtype=float), self.fast, self.slow)
+                        for t, p in price_data.items()}
 
     def on_market(self, event: MarketEvent, portfolio: Portfolio,
                   history: dict[str, list[float]]) -> list[SignalEvent]:
-        prices = history.get(event.ticker, [])
-        if len(prices) < self.slow:
-            return []
-        fast_ma = float(np.mean(prices[-self.fast:]))
-        slow_ma = float(np.mean(prices[-self.slow:]))
-        prev_fast = float(np.mean(prices[-self.fast - 1:-1]))
-        prev_slow = float(np.mean(prices[-self.slow - 1:-1]))
-
-        crossover_up = prev_fast <= prev_slow and fast_ma > slow_ma
-        crossover_down = prev_fast >= prev_slow and fast_ma < slow_ma
+        series = self._series.get(event.ticker)
+        if series is not None and 0 <= event.timestamp < len(series):
+            signal = series[event.timestamp]
+        else:
+            # Not prepared (direct use): the latest bar of the given history,
+            # which only ever needs the last max(fast, slow) + 1 closes.
+            tail = history.get(event.ticker, [])[-(max(self.fast, self.slow) + 1):]
+            signal = ma_crossover_series(np.asarray(tail, dtype=float), self.fast, self.slow)[-1] if tail else 0.0
+        crossover_up = signal > 0
+        crossover_down = signal < 0
 
         if crossover_up:
             return [SignalEvent(timestamp=event.timestamp, ticker=event.ticker,
@@ -489,8 +504,13 @@ def run_event_backtest(
     portfolio = Portfolio(initial_capital=initial_capital, allow_short=allow_short,
                           leverage_limit=params.get("leverage_limit", 2.0 if allow_short else 1.0))
 
-    # Find common length
-    T = min(len(arr) for arr in price_data.values())
+    # Bar i must be the same date for every ticker; callers align on the
+    # calendar (historical_data.aligned_panel), never by truncating lengths.
+    lengths = {len(price_data[t]) for t in tickers}
+    if len(lengths) != 1:
+        raise ValueError("price_data must be date-aligned arrays of equal length")
+    T = lengths.pop()
+    strategy.prepare({t: price_data[t] for t in tickers})
     history: dict[str, list[float]] = {t: [] for t in tickers}
 
     # Pending orders (1-bar delay)

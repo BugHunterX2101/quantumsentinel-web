@@ -437,16 +437,20 @@ async function afterLogin(data) {
 
 
 // ===========================================================================
-// PQC hybrid handshake (real server-side ML-KEM-768 + ML-DSA-65 + X25519)
+// PQC hybrid handshake — research prototype
 // ===========================================================================
+// The browser session itself is protected by TLS and HttpOnly cookies. This
+// handshake runs real X25519 + ML-KEM-768 + ML-DSA-65 on the server, but the
+// browser holds no ML-KEM key and does not verify ML-DSA signatures, so it is
+// a demonstration of hybrid key agreement, not the session's transport.
 async function performHandshake({ showOverlay = false } = {}) {
   const overlay = document.getElementById('handshake-overlay');
   const overlayText = document.getElementById('handshake-overlay-text');
   const steps = [
     'Generating X25519 ephemeral keypair…',
-    'Encapsulating ML-KEM-768 shared secret (FIPS 203)…',
-    'Deriving session key via HKDF-SHA256…',
-    'Verifying ML-DSA-65 ServerHello signature (FIPS 204)…',
+    'Server encapsulating ML-KEM-768 (FIPS 203)…',
+    'Server deriving hybrid session key (HKDF-SHA256)…',
+    'Server signing the transcript with ML-DSA-65 (FIPS 204)…',
   ];
   let stepTimer;
   if (showOverlay) {
@@ -483,22 +487,25 @@ async function performHandshake({ showOverlay = false } = {}) {
 
   if (showOverlay) {
     clearInterval(stepTimer);
-    overlayText.textContent = '✓ Secure session established';
+    overlayText.textContent = '✓ Hybrid handshake completed (research prototype)';
     await new Promise((r) => setTimeout(r, 450));
     overlay.classList.add('hidden');
   }
 
   state.handshake = Object.assign({}, result, { usedRealWebCrypto });
 
-  // Item 4: Server DSA fingerprint pinning
+  // Server identity pin (trust on first use, persisted across sessions). A
+  // changed fingerprint is a hard failure: the handshake is marked untrusted
+  // and the pin is kept, so the mismatch cannot be silently accepted. After a
+  // verified key rotation the user clears the pin in the Security tab.
   const receivedFp = result.server_dsa_fingerprint;
-  const pinnedFp = state._pinnedServerFingerprint;
-  if (pinnedFp && receivedFp && pinnedFp !== receivedFp) {
-    toast('⚠️ Server identity changed', 'Server DSA fingerprint mismatch — key rotation occurred. Verify with your administrator.', 'info', 10000);
-  }
-  if (receivedFp) {
-    state._pinnedServerFingerprint = receivedFp;
-    try { sessionStorage.setItem('qs_server_fp', receivedFp); } catch {}
+  let pinnedFp = null;
+  try { pinnedFp = localStorage.getItem('qs_server_fp'); } catch {}
+  state.handshake.identityTrusted = !pinnedFp || pinnedFp === receivedFp;
+  if (!state.handshake.identityTrusted) {
+    toast('Server identity mismatch', 'The server signing key differs from the one pinned in this browser. The handshake is not trusted.', 'error', 15000);
+  } else if (receivedFp && !pinnedFp) {
+    try { localStorage.setItem('qs_server_fp', receivedFp); } catch {}
   }
 
   renderHandshakeTrace();
@@ -520,6 +527,8 @@ function renderHandshakeTrace() {
     ['Session ID', String(h.session_id || '')],
     ['Client ML-KEM keypair', h.simulated_client_kem_keypair ? 'server-generated demo keypair (browser has no ML-KEM)' : 'client-supplied'],
     ['Server DSA fingerprint', String(h.server_dsa_fingerprint || 'N/A')],
+    ['Server identity', h.identityTrusted === false ? 'MISMATCH — differs from pinned fingerprint' : 'matches pinned fingerprint'],
+    ['Session transport', 'TLS + HttpOnly cookies (this handshake is a server-side research prototype)'],
     ['Transcript hash', String(h.transcript_hash || 'N/A')],
   ];
   // Full DOM API — zero innerHTML
@@ -1438,20 +1447,20 @@ async function addToWatchlist(ticker) {
 }
 
 // ─── 3D Background Initialisation ─────────────────────────────────────────────
+// Three.js arrives as an ES module (vendor/three-global.js). Poll briefly for
+// it; if it never loads (blocked, no WebGL build), the decorative background is
+// skipped instead of polling forever.
+function whenThreeReady(callback, attemptsLeft = 100) {
+  if (window.THREE) callback();
+  else if (attemptsLeft > 0) setTimeout(() => whenThreeReady(callback, attemptsLeft - 1), 100);
+}
+
 // Auth canvas starts immediately (vivid mode); app canvas starts on login
 window.addEventListener('load', () => {
   const authCanvas = document.getElementById('auth-bg-canvas');
   if (authCanvas) {
     authCanvas.classList.add('vivid');
-    // Wait for Three.js to be available (loaded deferred)
-    const tryInit = () => {
-      if (window.THREE) {
-        QS3D.init('auth-bg-canvas', 'auth');
-      } else {
-        setTimeout(tryInit, 100);
-      }
-    };
-    tryInit();
+    whenThreeReady(() => QS3D.init('auth-bg-canvas', 'auth'));
   }
   // If already logged in (user in state), start app canvas immediately
   if (state.user) {
@@ -1459,11 +1468,7 @@ window.addEventListener('load', () => {
     if (appCanvas) {
       authCanvas?.style && (authCanvas.style.display = 'none');
       appCanvas.style.display = '';
-      const tryInit2 = () => {
-        if (window.THREE) QS3D.init('app-bg-canvas', 'dashboard');
-        else setTimeout(tryInit2, 100);
-      };
-      tryInit2();
+      whenThreeReady(() => QS3D.init('app-bg-canvas', 'dashboard'));
     }
   }
 });
@@ -2297,6 +2302,21 @@ async function rotateKeys(algorithm, btn) {
   } finally { setButtonLoading(btn, false); }
 }
 document.getElementById('rotate-dsa').addEventListener('click', (e) => rotateKeys('ML-DSA-65', e.currentTarget));
+document.getElementById('repin-server').addEventListener('click', async (e) => {
+  // Only after an operator has confirmed a legitimate server key rotation.
+  if (!confirm('Trust the server signing key presented now and replace the pinned fingerprint?')) return;
+  try { localStorage.removeItem('qs_server_fp'); } catch {}
+  const btn = e.currentTarget;
+  setButtonLoading(btn, true, 'Re-pinning…');
+  try {
+    await performHandshake({ showOverlay: false });
+    toast('Server identity pinned', 'The current server fingerprint is now pinned in this browser.', 'success');
+  } catch (err) {
+    toast('Handshake failed', err.message, 'error');
+  } finally {
+    setButtonLoading(btn, false);
+  }
+});
 document.getElementById('rotate-kem').addEventListener('click', (e) => rotateKeys('ML-KEM-768', e.currentTarget));
 document.getElementById('compliance-export').addEventListener('click', async () => {
   const btn = document.getElementById('compliance-export');

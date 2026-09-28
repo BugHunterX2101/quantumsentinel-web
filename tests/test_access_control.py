@@ -140,7 +140,6 @@ class TestKillSwitchAuthorization:
     def test_non_admin_cannot_arm_global_switch(self, db, monkeypatch):
         from backend import main
 
-        monkeypatch.setattr(main, "ADMIN_EMAILS", set())
         user = _make_user(db)
 
         with pytest.raises(main.HTTPException) as exc:
@@ -152,7 +151,6 @@ class TestKillSwitchAuthorization:
     def test_non_admin_cannot_target_another_user(self, db, monkeypatch):
         from backend import main
 
-        monkeypatch.setattr(main, "ADMIN_EMAILS", set())
         attacker = _make_user(db, "attacker@example.com")
         victim = _make_user(db, "victim@example.com")
 
@@ -166,7 +164,6 @@ class TestKillSwitchAuthorization:
     def test_non_admin_cannot_arm_asset_switch(self, db, monkeypatch):
         from backend import main
 
-        monkeypatch.setattr(main, "ADMIN_EMAILS", set())
         user = _make_user(db)
 
         with pytest.raises(main.HTTPException) as exc:
@@ -179,7 +176,6 @@ class TestKillSwitchAuthorization:
         """Self-service risk control stays available to everyone."""
         from backend import main
 
-        monkeypatch.setattr(main, "ADMIN_EMAILS", set())
         user = _make_user(db)
 
         result = asyncio.run(main.manage_kill_switch(
@@ -192,18 +188,28 @@ class TestKillSwitchAuthorization:
         from backend import main
 
         admin = _make_user(db, "ops@example.com")
-        monkeypatch.setattr(main, "ADMIN_EMAILS", {"ops@example.com"})
+        admin.role = "risk_admin"
+        db.commit()
 
         result = asyncio.run(main.manage_kill_switch(
             {"scope": "global", "enabled": True}, user=admin, db=db))
         assert result["enabled"] is True
         assert ("global", None) in order_security._KILL_SWITCHES
 
+    def test_operator_email_without_provisioned_role_has_no_privilege(self, db, monkeypatch):
+        """Registering the operator's address must not confer operator rights."""
+        from backend import main
+
+        squatter = _make_user(db, "ops@example.com")
+        with pytest.raises(main.HTTPException) as exc:
+            asyncio.run(main.manage_kill_switch(
+                {"scope": "global", "enabled": True}, user=squatter, db=db))
+        assert exc.value.status_code == 403
+
     def test_listing_hides_other_users_switches(self, db, monkeypatch):
         """A user-scoped entry discloses another account's id."""
         from backend import main
 
-        monkeypatch.setattr(main, "ADMIN_EMAILS", set())
         user = _make_user(db, "me@example.com")
         order_security._KILL_SWITCHES.add(("user", "someone-elses-id"))
         order_security._KILL_SWITCHES.add(("user", user.id))

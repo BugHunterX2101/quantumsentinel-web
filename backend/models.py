@@ -30,6 +30,9 @@ class User(Base):
     watchlist = Column(JSON, nullable=True)  # list[str] of ticker symbols; None → use default
     preferred_exchanges = Column(JSON, nullable=True)  # list[str] e.g. ["US","NSE","CRYPTO"]
     user_timezone = Column(String(64), nullable=True)  # IANA tz e.g. "Asia/Kolkata"
+    # Provisioned out of band (python -m backend.manage set-role), never by
+    # registration: user | risk_admin | admin.
+    role = Column(String(32), nullable=False, default="user", server_default="user")
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
     key_pairs = relationship("KeyPair", back_populates="user")

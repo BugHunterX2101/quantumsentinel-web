@@ -58,6 +58,10 @@ def run_sync(coro, timeout: float = 2.0):
         _log.warning("Redis operation failed from sync context: %s", exc)
         return None
 
+class RiskStateUnavailable(RuntimeError):
+    """Security-critical shared state could not be read; callers must fail closed."""
+
+
 # In-memory fallback stores for development (single process)
 _mem_lock = Lock()
 _mem_nonces: dict[str, float] = {}
@@ -212,8 +216,12 @@ async def is_kill_switch_active(redis_client, scope: str,
     if redis_client:
         try:
             return bool(await redis_client.exists(key))
-        except Exception:
-            pass
+        except Exception as exc:
+            # Unknown risk state must never read as "no kill switch".
+            from ..config import ENVIRONMENT
+            if ENVIRONMENT == "production":
+                raise RiskStateUnavailable("kill-switch state unavailable") from exc
+            _log.warning("Redis kill-switch read failed; using in-memory state (dev): %s", exc)
     with _mem_lock:
         return key in _mem_kill_switches
 
@@ -230,8 +238,10 @@ async def list_kill_switches(redis_client) -> list[dict]:
                     identifier = parts[4] if len(parts) > 4 else None
                     keys.append({"scope": scope, "identifier": identifier})
             return keys
-        except Exception:
-            pass
+        except Exception as exc:
+            from ..config import ENVIRONMENT
+            if ENVIRONMENT == "production":
+                raise RiskStateUnavailable("kill-switch state unavailable") from exc
     with _mem_lock:
         result = []
         for key in _mem_kill_switches:

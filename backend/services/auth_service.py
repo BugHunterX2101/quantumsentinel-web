@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..crypto import pqc
 from ..config import (JWT_SIGNING_KEY, JWT_VERIFY_KEY, JWT_ALGORITHM, JWT_EXPIRE_SECONDS,
+                      JWT_ISSUER, JWT_AUDIENCE,
                       REFRESH_TOKEN_SECRET, REFRESH_TOKEN_SECONDS,
                       REFRESH_ABSOLUTE_SESSION_SECONDS, CSRF_SECRET)
 
@@ -180,13 +181,17 @@ def check_hibp(password: str) -> int:
 # ---------------------------------------------------------------------------
 def create_access_token(user_id: str, tier: str) -> str:
     now = int(time.time())
-    payload = {"sub": user_id, "tier": tier, "iat": now, "exp": now + JWT_EXPIRE_SECONDS}
+    payload = {"iss": JWT_ISSUER, "aud": JWT_AUDIENCE, "sub": user_id, "jti": secrets.token_hex(16),
+               "tier": tier, "iat": now, "exp": now + JWT_EXPIRE_SECONDS}
     return jwt.encode(payload, JWT_SIGNING_KEY, algorithm=JWT_ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict | None:
+    """Verify signature, expiry, issuer and audience; every claim is required."""
     try:
-        return jwt.decode(token, JWT_VERIFY_KEY, algorithms=[JWT_ALGORITHM])
+        return jwt.decode(token, JWT_VERIFY_KEY, algorithms=[JWT_ALGORITHM],
+                          audience=JWT_AUDIENCE, issuer=JWT_ISSUER,
+                          options={"require": ["exp", "iat", "sub", "iss", "aud", "jti"]})
     except jwt.PyJWTError:
         return None
 
@@ -446,8 +451,12 @@ def perform_handshake(db: Session, user_id: str, client_x25519_pub_b64: str,
         from .redis_store import consume_pqc_nonce, run_sync
         accepted = run_sync(consume_pqc_nonce(redis_client, client_nonce))
         if accepted is None:
-            # Redis call failed/unavailable — fail safe by also requiring
-            # the local in-memory check rather than silently accepting.
+            # Redis unavailable: a per-process check cannot see nonces used
+            # on other workers, so production refuses instead of guessing.
+            from ..config import ENVIRONMENT
+            if ENVIRONMENT == "production":
+                from fastapi import HTTPException
+                raise HTTPException(503, "handshake replay protection unavailable")
             accepted = _consume_nonce_local(client_nonce)
     else:
         accepted = _consume_nonce_local(client_nonce)

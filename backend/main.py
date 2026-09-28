@@ -10,7 +10,7 @@ Security hardening (v2):
 - CSRF double-submit cookie pattern
 - HMAC-signed API key requests (Item 7)
 - Redis-backed kill switches (Item 6)
-- Tightened CSP (no unsafe-inline; jsdelivr whitelisted for Three.js only)
+- Tightened CSP (script-src 'self'; Three.js is self-hosted)
 - WebSocket per-user connection limits, idle timeout, sequence numbers
 - Server signing key history endpoint (Item 8)
 """
@@ -27,6 +27,7 @@ import secrets
 import asyncio
 from contextlib import asynccontextmanager
 import hashlib
+import hmac
 import numpy as np
 from collections import defaultdict, deque
 from pathlib import Path
@@ -47,7 +48,7 @@ from . import models, schemas
 from .database import get_db, init_db, SessionLocal
 from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS,
                      COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
-                     REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT, ADMIN_EMAILS,
+                     REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT, OPERATOR_ROLES,
                      PAPER_MAX_POSITION_FRACTION, ORDER_SWEEPER_ENABLED, ORDER_SWEEP_INTERVAL_SECONDS)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service, order_security
@@ -143,7 +144,8 @@ def _user_watchlist(user: models.User) -> list[str]:
     return wl
 
 def _etag(value: str) -> str:
-    return hashlib.sha1(value.encode()).hexdigest()[:16]
+    # Cache validator, not a security control.
+    return hashlib.sha1(value.encode(), usedforsecurity=False).hexdigest()[:16]
 
 
 def _probe_tickers_parallel(tickers: list[str], max_workers: int = 10) -> set[str]:
@@ -193,6 +195,7 @@ async def _lifespan(_app: FastAPI):
     redis_store.set_app_loop(asyncio.get_running_loop())
     init_db()
     # Register the server signing key in the DB for audit key history (Item 8)
+    _enforce_server_identity_pin()
     db = SessionLocal()
     try:
         security_service.server_identity.register_in_db(db)
@@ -211,6 +214,21 @@ async def _lifespan(_app: FastAPI):
         if sweeper:
             sweeper.cancel()
         redis_store.set_app_loop(None)
+
+
+def _enforce_server_identity_pin() -> None:
+    """Refuse to start if the signing key is not the pinned one.
+
+    TRUSTED_SERVER_DSA_FINGERPRINT pins the deployment's ML-DSA identity:
+    a mismatch means the configured key material is not the key operators
+    registered, so the process must not sign audit logs or handshakes.
+    """
+    pinned = (TRUSTED_SERVER_DSA_FINGERPRINT or "").strip().lower()
+    if not pinned:
+        return
+    actual = (security_service.server_identity.fingerprint or "").lower()
+    if not hmac.compare_digest(pinned, actual):
+        raise RuntimeError("server ML-DSA key does not match TRUSTED_SERVER_DSA_FINGERPRINT")
 
 
 async def _order_sweeper() -> None:
@@ -258,8 +276,18 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-CSRF-Token", "Idempotency-Key",
+                   "If-None-Match", "X-QS-API-KEY", "X-QS-Key-ID", "X-QS-Timestamp",
+                   "X-QS-Nonce", "X-QS-Signature"],
 )
+
+
+@app.exception_handler(redis_store.RiskStateUnavailable)
+async def _risk_state_unavailable(_request, _exc):
+    # Security-critical shared state (kill switches) could not be read:
+    # refuse the action rather than assume the state is permissive.
+    return JSONResponse({"detail": "risk state unavailable"}, status_code=503)
 
 HTTP_REQUESTS = Counter("quantumsentinel_http_requests_total", "HTTP requests", ["method", "path", "status"])
 HTTP_LATENCY = Histogram("quantumsentinel_http_request_duration_seconds", "HTTP request latency", ["method", "path"])
@@ -334,8 +362,8 @@ async def security_headers_and_rate_limit(request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    # CSP: no unsafe-inline/eval on scripts, no external script hosts beyond
-    # jsdelivr (Three.js), explicit form-action/object-src.
+    # CSP: scripts only from this origin (Three.js is self-hosted), no
+    # unsafe-inline/eval, explicit form-action/object-src.
     #
     # style-src DOES need 'unsafe-inline': the frontend renders its Research
     # and Lab result panels (and a fair amount of index.html itself) with
@@ -348,7 +376,7 @@ async def security_headers_and_rate_limit(request, call_next):
     ws_policy = "wss:" if ENVIRONMENT == "production" else "wss: ws:"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self' https://cdn.jsdelivr.net; "
+        "script-src 'self'; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com data:; "
         "img-src 'self' data:; "
@@ -422,12 +450,6 @@ def require_api_scope(scope: str):
     ) -> models.ApiKey:
         # Path 1: HMAC-signed request (Item 7)
         if x_qs_key_id and x_qs_timestamp and x_qs_nonce and x_qs_signature:
-            # Nonce dedup via Redis
-            if _redis_client:
-                from .services import redis_store
-                nonce_ok = await redis_store.consume_api_nonce(_redis_client, x_qs_key_id, x_qs_nonce)
-                if not nonce_ok:
-                    raise HTTPException(409, "API request nonce already used")
             body = await request.body()
             key = integration_service.verify_hmac_request(
                 db, x_qs_key_id, x_qs_timestamp, x_qs_nonce,
@@ -435,6 +457,11 @@ def require_api_scope(scope: str):
             )
             if not key:
                 raise HTTPException(403, "Invalid HMAC signature or insufficient scope")
+            # Only an authenticated request may consume its nonce: consuming
+            # first would let forged requests burn a client's valid nonces.
+            # Redis when configured, otherwise the per-process store (dev).
+            if not await redis_store.consume_api_nonce(_redis_client, x_qs_key_id, x_qs_nonce):
+                raise HTTPException(409, "API request nonce already used")
             return key
         # Path 2: Legacy bearer API key
         if not x_qs_api_key:
@@ -894,73 +921,105 @@ def get_asset_info_endpoint(ticker: str, user: models.User = Depends(get_current
 
 
 
-# WebSocket per-user connection tracking
+# WebSocket limits. The per-user count lives in Redis when configured so the
+# limit holds across gunicorn workers; the dict is the single-process fallback.
 _ws_connections: dict[str, int] = defaultdict(int)
 _WS_MAX_PER_USER = 3
-_WS_IDLE_TIMEOUT = 300  # 5 minutes
+_WS_PUSH_INTERVAL = 30
 _WS_MAX_MESSAGE_SIZE = 65536  # 64KB
-_ws_sequence_counter: dict[str, int] = defaultdict(int)
+_WS_COUNTER_TTL = 120         # refreshed while connected; bounds leaks from crashed workers
+
+
+async def _ws_acquire(user_id: str) -> tuple[bool, bool]:
+    """Reserve a connection slot. Returns (acquired, counted_in_redis)."""
+    if _redis_client:
+        key = f"qs:ws:conn:{user_id}"
+        try:
+            count = int(await _redis_client.incr(key))
+            await _redis_client.expire(key, _WS_COUNTER_TTL)
+            if count > _WS_MAX_PER_USER:
+                await _redis_client.decr(key)
+                return False, False
+            return True, True
+        except Exception:
+            if ENVIRONMENT == "production":
+                return False, False
+    if _ws_connections[user_id] >= _WS_MAX_PER_USER:
+        return False, False
+    _ws_connections[user_id] += 1
+    return True, False
+
+
+async def _ws_release(user_id: str, counted_in_redis: bool) -> None:
+    if counted_in_redis:
+        try:
+            if int(await _redis_client.decr(f"qs:ws:conn:{user_id}")) < 0:
+                await _redis_client.set(f"qs:ws:conn:{user_id}", 0, ex=_WS_COUNTER_TTL)
+        except Exception:
+            log.warning("could not release websocket slot for %s", user_id)
+    else:
+        _ws_connections[user_id] = max(0, _ws_connections[user_id] - 1)
 
 
 @app.websocket("/api/signals/stream")
 async def signal_stream(websocket: WebSocket):
-    """Authenticated signal stream with browser-safe subprotocol credentials.
+    """Authenticated signal stream.
 
-    Security hardening:
-    - Per-user connection limit (max 3)
-    - Idle timeout (5 minutes)
-    - Sequence numbers for gap detection
-    - Max message size (64KB)
-
-    The JWT is carried as the second requested WebSocket subprotocol rather
-    than in the URL, keeping it out of query-string logs and referrers.
-    Alternatively, the access token can be read from the HttpOnly cookie.
+    * Authentication is the HttpOnly ``qs_access`` cookie only; tokens are
+      never accepted in the subprotocol (they would land in proxy logs).
+    * Origin must be an allowed origin.
+    * At most 3 connections per user across all workers (Redis).
+    * The socket is closed (4401) when the access token expires or the user
+      is deactivated; the client reconnects with its refreshed cookie.
+    * Client messages larger than 64KB close the socket (1009).
+    * Every push carries a sequence number for gap detection.
     """
     origin = websocket.headers.get("origin")
-    protocols = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
-    raw_token = protocols[1] if len(protocols) == 2 and protocols[0] == "qs" else None
-    # URL-decode: frontend sends encodeURIComponent(jwt) to avoid header parse issues
-    from urllib.parse import unquote
-    token = unquote(raw_token) if raw_token else None
-    # Fallback: read from cookie if subprotocol didn't carry the token
-    if not token:
-        token = websocket.cookies.get("qs_access")
+    token = websocket.cookies.get("qs_access")
     payload = auth_service.decode_access_token(token) if token else None
     origin_ok = ("*" in CORS_ORIGINS) or (origin in CORS_ORIGINS)
     if not origin_ok or not payload:
         await websocket.close(code=4401)
         return
-    user_id = payload.get("sub")
-    # Per-user connection limit
-    if _ws_connections.get(user_id, 0) >= _WS_MAX_PER_USER:
-        await websocket.close(code=4429)  # custom code: too many connections
+    user_id = payload["sub"]
+    expires_at = float(payload["exp"])
+    acquired, in_redis = await _ws_acquire(user_id)
+    if not acquired:
+        await websocket.close(code=4429)  # too many connections
         return
+    offered = [p.strip() for p in websocket.headers.get("sec-websocket-protocol", "").split(",") if p.strip()]
     db = SessionLocal()
     try:
         user = db.get(models.User, user_id)
         if not user or not user.is_active:
             await websocket.close(code=4401)
             return
-        _ws_connections[user_id] = _ws_connections.get(user_id, 0) + 1
-        await websocket.accept(subprotocol="qs")
+        await websocket.accept(subprotocol="qs" if "qs" in offered else None)
         seq = 0
         while True:
+            if time.time() >= expires_at:
+                await websocket.close(code=4401, reason="session expired")
+                break
+            # Re-read the user every cycle: deactivation and watchlist edits
+            # take effect on the next push, not at the next reconnect.
+            db.expire_all()
+            user = db.get(models.User, user_id)
+            if not user or not user.is_active:
+                await websocket.close(code=4401, reason="account inactive")
+                break
+            if in_redis:
+                try:
+                    await _redis_client.expire(f"qs:ws:conn:{user_id}", _WS_COUNTER_TTL)
+                except Exception:
+                    pass
             try:
-                # get_cached_signals() is a blocking call — on a cache miss it
-                # does a synchronous yfinance HTTP download while holding a
-                # threading.Lock. Calling it directly here would block this
-                # coroutine's turn on the single shared event loop, stalling
-                # every other request (HTTP and WebSocket) on the server for
-                # the duration of that download. asyncio.to_thread offloads
-                # it to a worker thread so the loop stays responsive.
+                # get_cached_signals() can block on a yfinance download; keep it
+                # off the event loop so other connections stay responsive.
                 data = await asyncio.to_thread(signal_engine.get_cached_signals)
                 wanted = set(_user_watchlist(user))
                 filtered = [s for s in data.get("signals", []) if s.get("asset") in wanted]
-                # FIX: same gap as /api/signals/latest — get_cached_signals()
-                # only covers the 20 preloaded TRACKED_ASSETS, so a
-                # watchlisted ticker outside that set would never appear in
-                # `data["signals"]` and would silently drop out of every push
-                # on this stream even though it stayed watchlisted.
+                # Watchlisted tickers outside the preloaded set are computed on
+                # demand, as in /api/signals/latest.
                 have = {s.get("asset") for s in filtered}
                 for ticker in wanted - have:
                     extra = await asyncio.to_thread(signal_engine.compute_single_asset, ticker)
@@ -976,20 +1035,24 @@ async def signal_stream(websocket: WebSocket):
                 await websocket.send_json(ws_payload)
             except Exception:
                 break
-            # Idle timeout: wait for receive with timeout
             try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=min(30, _WS_IDLE_TIMEOUT))
+                message = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=max(0.0, min(_WS_PUSH_INTERVAL, expires_at - time.time())),
+                )
+                if len(message.encode("utf-8")) > _WS_MAX_MESSAGE_SIZE:
+                    await websocket.close(code=1009, reason="message too large")
+                    break
             except asyncio.TimeoutError:
-                # Normal: no client message within poll interval, send next update
-                pass
+                pass  # no client message within the push interval: send the next update
             except WebSocketDisconnect:
                 break
     except WebSocketDisconnect:
         pass
     except Exception:
-        pass
+        log.exception("signal stream error")
     finally:
-        _ws_connections[user_id] = max(0, _ws_connections.get(user_id, 1) - 1)
+        await _ws_release(user_id, in_redis)
         db.close()
 
 
@@ -2719,7 +2782,8 @@ def server_signing_keys(user: models.User = Depends(get_current_user), db: Sessi
 # Kill switch admin endpoints (Item 6)
 # --------------------------------------------------------------------------
 def _is_admin(user: models.User) -> bool:
-    return bool(user.email) and user.email.lower() in ADMIN_EMAILS
+    """Operator privilege comes from a provisioned role, never from the email."""
+    return (user.role or "user") in OPERATOR_ROLES
 
 
 @app.post("/api/risk/kill-switch")

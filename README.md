@@ -31,8 +31,8 @@
 Two things that rarely appear together — in one open-source codebase:
 
 **Post-Quantum Cryptography (research / integration-ready)**
-- Every session begins with a **hybrid X25519 + ML-KEM-768** key exchange — combining classical and post-quantum cryptography per FIPS 203
-- **Handshake V2**: full-transcript ML-DSA-65 signing, atomic nonce replay protection (Redis `SET NX`), server identity fingerprint pinning
+- A **hybrid X25519 + ML-KEM-768** handshake prototype (FIPS 203) runs at sign-in. Encapsulation, key derivation and transcript signing happen server-side; browser sessions themselves are protected by TLS + HttpOnly cookies
+- **Handshake V2**: full-transcript ML-DSA-65 signing, atomic nonce replay protection (Redis `SET NX`), server identity pinning (startup-enforced `TRUSTED_SERVER_DSA_FINGERPRINT`; hard-fail browser pin)
 - **HttpOnly cookie auth**: access + refresh tokens in `Secure; SameSite=Strict` cookies — never exposed to JavaScript. Refresh-token rotation with family-based reuse detection
 - **CSRF double-submit** pattern for all state-changing requests; **HMAC-SHA256 request signing** for SDK/API clients
 - Production orders use a canonical `QS-ORDER-V1` payload, client ML-DSA-65 signature, bounded expiry, nonce, and idempotency key
@@ -213,9 +213,8 @@ sequenceDiagram
     GW->>PQC: dsa_sign(server_dsa_sk, ServerHello_payload) → ML-DSA-65 signature
     GW->>GW: Store short-lived session state
     GW-->>BR: ServerHello {kem_ciphertext, server_x25519_pub, ml_dsa_signature, ...}
-    BR->>BR: Verify ML-DSA-65 signature against server public key
-    BR->>BR: Derive session_key locally via HKDF-SHA256
-    Note over BR: Quantum-safe encrypted session established
+    BR->>BR: Compare server fingerprint with the pinned one (mismatch = untrusted)
+    Note over BR,GW: Research prototype: the browser holds no ML-KEM key and does not\nverify ML-DSA. Session security is TLS + HttpOnly cookies.
 ```
 
 ---

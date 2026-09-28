@@ -226,11 +226,16 @@ def assert_risk_gate(*, user_id: str, asset: str, side: str, quantity: float,
                or ("asset", asset.upper()) in _KILL_SWITCHES)
     if not blocked and redis_client is not None:
         from . import redis_store
-        blocked = bool(
-            redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "global"))
-            or redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "user", user_id))
-            or redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "asset", asset.upper()))
-        )
+        states = [
+            redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "global")),
+            redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "user", user_id)),
+            redis_store.run_sync(redis_store.is_kill_switch_active(redis_client, "asset", asset.upper())),
+        ]
+        # run_sync returns None when the state could not be read. Unknown
+        # risk state is not "no kill switch": production rejects the order.
+        if any(state is None for state in states) and ENVIRONMENT == "production":
+            raise HTTPException(503, "risk state unavailable; order not accepted")
+        blocked = any(bool(state) for state in states)
     if blocked:
         raise HTTPException(423, "trading kill switch is active")
     notional = quantity * price

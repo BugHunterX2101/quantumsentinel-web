@@ -226,8 +226,12 @@ def test_tr1_fast_info_no_dict_get(monkeypatch):
             return pd.DataFrame()
     monkeypatch.setattr(trading_service.yf, "Ticker", _FakeTicker)
     trading_service._price_cache.clear()
-    price = trading_service.get_last_price("FAKE_TR1")
-    assert price == 142.5
+    # fast_info carries no trade time, so its price values positions but is
+    # never executable.
+    assert trading_service.get_mark_price("FAKE_TR1") == (142.5, True)
+    with pytest.raises(trading_service.StaleMarketData) as exc:
+        trading_service.get_last_price("FAKE_TR1")
+    assert exc.value.price == 142.5 and exc.value.market_time is None
 
 
 def test_tr2_buy_price_improvement(monkeypatch):

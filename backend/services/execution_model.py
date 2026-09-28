@@ -232,7 +232,10 @@ class ExecutionConfig:
     borrow: BorrowCostModel = field(default_factory=BorrowCostModel)
     sizer: PositionSizer = field(default_factory=PositionSizer)
 
-    execution_delay_bars: int = 0    # 0 = fill same bar, 1 = next bar, etc.
+    # Bars between the close a signal is computed from and the close it fills
+    # at. At least 1: filling at the signal's own close would trade at a price
+    # that was only known once the decision had already used it.
+    execution_delay_bars: int = 1
     allow_short_selling: bool = True
     cash_reserve_pct: float = 0.0    # keep X% as cash buffer
     leverage_limit: float = 1.0       # max gross leverage

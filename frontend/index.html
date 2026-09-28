@@ -418,7 +418,7 @@
           <p class="hint">Test whether strategy performance is statistically significant or the result of data snooping.</p>
           <form id="research-stat-form">
             <label># Strategies Tested<input id="st-trials" type="number" min="1" max="10000" value="1"></label>
-            <p class="hint" style="margin-top:4px;font-size:11px;">How many strategy variants were tried before selecting this one? Higher count raises the bar for significance via the Deflated Sharpe Ratio.</p>
+            <p class="hint" style="margin-top:4px;font-size:11px;">How many strategy variants were tried before selecting this one? Higher count raises the bar for significance via the Deflated Sharpe Ratio. The server never uses fewer than the configurations it has backtested for this strategy and asset set.</p>
             <button type="submit" class="btn-primary ripple-btn" id="st-submit"><span class="btn-label">Run Statistical Tests</span></button>
             <div class="auth-error" id="st-error"></div>
           </form>

@@ -52,7 +52,7 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
                      PAPER_MAX_POSITION_FRACTION, ORDER_SWEEPER_ENABLED, ORDER_SWEEP_INTERVAL_SECONDS)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, backtest_service, integration_service, order_security
-from .services import paper_broker
+from .services import paper_broker, research_trials
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -1201,9 +1201,19 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
 
     # One strict price observation drives both the risk checks and the fill
     # decision. Without a real price the order is refused — the paper broker
-    # never substitutes a guessed price.
+    # never substitutes a guessed price — and it never executes against a
+    # stale one (a closed market's last close).
+    quote_stale = False
     try:
         last_price = trading_service.get_last_price(req.asset)
+    except trading_service.StaleMarketData as exc:
+        if req.order_type == "market":
+            raise HTTPException(409, f"{exc}. Market orders need a live market; "
+                                     "a limit or stop order can rest until it opens.") from exc
+        # A limit or stop order rests until the market trades again, and the
+        # sweeper fills it only against a live quote. The stale price feeds
+        # nothing but position valuation here: risk uses the order's own price.
+        last_price, quote_stale = exc.price, True
     except trading_service.MarketDataUnavailable as exc:
         raise HTTPException(503, f"no current market price for {req.asset}; order not accepted") from exc
 
@@ -1316,19 +1326,22 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
         raise HTTPException(409, "order nonce has already been used") from exc
     db.refresh(trade)
 
-    fill = trading_service.simulate_fill(
-        trade.asset, trade.side, float(trade.quantity), trade.order_type,
-        float(trade.limit_price) if trade.limit_price is not None else None,
-        float(trade.stop_price) if trade.stop_price is not None else None,
-        last_price=last_price,
-    )
+    if quote_stale:
+        fill = {"status": "ACCEPTED", "filled_price": None}
+    else:
+        fill = trading_service.simulate_fill(
+            trade.asset, trade.side, float(trade.quantity), trade.order_type,
+            float(trade.limit_price) if trade.limit_price is not None else None,
+            float(trade.stop_price) if trade.stop_price is not None else None,
+            last_price=last_price,
+        )
     reason = None
     if fill["status"] == "FILLED":
         reason = paper_broker.fill_order(db, trade, fill["filled_price"], reserved=reserve).reason
     elif trade.time_in_force == "ioc":
         paper_broker.close_order(db, trade, "EXPIRED", reserve)
     else:
-        if trade.order_type == "stop_limit" and paper_broker.stop_triggered(
+        if not quote_stale and trade.order_type == "stop_limit" and paper_broker.stop_triggered(
                 trade.side, float(trade.stop_price), last_price):
             # Triggered on arrival but not marketable: it rests as a limit order.
             trade.order_type = "limit"
@@ -1549,6 +1562,11 @@ def run_backtest(req: schemas.BacktestRequest, user: models.User = Depends(get_c
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    family = research_trials.family_hash("ma_crossover", [req.asset])
+    result["trial_family"] = family
+    result["trials_in_family"] = research_trials.record(
+        db, user.id, family, [{"fast_window": req.fast_window, "slow_window": req.slow_window,
+                               "period": req.period, "execution_preset": "retail"}], "backtest")
     record = models.Backtest(user_id=user.id, initial_capital=result["initial_capital"],
                              final_capital=result["final_capital"], sharpe_ratio=result["sharpe_ratio"],
                              max_drawdown=result["max_drawdown"], win_rate=result["win_rate"],
@@ -1663,6 +1681,11 @@ def advanced_backtest(req: schemas.AdvancedBacktestRequest,
         log.exception("Advanced backtest failed")
         raise HTTPException(500, "Backtest failed") from exc
 
+    family = research_trials.family_hash(config.strategy.strategy_type, req.assets)
+    result["trial_family"] = family
+    result["trials_in_family"] = research_trials.record(
+        db, user.id, family, [req.model_dump()], "backtest")
+
     security_service.write_audit_log(
         db, user.id, "ADVANCED_BACKTEST", "research", None,
         {"assets": req.assets, "strategy": req.strategy_type, "period": req.period}
@@ -1705,6 +1728,15 @@ def walk_forward_validation(req: schemas.WalkForwardRequest,
         log.exception("Walk-forward validation failed")
         raise HTTPException(500, "Walk-forward failed") from exc
 
+    # Every parameter set the in-sample search evaluated is a trial.
+    family = research_trials.family_hash("ma_crossover", req.assets)
+    common = {"window_type": req.window_type, "train_years": req.train_years,
+              "test_years": req.test_years, "total_years": req.total_years,
+              "execution_preset": req.execution_preset}
+    result["trial_family"] = family
+    result["trials_in_family"] = research_trials.record(
+        db, user.id, family, [{**common, **g} for g in result["parameter_grid"]], "walk_forward")
+
     security_service.write_audit_log(
         db, user.id, "WALK_FORWARD", "research", None,
         {"assets": req.assets, "window_type": req.window_type,
@@ -1723,31 +1755,41 @@ def statistical_tests(req: schemas.StatTestRequest,
     from .services.stat_tests import run_full_stat_tests
 
     returns = None
+    trial_family = req.trial_family
     if req.returns:
         returns = np.array(req.returns)
     elif req.backtest_id:
         row = db.get(models.Backtest, req.backtest_id)
         if not row or row.user_id != user.id:
             raise HTTPException(404, "Backtest not found")
-        # Extract returns from equity curve in result_json
         rj = row.result_json or {}
-        curve = rj.get("equity_curve_net") or rj.get("equity_curve", [])
-        if len(curve) > 2:
-            returns = np.array([
-                (curve[i] - curve[i - 1]) / curve[i - 1] if curve[i - 1] else 0
-                for i in range(1, len(curve))
-            ])
+        trial_family = trial_family or rj.get("trial_family")
+        if rj.get("daily_returns_net"):
+            # Full-resolution daily returns; the stored equity curve is
+            # downsampled for charting and has the wrong periodicity.
+            returns = np.array(rj["daily_returns_net"], dtype=float)
+        else:
+            curve = rj.get("equity_curve_net") or rj.get("equity_curve", [])
+            if len(curve) > 2:
+                returns = np.array([
+                    (curve[i] - curve[i - 1]) / curve[i - 1] if curve[i - 1] else 0
+                    for i in range(1, len(curve))
+                ])
     if returns is None or len(returns) < 5:
         raise HTTPException(422, "Need at least 5 return observations")
 
-    result = run_full_stat_tests(
-        returns,
-        n_strategies_tested=req.n_strategies_tested,
-    )
+    # The Deflated Sharpe discount uses at least every configuration the
+    # server evaluated for this research family, whatever is declared.
+    server_counted = research_trials.count(db, user.id, trial_family) if trial_family else 0
+    n_trials = max(req.n_strategies_tested, server_counted)
+    result = run_full_stat_tests(returns, n_strategies_tested=n_trials)
+    result["trial_count"] = {"used": n_trials, "declared": req.n_strategies_tested,
+                             "server_counted": server_counted, "family": trial_family}
 
     security_service.write_audit_log(
         db, user.id, "STAT_TEST", "research", None,
-        {"n_obs": len(returns), "n_strategies": req.n_strategies_tested}
+        {"n_obs": len(returns), "n_strategies": n_trials,
+         "declared_strategies": req.n_strategies_tested, "server_counted": server_counted}
     )
     return result
 
@@ -2010,7 +2052,7 @@ def event_backtest_endpoint(req: schemas.EventBacktestRequest,
     look-ahead bias through strict chronological event processing."""
     import numpy as np
     import yfinance as yf
-    import pandas as pd
+    from .services import historical_data
     from .services.event_simulator import run_event_backtest
 
     try:
@@ -2019,22 +2061,14 @@ def event_backtest_endpoint(req: schemas.EventBacktestRequest,
         if raw is None or raw.empty:
             raise HTTPException(422, "Failed to download market data")
 
-        price_data: dict[str, np.ndarray] = {}
-        for ticker in req.assets:
-            try:
-                s = raw["Close"][ticker] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]
-                s = s.dropna()
-                if len(s) >= 60:
-                    price_data[ticker] = s.to_numpy(dtype=float)
-            except (KeyError, TypeError):
-                continue
-
-        if not price_data:
+        # Bar i is the same date for every ticker (not merely the i-th bar
+        # each happened to have).
+        panel = historical_data.aligned_panel(raw, req.assets, min_rows=60)
+        if not panel.tickers or len(panel) < 60:
             raise HTTPException(422, "No tickers had sufficient data")
-
-        # Align lengths
-        min_len = min(len(v) for v in price_data.values())
-        price_data = {t: v[-min_len:] for t, v in price_data.items()}
+        price_data: dict[str, np.ndarray] = {
+            t: panel.close[t].to_numpy(dtype=float) for t in panel.tickers
+        }
 
     except HTTPException:
         raise
@@ -2060,6 +2094,11 @@ def event_backtest_endpoint(req: schemas.EventBacktestRequest,
     except Exception as exc:
         log.exception("Event backtest failed")
         raise HTTPException(500, "Event backtest failed") from exc
+
+    family = research_trials.family_hash(f"event:{req.strategy}", req.assets)
+    result["trial_family"] = family
+    result["trials_in_family"] = research_trials.record(
+        db, user.id, family, [req.model_dump()], "event_backtest")
 
     security_service.write_audit_log(
         db, user.id, "EVENT_BACKTEST", "research", None,
@@ -2180,26 +2219,23 @@ def pairs_trading_endpoint(req: schemas.PairsTradingRequest,
         raise HTTPException(422, "asset_y and asset_x must be different")
 
     try:
-        import pandas as pd
+        from .services import historical_data
         raw = yf.download([req.asset_y, req.asset_x], period=req.period,
                           interval="1d", progress=False, auto_adjust=True)
         if raw is None or raw.empty:
             raise HTTPException(422, "Failed to download pair data")
 
-        def get_series(ticker: str) -> np.ndarray:
-            s = raw["Close"][ticker] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]
-            s = s.dropna()
-            if len(s) < 60:
-                raise ValueError(f"Only {len(s)} trading days for {ticker}")
-            return s.to_numpy(dtype=float)
-
-        prices_y = get_series(req.asset_y)
-        prices_x = get_series(req.asset_x)
-
-        # Align
-        min_len = min(len(prices_y), len(prices_x))
-        prices_y = prices_y[-min_len:]
-        prices_x = prices_x[-min_len:]
+        # Cointegration compares the two legs date by date, so they must be
+        # aligned on the shared calendar.
+        panel = historical_data.aligned_panel(raw, [req.asset_y, req.asset_x])
+        for ticker in (req.asset_y, req.asset_x):
+            if ticker not in panel.tickers:
+                raise ValueError(f"No price data for {ticker}")
+        if len(panel) < 60:
+            raise ValueError(f"Only {len(panel)} common trading days for {req.asset_y}/{req.asset_x}")
+        prices_y = panel.close[req.asset_y].to_numpy(dtype=float)
+        prices_x = panel.close[req.asset_x].to_numpy(dtype=float)
+        min_len = len(panel)
 
     except HTTPException:
         raise
@@ -2796,6 +2832,16 @@ def compliance_report(user: models.User = Depends(get_current_user), db: Session
         "audit_log": {"entries_reviewed": len(logs), "signatures_verified": verified,
                       "all_verified": verified == len(logs)},
     }
+
+
+@app.get("/api/security/audit-chain")
+def audit_chain(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Verify the whole tamper-evident audit chain (operators only: it spans
+    every user's events)."""
+    if not _is_admin(user):
+        raise HTTPException(403, "Operator role required")
+    status = security_service.audit_chain_status(db)
+    return {**status, "verified_at": dt.datetime.now(dt.timezone.utc).isoformat()}
 
 
 @app.post("/api/security/rotate-keys")

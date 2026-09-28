@@ -498,6 +498,9 @@ class StatTestRequest(BaseModel):
     # Or provide raw returns
     returns: list[float] | None = None
     n_strategies_tested: int = Field(default=1, ge=1, le=10_000)
+    # Research family returned by the backtest that produced these returns;
+    # the server then counts at least every trial it ran for that family.
+    trial_family: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     n_bootstrap: int = Field(default=10_000, ge=100, le=100_000)
     n_permutations: int = Field(default=10_000, ge=100, le=100_000)
 

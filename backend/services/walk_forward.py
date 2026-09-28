@@ -11,7 +11,9 @@ Workflow:
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -19,12 +21,14 @@ from enum import Enum
 import numpy as np
 import yfinance as yf
 
+from . import historical_data
 from .backtest_service import (
     BacktestConfig, BacktestEngine, StrategyConfig, StrategyType,
     _sharpe, _sortino, _max_drawdown, _var_cvar, _calmar,
-    _omega_ratio, _downside_deviation,
+    _omega_ratio, _downside_deviation, _compute_win_rate,
 )
-from .execution_model import ExecutionConfig, retail_config
+from .execution_model import ExecutionConfig, PositionSizer, SizingMethod, retail_config
+from .strategy_signals import warmup_bars
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +54,8 @@ class WalkForwardConfig:
     fast_window_range: list[int] = field(default_factory=lambda: [10, 15, 20, 25, 30])
     slow_window_range: list[int] = field(default_factory=lambda: [40, 50, 60, 75, 100])
     optimize_parameters: bool = True
+    # None = equal-weight sleeves that together invest the whole account.
+    sizer: PositionSizer | None = None
 
 
 @dataclass
@@ -81,12 +87,17 @@ class FoldResult:
     # Equity curve
     oos_equity: list[float] = field(default_factory=list)
     oos_returns: list[float] = field(default_factory=list)
+    # Calendar dates of the windows ("first..last"), when known
+    train_dates: str = ""
+    test_dates: str = ""
 
     def to_dict(self) -> dict:
         return {
             "fold": self.fold_index,
             "train_period": f"bar_{self.train_start}_to_{self.train_end}",
             "test_period": f"bar_{self.test_start}_to_{self.test_end}",
+            "train_dates": self.train_dates,
+            "test_dates": self.test_dates,
             "train_sharpe": round(self.train_sharpe, 3),
             "train_return": round(self.train_return, 4),
             "train_max_dd": round(self.train_max_dd, 4),
@@ -120,26 +131,67 @@ def _windowed_vol(close: np.ndarray, i: int, window: int = 22) -> float:
     return float(np.std(rets))
 
 
+_WF_CAPITAL = 100_000.0
+
+
+def _fully_invested_sizer() -> PositionSizer:
+    """Equal-weight sleeves that together invest the whole account, the
+    walk-forward's long-standing convention (it used to put 95% of capital
+    into the single asset it evaluated)."""
+    return PositionSizer(method=SizingMethod.EQUAL_WEIGHT, max_position_pct=1.0, max_leverage=1.0)
+
+
+def _asset_data_from_closes(close_data: dict) -> dict:
+    """Engine input from bare close arrays (no high/low/volume available)."""
+    out = {}
+    for ticker, close in close_data.items():
+        close = np.asarray(close, dtype=float).reshape(-1)
+        out[ticker] = {"close": close, "high": close, "low": close,
+                       "volume": np.full(len(close), historical_data.DEFAULT_VOLUME)}
+    return out
+
+
+def _empty_metrics() -> dict:
+    return {"sharpe": 0.0, "sortino": 0.0, "total_return": 0.0, "max_dd": 0.0, "calmar": 0.0,
+            "var_95": 0.0, "cvar_95": 0.0, "win_rate": 0.0, "n_trades": 0,
+            "equity": [_WF_CAPITAL], "returns": []}
+
+
 class WalkForwardEngine:
-    """Walk-forward validation engine."""
+    """Walk-forward validation engine.
+
+    Every fold (each in-sample parameter trial and the out-of-sample test) is
+    run by BacktestEngine on the date-aligned panel, so walk-forward
+    validates exactly the strategy, costs, fill timing and multi-asset
+    portfolio the backtester simulates. The strategy is the moving-average
+    crossover, whose windows are the parameters searched.
+    """
 
     def __init__(self, config: WalkForwardConfig):
         self.config = config
+        # Long-only, as walk-forward has always been: a sell signal closes the
+        # position rather than reversing into a short.
+        self._execution = dataclasses.replace(
+            config.execution, sizer=config.sizer or _fully_invested_sizer(), allow_short_selling=False)
+
+    def _parameter_grid(self) -> list[tuple[int, int]]:
+        cfg = self.config
+        if not cfg.optimize_parameters:
+            return [(cfg.strategy.fast_window, cfg.strategy.slow_window)]
+        return [(fw, sw) for fw in cfg.fast_window_range for sw in cfg.slow_window_range if sw > fw]
 
     def run(self) -> dict:
         """Execute walk-forward validation."""
         t0 = time.perf_counter()
         cfg = self.config
 
-        # ── Fetch all data upfront ──
+        # ── Fetch all data upfront, aligned on one calendar ──
         period_map = {3: "3y", 4: "4y", 5: "5y", 6: "6y", 7: "7y",
                       8: "8y", 10: "10y"}
         yf_period = period_map.get(cfg.total_years, f"{cfg.total_years}y")
-
-        all_tickers = list(set(cfg.assets + [cfg.benchmark]))
         try:
             data = yf.download(
-                all_tickers, period=yf_period, interval="1d",
+                list(dict.fromkeys(cfg.assets)), period=yf_period, interval="1d",
                 progress=False, auto_adjust=True,
             )
         except Exception as exc:
@@ -148,27 +200,14 @@ class WalkForwardEngine:
         if data is None or data.empty:
             raise ValueError("Empty data returned")
 
-        # Extract close prices
-        import pandas as pd
-        close_data = {}
-        for ticker in all_tickers:
-            try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    series = data["Close"][ticker].dropna()
-                else:
-                    series = data["Close"].dropna()
-                arr = series.to_numpy(dtype=float)
-                if len(arr) > 100:
-                    close_data[ticker] = arr
-            except (KeyError, TypeError):
-                continue
-
-        valid_assets = [t for t in cfg.assets if t in close_data]
+        panel = historical_data.aligned_panel(data, cfg.assets, min_rows=101)
+        valid_assets = panel.tickers
         if not valid_assets:
             raise ValueError("No valid assets found")
+        asset_data = panel.asset_data()
+        dates = panel.date_strings()
+        n_bars = len(panel)
 
-        # Use shortest series length
-        min_len = min(len(close_data[t]) for t in valid_assets)
         bars_per_year = 252
         train_bars = cfg.train_years * bars_per_year
         test_bars = cfg.test_years * bars_per_year
@@ -180,26 +219,26 @@ class WalkForwardEngine:
 
         if cfg.window_type == WindowType.ROLLING:
             start = 0
-            while start + train_bars + test_bars <= min_len:
+            while start + train_bars + test_bars <= n_bars:
                 folds.append({
                     "fold": fold_idx,
                     "train_start": start,
                     "train_end": start + train_bars,
                     "test_start": start + train_bars,
-                    "test_end": min(start + train_bars + test_bars, min_len),
+                    "test_end": min(start + train_bars + test_bars, n_bars),
                 })
                 fold_idx += 1
                 start += step_bars
         else:  # EXPANDING
             start = 0
             test_start = train_bars
-            while test_start + test_bars <= min_len:
+            while test_start + test_bars <= n_bars:
                 folds.append({
                     "fold": fold_idx,
                     "train_start": start,  # always 0 for expanding
                     "train_end": test_start,
                     "test_start": test_start,
-                    "test_end": min(test_start + test_bars, min_len),
+                    "test_end": min(test_start + test_bars, n_bars),
                 })
                 fold_idx += 1
                 test_start += step_bars
@@ -207,7 +246,7 @@ class WalkForwardEngine:
         if not folds:
             raise ValueError(
                 f"Not enough data for walk-forward: need {train_bars + test_bars} "
-                f"bars, have {min_len}"
+                f"bars, have {n_bars}"
             )
 
         # ── Run each fold ──
@@ -215,16 +254,14 @@ class WalkForwardEngine:
         all_oos_returns = []
 
         for fold in folds:
-            result = self._run_fold(
-                close_data, valid_assets, fold, cfg
-            )
+            result = self._run_fold(asset_data, valid_assets, fold, cfg, dates)
             fold_results.append(result)
             all_oos_returns.extend(result.oos_returns)
 
         # ── Aggregate OOS results ──
         all_oos = np.array(all_oos_returns) if all_oos_returns else np.array([0.0])
         # Build aggregated equity from OOS returns.
-        agg_equity = [100_000.0]
+        agg_equity = [_WF_CAPITAL]
         for r in all_oos:
             agg_equity.append(agg_equity[-1] * (1 + r))
 
@@ -257,6 +294,7 @@ class WalkForwardEngine:
         # Subsample equity curve
         max_points = 200
         step = max(1, len(agg_equity) // max_points)
+        grid = self._parameter_grid()
 
         return {
             "window_type": cfg.window_type,
@@ -264,6 +302,13 @@ class WalkForwardEngine:
             "train_years": cfg.train_years,
             "test_years": cfg.test_years,
             "assets": valid_assets,
+            "data_start": dates[0],
+            "data_end": dates[-1],
+            "execution_delay_bars": self._execution.execution_delay_bars,
+            # Distinct parameter sets evaluated: the trial count a Deflated
+            # Sharpe test of the selected configuration must account for.
+            "n_trials": len(grid),
+            "parameter_grid": [{"fast_window": fw, "slow_window": sw} for fw, sw in grid],
             # Per-fold results
             "folds": [f.to_dict() for f in fold_results],
             # Aggregated OOS metrics
@@ -275,8 +320,9 @@ class WalkForwardEngine:
                 "calmar": round(agg_calmar, 3),
                 "var_95": round(agg_var95, 4),
                 "cvar_95": round(agg_cvar95, 4),
-                "n_oos_days": len(all_oos),
+                "n_oos_days": len(all_oos_returns),
                 "equity_curve": [round(float(v), 2) for v in agg_equity[::step]],
+                "daily_returns": [round(float(r), 6) for r in all_oos_returns],
             },
             # Overfitting analysis
             "overfitting_analysis": {
@@ -293,42 +339,35 @@ class WalkForwardEngine:
             "execution_time_ms": round(elapsed_ms, 2),
         }
 
-    def _run_fold(self, close_data: dict, assets: list[str],
-                  fold: dict, cfg: WalkForwardConfig) -> FoldResult:
+    def _run_fold(self, asset_data: dict, assets: list[str],
+                  fold: dict, cfg: WalkForwardConfig,
+                  dates: list[str] | None = None) -> FoldResult:
         """Run a single walk-forward fold."""
         train_start = fold["train_start"]
         train_end = fold["train_end"]
         test_start = fold["test_start"]
         test_end = fold["test_end"]
 
-        # ── Parameter optimization on train set ──
+        # ── Parameter optimization on train set (same engine, same costs) ──
         best_fast = cfg.strategy.fast_window
         best_slow = cfg.strategy.slow_window
-        best_train_sharpe = -999.0
-
         if cfg.optimize_parameters:
-            for fw in cfg.fast_window_range:
-                for sw in cfg.slow_window_range:
-                    if sw <= fw:
-                        continue
-                    # Quick in-sample evaluation
-                    train_sharpe = self._quick_eval(
-                        close_data, assets, train_start, train_end, fw, sw
-                    )
-                    if train_sharpe > best_train_sharpe:
-                        best_train_sharpe = train_sharpe
-                        best_fast = fw
-                        best_slow = sw
+            best_train_sharpe = -math.inf
+            for fw, sw in self._parameter_grid():
+                train_sharpe = self._evaluate(asset_data, assets, train_start, train_end, fw, sw)["sharpe"]
+                if train_sharpe > best_train_sharpe:
+                    best_train_sharpe = train_sharpe
+                    best_fast = fw
+                    best_slow = sw
 
         # ── Evaluate on test set with best parameters ──
-        oos_metrics = self._evaluate_period(
-            close_data, assets, test_start, test_end, best_fast, best_slow, cfg
-        )
+        oos_metrics = self._evaluate(asset_data, assets, test_start, test_end, best_fast, best_slow)
 
         # In-sample metrics
-        train_metrics = self._evaluate_period(
-            close_data, assets, train_start, train_end, best_fast, best_slow, cfg
-        )
+        train_metrics = self._evaluate(asset_data, assets, train_start, train_end, best_fast, best_slow)
+
+        def span(a: int, b: int) -> str:
+            return f"{dates[a]}..{dates[b - 1]}" if dates and b > a else ""
 
         return FoldResult(
             fold_index=fold["fold"],
@@ -352,126 +391,62 @@ class WalkForwardEngine:
             best_slow_window=best_slow,
             oos_equity=oos_metrics.get("equity", []),
             oos_returns=oos_metrics.get("returns", []),
+            train_dates=span(train_start, train_end),
+            test_dates=span(test_start, test_end),
         )
 
-    def _quick_eval(self, close_data: dict, assets: list[str],
-                    start: int, end: int, fast_w: int,
-                    slow_w: int) -> float:
-        """Quick Sharpe evaluation for parameter search (no execution costs)."""
-        all_returns = []
-        for asset in assets:
-            if asset not in close_data:
-                continue
-            close = close_data[asset]
-            if end > len(close):
-                continue
-            # Simple MA crossover signal → return accumulation
-            for i in range(start + slow_w + 1, min(end, len(close))):
-                fast_ma = np.mean(close[i - fast_w:i])
-                slow_ma = np.mean(close[i - slow_w:i])
-                # Simplified: track if we're in position (level signal, not
-                # a crossover-edge signal — the previous-bar MAs aren't
-                # needed here, so they're not recomputed on every iteration
-                # of what's a hot loop during hyperparameter search).
-                in_position = fast_ma > slow_ma
-                if in_position and close[i - 1] > 0:
-                    ret = close[i] / close[i - 1] - 1
-                    all_returns.append(ret)
-                else:
-                    all_returns.append(0.0)
+    def _evaluate(self, asset_data: dict, assets: list[str], start: int, end: int,
+                  fast_w: int, slow_w: int) -> dict:
+        """Portfolio backtest over bars [start, end) with the given MA windows.
 
-        returns = np.array(all_returns)
-        return _sharpe(returns) if len(returns) > 5 else -999.0
+        Signals may read closes before ``start`` (history known at the time);
+        nothing at or after ``end`` is read. Each window starts flat with
+        fresh capital.
+        """
+        assets = [a for a in assets if a in asset_data]
+        if not assets:
+            return _empty_metrics()
+        strategy = dataclasses.replace(self.config.strategy, strategy_type=StrategyType.MA_CROSSOVER,
+                                       fast_window=fast_w, slow_window=slow_w)
+        engine = BacktestEngine(BacktestConfig(assets=assets, strategy=strategy,
+                                               execution=self._execution, initial_capital=_WF_CAPITAL))
+        end = min(end, min(len(asset_data[a]["close"]) for a in assets))
+        first = max(start, warmup_bars(strategy) - 1 + engine._delay())
+        if end - first < 2:
+            return _empty_metrics()
 
-    def _evaluate_period(self, close_data: dict, assets: list[str],
-                         start: int, end: int, fast_w: int,
-                         slow_w: int,
-                         cfg: WalkForwardConfig) -> dict:
-        """Full evaluation of a period with execution costs."""
-        capital = 100_000.0
-        position = 0.0
-        equity = [capital]
-        returns_list = []
-        trades = 0
-        wins = 0
-        closed = 0
-        entry_price = 0.0
-
-        # Use first asset for simplicity in walk-forward
-        asset = assets[0]
-        if asset not in close_data:
-            return {"sharpe": 0, "total_return": 0, "max_dd": 0,
-                    "returns": [], "equity": [capital]}
-
-        close = close_data[asset]
-        if end > len(close):
-            end = len(close)
-
-        from .execution_model import ExecutionSimulator
-        executor = ExecutionSimulator(cfg.execution)
-
-        for i in range(start + slow_w + 1, end):
-            if i >= len(close) or i < 1:
-                continue
-
-            price = float(close[i])
-            prev_price = float(close[i - 1])
-
-            # Signal
-            fast_ma = np.mean(close[max(0, i - fast_w):i])
-            slow_ma = np.mean(close[max(0, i - slow_w):i])
-            prev_fast = np.mean(close[max(0, i - fast_w - 1):max(1, i - 1)])
-            prev_slow = np.mean(close[max(0, i - slow_w - 1):max(1, i - 1)])
-
-            # Crossover detection
-            if position == 0 and prev_fast <= prev_slow and fast_ma > slow_ma:
-                # Buy
-                vol = _windowed_vol(close, i)
-                desired = capital * 0.95 / price
-                fill = executor.execute_order(
-                    "buy", desired, price, vol, 1e6, asset, capital, 0
-                )
-                if fill.filled:
-                    position = fill.fill_qty
-                    entry_price = fill.fill_price
-                    capital -= fill.fill_qty * fill.fill_price + fill.commission
-                    trades += 1
-
-            elif position > 0 and prev_fast >= prev_slow and fast_ma < slow_ma:
-                # Sell
-                vol = _windowed_vol(close, i)
-                fill = executor.execute_order(
-                    "sell", position, price, vol, 1e6, asset, capital, position
-                )
-                if fill.filled:
-                    capital += fill.fill_qty * fill.fill_price - fill.commission
-                    closed += 1
-                    if fill.fill_price > entry_price:
-                        wins += 1
-                    position -= fill.fill_qty
-                    trades += 1
-
-            # Mark-to-market
-            port_val = capital + position * price
-            equity.append(port_val)
-            if len(equity) > 1 and equity[-2] > 0:
-                returns_list.append((equity[-1] - equity[-2]) / equity[-2])
-
-        rets = np.array(returns_list)
+        res = engine._run_strategy(asset_data, first, end)
+        equity = [_WF_CAPITAL] + [float(v) for v in res["equity_curve_net"]]
+        returns = [equity[i] / equity[i - 1] - 1 if equity[i - 1] > 0 else 0.0
+                   for i in range(1, len(equity))]
+        rets = np.array(returns)
+        wins, closed = _compute_win_rate(res["trade_log"])
         max_dd = _max_drawdown(equity)
         var95, cvar95 = _var_cvar(rets, 0.05)
-        total_ret = float(equity[-1] / equity[0] - 1) if equity[0] > 0 else 0
-
         return {
             "sharpe": _sharpe(rets),
             "sortino": _sortino(rets),
-            "total_return": total_ret,
+            "total_return": float(equity[-1] / equity[0] - 1),
             "max_dd": max_dd,
             "calmar": _calmar(rets, max_dd),
             "var_95": var95,
             "cvar_95": cvar95,
             "win_rate": wins / max(1, closed),
-            "n_trades": trades,
+            "n_trades": len(res["trade_log"]),
             "equity": equity,
-            "returns": returns_list,
+            "returns": returns,
         }
+
+    def _evaluate_period(self, close_data: dict, assets: list[str],
+                         start: int, end: int, fast_w: int,
+                         slow_w: int,
+                         cfg: WalkForwardConfig | None = None) -> dict:
+        """``_evaluate`` for bare close arrays."""
+        return self._evaluate(_asset_data_from_closes(close_data), assets, start, end, fast_w, slow_w)
+
+    def _quick_eval(self, close_data: dict, assets: list[str],
+                    start: int, end: int, fast_w: int,
+                    slow_w: int) -> float:
+        """In-sample objective of the parameter search: net Sharpe of the
+        same backtest the out-of-sample evaluation runs."""
+        return self._evaluate_period(close_data, assets, start, end, fast_w, slow_w)["sharpe"]

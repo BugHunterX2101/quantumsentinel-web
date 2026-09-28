@@ -12,6 +12,8 @@ from __future__ import annotations
 import math
 import logging
 from dataclasses import dataclass, field
+from statistics import NormalDist
+from statistics import NormalDist
 
 import numpy as np
 
@@ -168,7 +170,10 @@ def permutation_test(returns: np.ndarray, n_permutations: int = 10_000,
     """
     n = len(returns)
     if n < 10:
-        return {"observed_sharpe": 0, "p_value": 1.0, "n_permutations": 0}
+        # Too few observations to randomize: not significant, same shape as
+        # a full result (run_full_stat_tests and the UI read every key).
+        return {"observed_sharpe": 0, "p_value": 1.0, "n_permutations": 0,
+                "significant_5pct": False, "significant_1pct": False, "count_exceeding": 0}
 
     rng = np.random.default_rng(seed)
     std = np.std(returns, ddof=1)
@@ -310,64 +315,72 @@ def benjamini_hochberg(p_values: list[float],
     }
 
 
+_EULER_GAMMA = 0.5772156649015329
+
+
+def expected_max_sharpe(n_trials: int, trial_sharpe_std: float) -> float:
+    """E[max] of ``n_trials`` independent zero-mean Sharpe estimates with the
+    given standard deviation (Bailey & López de Prado 2014, eq. 5); 0 for a
+    single trial, whose expected value is simply the null mean."""
+    if n_trials <= 1:
+        return 0.0
+    inv = NormalDist().inv_cdf
+    return trial_sharpe_std * ((1 - _EULER_GAMMA) * inv(1 - 1 / n_trials)
+                               + _EULER_GAMMA * inv(1 - 1 / (n_trials * math.e)))
+
+
 def deflated_sharpe_ratio(observed_sharpe: float,
                           n_trials: int,
                           n_observations: int,
                           skewness: float = 0.0,
                           kurtosis: float = 3.0,
-                          sharpe_std: float = 1.0) -> dict:
+                          sharpe_std: float | None = None,
+                          periods_per_year: int = 252) -> dict:
     """Deflated Sharpe Ratio (Bailey & López de Prado, 2014).
 
-    Adjusts the Sharpe ratio for the number of strategy variants tried.
-    This is the single most important test for quantitative strategy
-    evaluation — it directly addresses data-snooping bias.
+    The probability that the true Sharpe exceeds the best Sharpe that
+    ``n_trials`` skill-less strategy variants would be expected to show.
 
-    DSR accounts for:
-      1. Number of trials (strategies tested)
-      2. Sample length
-      3. Non-normality of returns (skew, kurtosis)
+    ``observed_sharpe`` (and ``sharpe_std``, the cross-trial standard
+    deviation of Sharpe estimates, if known) are annualised. The test itself
+    runs in per-observation units, the frequency of the returns: the
+    estimator's variance
+        Var(SR) = (1 - γ₃·SR + (γ₄ - 1)/4 · SR²) / (T - 1)
+    (γ₄ is kurtosis, not excess kurtosis) describes a per-period SR, so an
+    annualised SR must not be divided by it. Without a supplied
+    ``sharpe_std`` the trials' dispersion is that of the estimator under
+    the null, sqrt(1 / (T - 1)).
+
+    With a single trial the benchmark is 0 and this is the probabilistic
+    Sharpe ratio test of SR > 0.
     """
     if n_trials < 1 or n_observations < 5:
         return {"dsr": 0, "p_value": 1.0, "significant": False}
 
-    # Expected maximum Sharpe under null (from order statistics)
-    # E[max(SR)] ≈ σ * √(2 * ln(N)) for N trials
-    expected_max_sharpe = sharpe_std * math.sqrt(2 * math.log(max(n_trials, 2)))
+    scale = math.sqrt(periods_per_year)
+    sr = observed_sharpe / scale
+    null_std = math.sqrt(1.0 / (n_observations - 1))
+    trial_std = sharpe_std / scale if sharpe_std is not None else null_std
+    sr_benchmark = expected_max_sharpe(n_trials, trial_std)
 
-    # Variance of the Sharpe ratio estimator (Mertens 2002; used by Bailey &
-    # López de Prado 2014 for the DSR/PSR denominator, building on Lo 2002):
-    #   Var(SR) ≈ (1 - γ₁*SR + ((γ₂ - 1) / 4) * SR^2) / (n - 1)
-    # where γ₁ = skewness and γ₂ = kurtosis (NOT excess kurtosis — this
-    # `kurtosis` parameter's own default of 3.0, the kurtosis of a normal
-    # distribution, is what forces the correct sanity check: at γ₁=0, γ₂=3
-    # this must reduce to the classical Var(SR) ≈ (1 + 0.5*SR^2)/n for i.i.d.
-    # normal returns. A previous version of this formula subtracted 3 from
-    # kurtosis here (i.e. used excess kurtosis in the (γ₂-1) slot), which
-    # silently dropped that entire +0.5*SR^2 baseline term even for
-    # perfectly normal returns — understating sr_std and therefore
-    # overstating DSR significance (smaller p-values than the math supports)
-    # on every single call, not just non-normal ones.
-    sr_variance = (
-        (1 - observed_sharpe * skewness
-         + 0.25 * observed_sharpe ** 2 * (kurtosis - 1)) / max(1, n_observations - 1)
-    )
+    sr_variance = (1 - skewness * sr + 0.25 * (kurtosis - 1) * sr ** 2) / (n_observations - 1)
     sr_std = math.sqrt(max(sr_variance, 1e-12))
 
-    # DSR = Prob(SR* > E[max(SR)])
-    # where SR* is the observed Sharpe
-    dsr_z = (observed_sharpe - expected_max_sharpe) / sr_std
+    dsr_z = (sr - sr_benchmark) / sr_std
     dsr_p = 1.0 - _normal_cdf(dsr_z)
+    expected_max_annual = sr_benchmark * scale
 
     return {
         "observed_sharpe": round(observed_sharpe, 4),
-        "expected_max_sharpe": round(expected_max_sharpe, 4),
+        "expected_max_sharpe": round(expected_max_annual, 4),
         "n_trials": n_trials,
         "n_observations": n_observations,
+        "sharpe_standard_error": round(sr_std * scale, 4),
         "dsr_z_score": round(dsr_z, 4),
         "dsr_p_value": round(dsr_p, 6),
         "significant_5pct": dsr_p < 0.05,
         "haircut_pct": round(
-            max(0, (1 - observed_sharpe / max(expected_max_sharpe, 1e-9))) * 100, 1
+            max(0.0, 1 - observed_sharpe / expected_max_annual) * 100 if expected_max_annual > 0 else 0.0, 1
         ),
         "interpretation": (
             f"After accounting for {n_trials} strategy trials, the observed "

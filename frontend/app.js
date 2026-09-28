@@ -2525,6 +2525,9 @@ async function loadCommunity() {
 // ══════════════════════════════════════════════════════════════════
 
 let _lastBacktestReturns = null;
+// Research family of the last backtest: the server counts every
+// configuration it evaluated for it when deflating the Sharpe ratio.
+let _lastBacktestTrialFamily = null;
 
 // ── Helper: metric card ──
 function metricCard(label, value, unit='', cls='') {
@@ -2586,6 +2589,7 @@ document.getElementById('research-backtest-form').addEventListener('submit', asy
     // points for chart-payload size, so differencing it would silently feed
     // the statistical-tests panel returns with the wrong periodicity.
     _lastBacktestReturns = (d.daily_returns_net && d.daily_returns_net.length) ? d.daily_returns_net : null;
+    _lastBacktestTrialFamily = d.trial_family || null;
     renderBacktestResult(d, resultEl);
   } catch (err) {
     errEl.textContent = err.message;
@@ -2776,6 +2780,7 @@ document.getElementById('research-stat-form').addEventListener('submit', async (
     returns: _lastBacktestReturns,
     n_strategies_tested: +document.getElementById('st-trials').value,
   };
+  if (_lastBacktestTrialFamily) body.trial_family = _lastBacktestTrialFamily;
 
   try {
     const d = await api('/api/research/stat-test', { method: 'POST', body: JSON.stringify(body) });
@@ -2842,7 +2847,13 @@ function renderStatResult(d, el) {
       ${metricCard('# Trials', dsr.n_trials)}
       ${metricCard('Haircut %', dsr.haircut_pct + '%')}
     </div>
-    <p style="font-size:12px;color:var(--text-2);margin:4px 0 12px;">${dsr.interpretation || ''}</p>`;
+    <p style="font-size:12px;color:var(--text-2);margin:4px 0 4px;">${dsr.interpretation || ''}</p>`;
+  const tc = d.trial_count || {};
+  if (tc.server_counted > tc.declared) {
+    html += `<p style="font-size:12px;color:var(--text-2);margin:0 0 12px;">Trials used: ${tc.used} — the server has evaluated ${tc.server_counted} distinct configurations of this strategy on these assets (you declared ${tc.declared}).</p>`;
+  } else {
+    html += '<div style="margin-bottom:12px;"></div>';
+  }
 
   // Autocorrelation
   html += `<h4 style="margin:12px 0 6px;">Ljung-Box Autocorrelation</h4>

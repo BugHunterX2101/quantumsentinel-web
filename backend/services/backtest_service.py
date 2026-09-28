@@ -23,39 +23,14 @@ from .execution_model import (
     ExecutionConfig, ExecutionSimulator, PositionSizer, SizingMethod,
     zero_cost_config, retail_config, institutional_config, FillResult,
 )
-from . import signal_engine
+from . import historical_data
+# Strategy definitions live in strategy_signals so every engine shares them;
+# re-exported here for existing importers.
+from .strategy_signals import (  # noqa: F401
+    MIN_DECISION_DELAY_BARS, StrategyConfig, StrategyType, latest_signal, signal_series, warmup_bars,
+)
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Strategy definitions
-# ---------------------------------------------------------------------------
-
-class StrategyType:
-    MA_CROSSOVER = "ma_crossover"
-    SBA_SIGNAL = "sba_signal"
-    MOMENTUM = "momentum"
-    MEAN_REVERSION = "mean_reversion"
-
-
-@dataclass
-class StrategyConfig:
-    """Configuration for a backtesting strategy."""
-    strategy_type: str = StrategyType.MA_CROSSOVER
-    fast_window: int = 20
-    slow_window: int = 50
-    # SBA-specific
-    sba_buy_threshold: float = 0.15
-    sba_sell_threshold: float = -0.15
-    # Momentum
-    momentum_lookback: int = 20
-    momentum_entry: float = 0.05   # enter if momentum > 5%
-    momentum_exit: float = -0.02   # exit if momentum < -2%
-    # Mean reversion
-    mr_lookback: int = 20
-    mr_entry_zscore: float = -2.0  # buy when z < -2
-    mr_exit_zscore: float = 0.0    # sell when z > 0
 
 
 @dataclass
@@ -121,52 +96,58 @@ class BacktestEngine:
     def run(self) -> dict:
         """Execute the backtest and return results."""
         t0 = time.perf_counter()
+        cfg = self.config
 
-        # ── 1. Fetch historical data ──
-        all_tickers = list(set(self.config.assets + [self.config.benchmark]))
-        data = self._fetch_data(all_tickers, self.config.period)
+        # ── 1. Fetch historical data and align it on one calendar ──
+        # Row i of every asset is the same trading day; see historical_data.
+        all_tickers = list(dict.fromkeys(cfg.assets + [cfg.benchmark]))
+        data = self._fetch_data(all_tickers, cfg.period)
         if data is None:
             raise ValueError("Failed to fetch historical data")
-
-        # Extract close, volume, high, low for each asset
-        asset_data = {}
-        for ticker in all_tickers:
-            close = self._extract_series(data, ticker, "Close")
-            volume = self._extract_series(data, ticker, "Volume")
-            high = self._extract_series(data, ticker, "High")
-            low = self._extract_series(data, ticker, "Low")
-            if close is not None and len(close) > self.config.strategy.slow_window + 10:
-                asset_data[ticker] = {
-                    "close": close, "volume": volume,
-                    "high": high, "low": low,
-                }
-
-        if not any(t in asset_data for t in self.config.assets):
+        panel = historical_data.aligned_panel(data, cfg.assets,
+                                              min_rows=cfg.strategy.slow_window + 11)
+        if not panel.tickers:
             raise ValueError("No assets had sufficient price history")
-
-        # ── 2. Determine common date range ──
-        # Use the shortest series to align
-        min_len = min(len(asset_data[t]["close"])
-                      for t in self.config.assets if t in asset_data)
-        start_bar = self.config.strategy.slow_window + 5  # warm-up
-
-        if min_len <= start_bar + 2:
+        n_bars = len(panel)
+        start_bar = self._start_bar()
+        if n_bars <= start_bar + 2:
             raise ValueError("Not enough data after warm-up period")
+        dates = panel.date_strings()
 
-        # ── 3. Run strategy ──
-        results = self._run_strategy(asset_data, start_bar, min_len)
+        # ── 2. Run strategy ──
+        results = self._run_strategy(panel.asset_data(), start_bar, n_bars, dates=dates)
 
-        # ── 4. Compute benchmark ──
+        # ── 3. Benchmark on the same calendar ──
         benchmark_result = None
-        if self.config.benchmark in asset_data:
-            benchmark_result = self._compute_benchmark(
-                asset_data[self.config.benchmark]["close"],
-                start_bar, min_len
-            )
+        bench_close = historical_data.series_on_calendar(data, cfg.benchmark, panel.dates)
+        if bench_close is not None:
+            benchmark_result = self._compute_benchmark(bench_close, start_bar, n_bars)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        return self._compile_results(results, benchmark_result, elapsed_ms)
+        output = self._compile_results(results, benchmark_result, elapsed_ms)
+        output.update({
+            "assets_traded": panel.tickers,
+            "data_start": dates[0],
+            "data_end": dates[-1],
+            "first_trading_date": dates[start_bar],
+            "n_bars": n_bars,
+            "execution_delay_bars": self._delay(),
+        })
+        return output
+
+    def _delay(self) -> int:
+        delay = int(self.config.execution.execution_delay_bars)
+        if delay < MIN_DECISION_DELAY_BARS:
+            raise ValueError("execution_delay_bars must be at least 1: a signal cannot "
+                             "fill at the close it was computed from")
+        return delay
+
+    def _start_bar(self) -> int:
+        """First bar that may trade: past the warm-up, and late enough that the
+        decision bar (start - delay) already has the strategy's full lookback."""
+        strategy = self.config.strategy
+        return max(strategy.slow_window + 5, warmup_bars(strategy) - 1 + self._delay())
 
     def _fetch_data(self, tickers: list[str], period: str):
         """Download historical data for all tickers."""
@@ -180,24 +161,17 @@ class BacktestEngine:
             log.warning("Data download failed: %s", exc)
             return None
 
-    def _extract_series(self, data, ticker: str, field: str) -> np.ndarray | None:
-        """Extract a price series from yfinance download result."""
-        import pandas as pd
-        try:
-            if isinstance(data.columns, pd.MultiIndex):
-                series = data[field][ticker].dropna()
-            else:
-                series = data[field].dropna()
-            arr = series.to_numpy(dtype=float)
-            return arr if len(arr) > 0 else None
-        except (KeyError, TypeError):
-            return None
-
     def _run_strategy(self, asset_data: dict, start_bar: int,
-                      n_bars: int) -> dict:
-        """Execute the strategy bar-by-bar."""
+                      n_bars: int, dates: list[str] | None = None) -> dict:
+        """Execute the strategy bar-by-bar.
+
+        The order filled at ``close[bar]`` acts on the signal computed at the
+        close of ``bar - delay``, and everything used to size it (volatility,
+        volume, equity) was known at that close too.
+        """
         cfg = self.config
         strategy = cfg.strategy
+        delay = self._delay()
 
         # Portfolio state
         capital = cfg.initial_capital
@@ -215,50 +189,46 @@ class BacktestEngine:
 
         valid_assets = [t for t in cfg.assets if t in asset_data]
         n_assets = len(valid_assets)
+        signals = {t: signal_series(asset_data[t]["close"][:n_bars], strategy,
+                                    start=max(0, start_bar - delay))
+                   for t in valid_assets}
 
-        for bar in range(start_bar, n_bars):
-            bar_date = f"bar_{bar}"
+        for bar in range(max(start_bar, delay), n_bars):
+            bar_date = dates[bar] if dates is not None else f"bar_{bar}"
+            decision_bar = bar - delay
+            # Sizing base: equity marked at the decision bar's closes (cash
+            # alone would under-size every asset after the first one bought).
+            sizing_equity = capital + sum(
+                shares * float(asset_data[t]["close"][decision_bar])
+                for t, shares in positions.items()
+                if t in asset_data and decision_bar < len(asset_data[t]["close"])
+            )
 
-            # ── Generate signals ──
-            signals = {}
-            for ticker in valid_assets:
-                ad = asset_data[ticker]
-                if bar >= len(ad["close"]):
+            # Exits settle before entries (an entry may be funded by a same-bar
+            # exit), and each group runs in ticker order: when cash cannot
+            # cover every entry, which one is capped must not depend on the
+            # order the assets were listed in.
+            exits, entries = [], []
+            for ticker in sorted(valid_assets):
+                if bar >= len(asset_data[ticker]["close"]):
                     continue
-                close_history = ad["close"][:bar + 1]
-                sig = self._compute_signal(close_history, strategy)
-                signals[ticker] = sig
-
-            # ── Execute delayed orders (if delay > 0, execute previous bar's signals) ──
-            # For simplicity, execute signals on the same bar
-            for ticker, signal in signals.items():
-                ad = asset_data[ticker]
-                if bar >= len(ad["close"]):
-                    continue
-                price = float(ad["close"][bar])
-                volume = float(ad["volume"][bar]) if ad["volume"] is not None and bar < len(ad["volume"]) else 1e6
-                # FIX: the numerator diffs a 22-element window (bar-21..bar
-                # inclusive) into 21 returns, but the denominator sliced from
-                # bar-20 instead of bar-21, producing only 20 prices — a
-                # guaranteed "operands could not be broadcast together with
-                # shapes (21,) (20,)" crash on every real backtest, since any
-                # period longer than ~21 bars (i.e. essentially all of them:
-                # 1y/2y/3y/5y all run for hundreds of bars) reaches this line.
-                # Both slices must share the same start index so element i of
-                # the diff (close[s+i+1]-close[s+i]) divides by element i of
-                # the base-price window (close[s+i]) — the correct daily
-                # simple-return definition, not an arbitrary shift.
-                win_start = max(0, bar - 21)
-                returns_window = np.diff(ad["close"][win_start:bar + 1]) / np.maximum(ad["close"][win_start:bar], 1e-9) if bar > 1 else np.array([0.01])
-                daily_vol = float(np.std(returns_window)) if len(returns_window) > 1 else 0.02
-                avg_volume = float(np.mean(ad["volume"][max(0, bar - 21):bar + 1])) if ad["volume"] is not None and bar > 1 else 1e6
-
+                signal = float(signals[ticker][decision_bar])
                 current_pos = positions.get(ticker, 0.0)
+                if signal < 0 and current_pos > 0:
+                    exits.append((ticker, signal))
+                elif signal > 0 and current_pos <= 0:
+                    entries.append((ticker, signal))
+
+            for ticker, signal in exits + entries:
+                ad = asset_data[ticker]
+                current_pos = positions.get(ticker, 0.0)
+                price = float(ad["close"][bar])
+                daily_vol, avg_volume = _pre_trade_liquidity(ad, decision_bar)
 
                 if signal > 0 and current_pos <= 0:
                     # BUY signal — go long
                     desired = self.sizer.compute_shares(
-                        capital, price, daily_vol,
+                        sizing_equity, price, daily_vol,
                         n_assets=n_assets,
                     )
                     if current_pos < 0:
@@ -345,7 +315,7 @@ class BacktestEngine:
                     # Optionally go short
                     if cfg.execution.allow_short_selling and signal < -0.5:
                         desired_short = self.sizer.compute_shares(
-                            capital, price, daily_vol, n_assets=n_assets,
+                            sizing_equity, price, daily_vol, n_assets=n_assets,
                         )
                         if desired_short > 0:
                             fill = self.executor.execute_order(
@@ -447,63 +417,8 @@ class BacktestEngine:
 
     def _compute_signal(self, close: np.ndarray,
                         strategy: StrategyConfig) -> float:
-        """Compute signal for a single asset at the current bar.
-
-        Returns:
-          > 0: buy signal (magnitude = strength)
-          < 0: sell signal
-          = 0: hold
-        """
-        if strategy.strategy_type == StrategyType.MA_CROSSOVER:
-            if len(close) < strategy.slow_window + 1:
-                return 0.0
-            fast = np.mean(close[-strategy.fast_window:])
-            slow = np.mean(close[-strategy.slow_window:])
-            prev_fast = np.mean(close[-strategy.fast_window - 1:-1])
-            prev_slow = np.mean(close[-strategy.slow_window - 1:-1])
-            if prev_fast <= prev_slow and fast > slow:
-                return 1.0  # bullish crossover
-            elif prev_fast >= prev_slow and fast < slow:
-                return -1.0  # bearish crossover
-            return 0.0
-
-        elif strategy.strategy_type == StrategyType.MOMENTUM:
-            if len(close) < strategy.momentum_lookback + 1:
-                return 0.0
-            mom = close[-1] / close[-strategy.momentum_lookback - 1] - 1.0
-            if mom > strategy.momentum_entry:
-                return min(mom * 5, 1.0)
-            elif mom < strategy.momentum_exit:
-                return max(mom * 5, -1.0)
-            return 0.0
-
-        elif strategy.strategy_type == StrategyType.MEAN_REVERSION:
-            if len(close) < strategy.mr_lookback + 1:
-                return 0.0
-            window = close[-strategy.mr_lookback:]
-            mu = np.mean(window)
-            sigma = np.std(window, ddof=1)
-            if sigma < 1e-9:
-                return 0.0
-            z = (close[-1] - mu) / sigma
-            if z < strategy.mr_entry_zscore:
-                return min(abs(z) / 3, 1.0)
-            elif z > strategy.mr_exit_zscore:
-                return max(-abs(z) / 3, -1.0)
-            return 0.0
-
-        elif strategy.strategy_type == StrategyType.SBA_SIGNAL:
-            # Use SBA features
-            feats = signal_engine.extract_features(close)
-            mom = feats["momentum"]
-            spin = float(np.tanh(mom * 5.0))
-            if spin > strategy.sba_buy_threshold:
-                return spin
-            elif spin < strategy.sba_sell_threshold:
-                return spin
-            return 0.0
-
-        return 0.0
+        """Signal as of the last bar of ``close`` (see strategy_signals)."""
+        return latest_signal(close, strategy)
 
     def _compute_benchmark(self, close: np.ndarray, start_bar: int,
                            n_bars: int) -> dict:
@@ -652,6 +567,26 @@ class BacktestEngine:
                 output["information_ratio"] = round(ir, 3)
 
         return output
+
+
+def _pre_trade_liquidity(ad: dict, decision_bar: int) -> tuple[float, float]:
+    """Daily volatility and average volume known at the decision bar's close.
+
+    Both slices of the returns window start at the same index, so element i
+    of the diff divides by element i of the base-price window.
+    """
+    close = ad["close"]
+    if decision_bar > 1:
+        win_start = max(0, decision_bar - 21)
+        returns_window = (np.diff(close[win_start:decision_bar + 1])
+                          / np.maximum(close[win_start:decision_bar], 1e-9))
+    else:
+        returns_window = np.array([0.01])
+    daily_vol = float(np.std(returns_window)) if len(returns_window) > 1 else 0.02
+    volume = ad.get("volume")
+    avg_volume = (float(np.mean(volume[max(0, decision_bar - 21):decision_bar + 1]))
+                  if volume is not None and decision_bar > 1 else 1e6)
+    return daily_vol, avg_volume
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +777,12 @@ def run_moving_average_backtest(asset: str, fast_window: int,
         "total_trades": result["total_trades"],
         "win_rate": result["win_rate"],
         "equity_curve": result["equity_curve_net"],
+        # Full-resolution daily returns for statistical tests (the curve
+        # above is downsampled for charting).
+        "daily_returns_net": result["daily_returns_net"],
+        "data_start": result.get("data_start"),
+        "data_end": result.get("data_end"),
+        "execution_delay_bars": result.get("execution_delay_bars"),
         # New fields
         "sharpe_ratio_gross": result["sharpe_ratio_gross"],
         "sortino_ratio": result["sortino_ratio"],

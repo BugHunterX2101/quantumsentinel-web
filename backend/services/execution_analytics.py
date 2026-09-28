@@ -185,41 +185,59 @@ def compute_implementation_shortfall(
 # Queue-Position Analytics
 # ---------------------------------------------------------------------------
 
-def compute_queue_analytics(orders: Sequence[Order]) -> dict:
-    """Compute queue-position analytics for a set of paper orders.
+def _filled_quantity(o: Order) -> float:
+    # An order constructed directly as FILLED (e.g. from stored history)
+    # may not carry filled_quantity; its status is authoritative.
+    if o.status == OrderStatus.FILLED and o.filled_quantity <= 0:
+        return o.quantity
+    return o.filled_quantity
 
-    Returns aggregate statistics on queue position, fill probability,
-    and time-in-queue metrics.
+
+def _is_partial(o: Order) -> bool:
+    """Some quantity executed but not all — including partials later cancelled/expired."""
+    return o.status == OrderStatus.PARTIALLY_FILLED or (
+        o.status != OrderStatus.FILLED and _filled_quantity(o) > 0)
+
+
+def _queue_time(o: Order) -> float | None:
+    if o.entered_book_at is None or o.filled_at is None:
+        return None
+    t = o.filled_at - o.entered_book_at
+    return t if t >= 0 else None
+
+
+def compute_queue_analytics(orders: Sequence[Order]) -> dict:
+    """Queue-position analytics for orders that rested on the book.
+
+    ``fill_rate`` is the share of rested orders with any execution (kept for
+    compatibility); ``full_fill_rate`` counts only complete fills and
+    ``fill_ratio`` is executed quantity / submitted quantity.
     """
-    filled = [o for o in orders if o.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)]
-    resting = [o for o in orders if o.status == OrderStatus.QUEUED]
+    filled = [o for o in orders if o.status == OrderStatus.FILLED or _is_partial(o)]
+    resting = [o for o in orders if o.status == OrderStatus.QUEUED and _filled_quantity(o) <= 0]
     all_active = filled + resting
 
     if not all_active:
         return {"total_orders": 0}
 
+    full = [o for o in filled if o.status == OrderStatus.FILLED]
+    partial = [o for o in filled if _is_partial(o)]
     queue_at_entry = [o.queue_ahead_at_entry for o in all_active]
     queue_at_peak = [o.queue_ahead_peak for o in all_active]
-
-    fill_times = []
-    for o in filled:
-        if o.entered_book_at is not None and o.filled_at is not None:
-            ft = o.filled_at - o.entered_book_at
-            if ft >= 0:
-                fill_times.append(ft)
-
-    partial_fills = [o for o in filled if o.status == OrderStatus.PARTIALLY_FILLED]
-
-    fill_rate = len(filled) / len(all_active) if all_active else 0
-    partial_rate = len(partial_fills) / len(filled) if filled else 0
+    fill_times = [t for t in (_queue_time(o) for o in filled) if t is not None]
+    submitted = sum(o.quantity for o in all_active)
+    executed = sum(_filled_quantity(o) for o in all_active)
 
     return {
         "total_orders": len(all_active),
         "filled": len(filled),
-        "partially_filled": len(partial_fills),
+        "fully_filled": len(full),
+        "partially_filled": len(partial),
         "resting": len(resting),
-        "fill_rate": round(fill_rate, 4),
-        "partial_fill_rate": round(partial_rate, 4),
+        "fill_rate": round(len(filled) / len(all_active), 4),
+        "full_fill_rate": round(len(full) / len(all_active), 4),
+        "partial_fill_rate": round(len(partial) / len(filled), 4) if filled else 0,
+        "fill_ratio": round(executed / submitted, 4) if submitted else 0,
         "avg_queue_ahead_at_entry": round(sum(queue_at_entry) / len(queue_at_entry), 2) if queue_at_entry else 0,
         "avg_queue_ahead_peak": round(sum(queue_at_peak) / len(queue_at_peak), 2) if queue_at_peak else 0,
         "avg_fill_time_seconds": round(sum(fill_times) / len(fill_times), 4) if fill_times else None,
@@ -235,52 +253,115 @@ def compute_execution_metrics(
     fills: Sequence[Fill],
     mid_prices: dict[str, float] | None = None,
 ) -> dict:
-    """Compute comprehensive execution quality metrics.
+    """Execution quality metrics with each outcome counted separately.
 
-    Returns fill rate, partial fill rate, cancel rate, average queue time,
-    spread paid, price improvement, and more.
+    * ``any_fill_rate``   — orders with any execution / orders
+      (``fill_rate`` is kept as an alias for compatibility)
+    * ``full_fill_rate``  — completely filled orders / orders
+    * ``partial_fill_rate`` — partially executed orders / orders
+    * ``fill_ratio``      — executed quantity / submitted quantity
+    * ``cancel_rate`` / ``expiry_rate`` / ``reject_rate`` — orders that ended
+      in that state *without* any execution / orders
     """
     total = len(orders)
     if total == 0:
         return {"total_orders": 0}
 
-    filled_orders = [o for o in orders if o.status == OrderStatus.FILLED]
-    partial_orders = [o for o in orders if o.status == OrderStatus.PARTIALLY_FILLED]
-    cancelled_orders = [o for o in orders if o.status == OrderStatus.CANCELLED]
-    rejected_orders = [o for o in orders if o.status == OrderStatus.REJECTED]
+    full = [o for o in orders if o.status == OrderStatus.FILLED]
+    partial = [o for o in orders if _is_partial(o)]
+    unfilled = [o for o in orders if _filled_quantity(o) <= 0]
+    cancelled = [o for o in unfilled if o.status == OrderStatus.CANCELLED]
+    expired = [o for o in unfilled if o.status == OrderStatus.EXPIRED]
+    rejected = [o for o in unfilled if o.status == OrderStatus.REJECTED]
+    submitted_qty = sum(o.quantity for o in orders if o.status != OrderStatus.REJECTED)
+    executed_qty = sum(_filled_quantity(o) for o in orders)
 
-    # Fill rate
-    fill_rate = (len(filled_orders) + len(partial_orders)) / total
-    cancel_rate = len(cancelled_orders) / total
-
-    # Average fill price vs limit price (price improvement)
     price_improvements = []
-    for o in filled_orders:
+    for o in full:
         if o.limit_price and o.avg_fill_price:
-            if o.side == TradeSide.BUY:
-                improvement = o.limit_price - o.avg_fill_price
-            else:
-                improvement = o.avg_fill_price - o.limit_price
+            improvement = (o.limit_price - o.avg_fill_price if o.side == TradeSide.BUY
+                           else o.avg_fill_price - o.limit_price)
             price_improvements.append(improvement)
-
-    # Turnover (total filled notional)
-    total_notional = sum(
-        f.fill_price * f.fill_quantity for f in fills
-    )
+    queue_times = [t for t in (_queue_time(o) for o in orders if _filled_quantity(o) > 0) if t is not None]
+    any_fill = len(full) + len(partial)
 
     return {
         "total_orders": total,
-        "filled": len(filled_orders),
-        "partially_filled": len(partial_orders),
-        "cancelled": len(cancelled_orders),
-        "rejected": len(rejected_orders),
-        "fill_rate": round(fill_rate, 4),
-        "cancel_rate": round(cancel_rate, 4),
+        "filled": len(full),
+        "partially_filled": len(partial),
+        "cancelled": len(cancelled),
+        "expired": len(expired),
+        "rejected": len(rejected),
+        "fill_rate": round(any_fill / total, 4),
+        "any_fill_rate": round(any_fill / total, 4),
+        "full_fill_rate": round(len(full) / total, 4),
+        "partial_fill_rate": round(len(partial) / total, 4),
+        "fill_ratio": round(executed_qty / submitted_qty, 4) if submitted_qty else 0,
+        "cancel_rate": round(len(cancelled) / total, 4),
+        "expiry_rate": round(len(expired) / total, 4),
+        "reject_rate": round(len(rejected) / total, 4),
         "avg_price_improvement": round(
             sum(price_improvements) / len(price_improvements), 6
         ) if price_improvements else 0,
-        "total_notional": round(total_notional, 2),
+        "avg_queue_time_seconds": round(sum(queue_times) / len(queue_times), 4) if queue_times else None,
+        "total_notional": round(sum(f.fill_price * f.fill_quantity for f in fills), 2),
         "total_fills": len(fills),
+    }
+
+
+def build_execution_report(exchange, adverse_selection_horizons_s: Sequence[float] = (1.0, 10.0, 60.0)) -> dict:
+    """Execution analytics derived from a PaperExchange's own orders and fills.
+
+    Implementation shortfall uses the book mid when the decision was made
+    (order submission) and when the order reached the exchange (after
+    latency), so delay cost is the latency cost and market impact includes
+    the spread paid. Adverse selection compares each fill with the mid
+    observed ``h`` seconds later; horizons beyond the replayed data are
+    omitted rather than extrapolated.
+    """
+    orders = exchange.order_history
+    fills = exchange.fill_history
+    rows, total_is, notional = [], 0.0, 0.0
+    for o in orders:
+        qty = o.filled_quantity
+        decision = exchange.decision_mid.get(o.order_id)
+        arrival = exchange.arrival_mid.get(o.order_id)
+        if qty <= 0 or decision is None or arrival is None:
+            continue
+        row = compute_implementation_shortfall(decision, arrival, o.avg_fill_price, o.side.value, qty)
+        row["order_id"] = o.order_id
+        rows.append(row)
+        total_is += row["total_is"]
+        notional += decision * qty
+
+    last_seen = exchange.mid_history[-1][0] if exchange.mid_history else None
+    fill_rows, mids_after = [], {}
+    for i, f in enumerate(fills):
+        key = f"{f.order_id}#{i}"
+        fill_rows.append({"order_id": key, "fill_price": f.fill_price,
+                          "side": f.side.value if f.side else "BUY"})
+        horizon_mids = []
+        for h in adverse_selection_horizons_s:
+            if last_seen is not None and f.timestamp + h <= last_seen:
+                mid = exchange.mid_at(f.timestamp + h)
+                if mid is not None:
+                    label = int(h * 1000) if float(h * 1000).is_integer() else h * 1000
+                    horizon_mids.append((label, mid))
+        mids_after[key] = horizon_mids
+    per_fill = compute_adverse_selection(fill_rows, mids_after)
+
+    return {
+        "execution_metrics": compute_execution_metrics(orders, fills),
+        "queue_analytics": compute_queue_analytics([o for o in orders if o.entered_book_at is not None]),
+        "implementation_shortfall": {
+            "orders": rows,
+            "total_is": round(total_is, 4),
+            "total_is_bps": round(total_is / notional * 10_000, 2) if notional else 0,
+        },
+        "adverse_selection": {
+            "horizons_seconds": list(adverse_selection_horizons_s),
+            "summary": compute_adverse_selection_summary(per_fill),
+        },
     }
 
 

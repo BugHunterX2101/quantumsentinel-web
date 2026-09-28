@@ -460,10 +460,10 @@ quantumsentinel-web/
 │       │
 │       │   ── Market Microstructure ────────────────────────────────────
 │       ├── market_microstructure.py      ← L2 order-book analytics · OBI · microprice · spread
-│       ├── l2_event_replay.py           ← L2 event stream replay engine · synthetic L2 generator
-│       ├── order_book.py                ← In-memory L2 order book · price-time priority · FIFO queues
-│       ├── matching_engine.py           ← Queue-aware matching · stop triggers · IOC/FOK/GTC
-│       ├── paper_exchange.py            ← Event-driven paper exchange · portfolio tracking
+│       ├── l2_event_replay.py           ← Incremental L2 replay · strategy → paper orders → fills · CSV/record loaders
+│       ├── order_book.py                ← L2 book on integer ticks · MARKET vs PAPER ownership · FIFO queue position
+│       ├── matching_engine.py           ← ADD/CANCEL/MODIFY/TRADE processing · one event per fill · stops · IOC/FOK
+│       ├── paper_exchange.py            ← Latency-aware simulator · cash/position checks · automatic execution analytics
 │       ├── latency_model.py             ← Configurable latency simulation · 7 presets
 │       ├── execution_analytics.py       ← Adverse selection · implementation shortfall · capacity
 │       └── experiment_registry.py       ← Experiment tracking · ML-DSA signed manifests · gates
@@ -613,13 +613,15 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 
 ### Market Microstructure & Paper Exchange Endpoints
 
+> **Synthetic L2.** Order-book data in these endpoints is generated from OHLCV bars (`data_source: "synthetic"`), not historical venue depth. The generator guarantees a valid book history (tick-grid prices, never crossed, cancels and trades only against resting liquidity) whose mid follows the bars. External L2 can be loaded with `L2EventStream.from_csv` / `from_records`, which validate market-data invariants. The simulator applies ADD/CANCEL/MODIFY/TRADE events to one incrementally maintained book, keeps paper orders in true FIFO queue position behind market liquidity, delays orders by the configured latency, and derives implementation shortfall, adverse selection and fill/queue metrics from its own fills. Live paper trading (`/api/trading/orders`) is separate: it settles in the server-side paper account at real market prices.
+
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/microstructure/snapshot/{ticker}` | Synthetic order-book snapshot with OBI, microprice, spread analytics |
 | `POST` | `/api/microstructure/analytics` | Compute microstructure features from provided bid/ask data |
-| `POST` | `/api/microstructure/replay` | Replay L2 events through the OBI-momentum strategy |
-| `POST` | `/api/exchange/order` | Submit order to queue-aware paper exchange |
-| `GET` | `/api/exchange/book/{ticker}` | Current synthetic order book state |
+| `POST` | `/api/microstructure/replay` | Replay synthetic L2 through the OBI-momentum strategy; with `execute` it trades through the paper exchange (latency preset, queue-aware fills, execution analytics) |
+| `POST` | `/api/exchange/order` | Simulate one order against a synthetic L2 book (deterministic per seed; starting cash fixed server-side; never touches the paper account) |
+| `GET` | `/api/exchange/book/{ticker}` | Synthetic order book seeded at the latest price |
 | `POST` | `/api/execution/analysis` | Implementation shortfall decomposition (delay + spread + impact + fees) |
 | `POST` | `/api/execution/capacity` | Strategy capacity analysis across capital sizes |
 | `POST` | `/api/experiments/create` | Create experiment with dataset/strategy/parameter hashes |

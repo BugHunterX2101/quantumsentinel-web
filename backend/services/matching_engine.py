@@ -1,15 +1,22 @@
-"""QuantumSentinel — Queue-Aware Matching Engine.
+"""QuantumSentinel — Queue-Aware Matching Engine (paper simulation only).
 
-A paper-trading matching engine that processes incoming orders against
-the order book with realistic queue-position tracking.
+Routes paper orders against an ``OrderBook`` and processes the L2 feed.
 
-Key behaviours:
-- Market orders consume liquidity across multiple price levels (VWAP fills)
-- Limit orders rest on the book with tracked queue_ahead
-- Stop orders activate when the trigger price is reached
-- Stop-limit orders place a limit order upon trigger
-- Partial fills, cancels, and expiry are all supported
-- No live trading — 100% paper simulation
+Guarantees
+----------
+* **Every execution is its own event.** Each fill of a paper order emits
+  exactly one ``ORDER_FILLED`` / ``ORDER_PARTIALLY_FILLED`` event whose
+  details carry ``fill_price``, ``fill_quantity``, ``side`` and
+  ``liquidity`` (taker/maker). Consumers (the paper exchange, analytics)
+  settle fills from these fields and nothing else, so no fill can be lost.
+* Market orders sweep the book; an unfilled remainder is cancelled.
+* Limit orders take liquidity up to their limit, then rest (FIFO).
+* IOC cancels any unfilled remainder; FOK checks available liquidity
+  *before* executing and fills completely or not at all.
+* Stop / stop-limit orders trigger on trade prints and then execute as
+  market / limit orders.
+* Paper orders never match other paper orders (self-trade prevention).
+* Prices must lie on the book's tick grid.
 """
 
 from __future__ import annotations
@@ -17,34 +24,31 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Sequence
 
 from backend.services.market_microstructure import (
     BookEvent,
     BookEventType,
-    OrderBookSnapshot,
     TradeSide,
 )
 from backend.services.order_book import (
     Fill,
-    LevelQueue,
     Order,
     OrderBook,
     OrderStatus,
     OrderType,
+    Owner,
     TimeInForce,
 )
 
+_EPS = 1e-9
 
-# ---------------------------------------------------------------------------
-# Exchange Events
-# ---------------------------------------------------------------------------
 
 class ExchangeEventType(str, Enum):
     """Events emitted by the matching engine."""
     ORDER_SUBMITTED = "ORDER_SUBMITTED"
     ORDER_ACCEPTED = "ORDER_ACCEPTED"
     ORDER_QUEUED = "ORDER_QUEUED"
+    ORDER_TRIGGERED = "ORDER_TRIGGERED"
     ORDER_PARTIALLY_FILLED = "ORDER_PARTIALLY_FILLED"
     ORDER_FILLED = "ORDER_FILLED"
     ORDER_CANCELLED = "ORDER_CANCELLED"
@@ -53,6 +57,9 @@ class ExchangeEventType(str, Enum):
     QUOTE_UPDATE = "QUOTE_UPDATE"
     TRADE_EVENT = "TRADE_EVENT"
     BOOK_UPDATE = "BOOK_UPDATE"
+
+
+FILL_EVENTS = (ExchangeEventType.ORDER_FILLED, ExchangeEventType.ORDER_PARTIALLY_FILLED)
 
 
 @dataclass(slots=True)
@@ -74,391 +81,211 @@ class ExchangeEvent:
         }
 
 
-# ---------------------------------------------------------------------------
-# Matching Engine
-# ---------------------------------------------------------------------------
-
 class MatchingEngine:
-    """Queue-position-aware matching engine for paper trading.
-
-    This engine processes orders against the ``OrderBook`` and handles:
-    - Immediate execution of market orders (book consumption)
-    - Limit order resting with queue-position tracking
-    - Stop/stop-limit trigger monitoring
-    - IOC and FOK time-in-force semantics
-    - Order expiry
-    """
+    """Queue-position-aware matching engine for paper trading."""
 
     def __init__(self, book: OrderBook):
         self.book = book
         self.event_log: list[ExchangeEvent] = []
         self._pending_stops: list[Order] = []
 
+    # ---- helpers --------------------------------------------------------
+
+    def _event(self, now: float, etype: ExchangeEventType, order: Order, **details) -> ExchangeEvent:
+        return ExchangeEvent(timestamp=now, event_type=etype, order_id=order.order_id,
+                             symbol=order.symbol, details=details)
+
+    def _fill_event(self, order: Order, price: float, qty: float, now: float, aggressor: bool) -> ExchangeEvent:
+        etype = ExchangeEventType.ORDER_FILLED if order.status == OrderStatus.FILLED \
+            else ExchangeEventType.ORDER_PARTIALLY_FILLED
+        return self._event(
+            now, etype, order,
+            fill_price=price, fill_quantity=qty, side=order.side.value,
+            liquidity="taker" if aggressor else "maker",
+            avg_price=round(order.avg_fill_price, 8), quantity=order.quantity,
+            cumulative_filled=order.filled_quantity, remaining=order.remaining_quantity,
+        )
+
+    def _reject(self, order: Order, now: float, reason: str) -> list[ExchangeEvent]:
+        order.status = OrderStatus.REJECTED
+        return [self._event(now, ExchangeEventType.ORDER_REJECTED, order, reason=reason)]
+
+    def _take(self, order: Order, now: float, limit_price: float | None) -> list[ExchangeEvent]:
+        """Execute ``order`` as an aggressor; one event per execution."""
+        events = []
+        for resting_fill in self.book.consume_liquidity(order.side, order.remaining_quantity, now,
+                                                        limit_price=limit_price):
+            order.record_fill(resting_fill.fill_price, resting_fill.fill_quantity, now)
+            events.append(self._fill_event(order, resting_fill.fill_price,
+                                           resting_fill.fill_quantity, now, aggressor=True))
+        return events
+
+    def _available(self, side: TradeSide, limit_price: float | None) -> float:
+        """Market liquidity an aggressor of ``side`` could take up to ``limit_price``."""
+        levels = self.book.ask_levels if side == TradeSide.BUY else self.book.bid_levels
+        total = 0.0
+        for level in levels:
+            if limit_price is not None:
+                if side == TradeSide.BUY and level.price > limit_price + _EPS:
+                    break
+                if side == TradeSide.SELL and level.price < limit_price - _EPS:
+                    break
+            total += level.market_size
+        return total
+
     # ---- Order submission -----------------------------------------------
 
     def submit_order(self, order: Order, timestamp: float | None = None) -> list[ExchangeEvent]:
-        """Process an incoming order.
+        """Process an incoming paper order; returns the events it produced.
 
-        ``timestamp``, when given, is used for this order's events and its
-        ``entered_book_at`` if it rests — pass the caller's simulated clock
-        during a backtest/replay so it stays comparable to fill timestamps
-        recorded via ``on_market_event``. Defaults to wall-clock.
-
-        Returns a list of exchange events produced.
+        ``timestamp`` is the caller's simulation clock (wall clock if omitted).
         """
-        events: list[ExchangeEvent] = []
         now = timestamp if timestamp is not None else time.time()
+        order.owner = Owner.PAPER
+        order.symbol = order.symbol or self.book.symbol
+        events = [self._event(now, ExchangeEventType.ORDER_SUBMITTED, order, side=order.side.value,
+                              type=order.order_type.value, quantity=order.quantity)]
 
-        # Emit submission event
-        events.append(ExchangeEvent(
-            timestamp=now,
-            event_type=ExchangeEventType.ORDER_SUBMITTED,
-            order_id=order.order_id,
-            symbol=order.symbol,
-            details={"side": order.side.value, "type": order.order_type.value,
-                      "quantity": order.quantity},
-        ))
-
-        # Validate
         if order.quantity <= 0:
-            order.status = OrderStatus.REJECTED
-            events.append(ExchangeEvent(
-                timestamp=now,
-                event_type=ExchangeEventType.ORDER_REJECTED,
-                order_id=order.order_id,
-                symbol=order.symbol,
-                details={"reason": "quantity must be positive"},
-            ))
-            self.event_log.extend(events)
-            return events
+            events += self._reject(order, now, "quantity must be positive")
+        elif order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and order.limit_price is None:
+            events += self._reject(order, now, "limit order requires limit_price")
+        elif order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and order.stop_price is None:
+            events += self._reject(order, now, "stop order requires stop_price")
+        elif any(p is not None and (p <= 0 or not self.book.is_on_grid(p))
+                 for p in (order.limit_price, order.stop_price)):
+            events += self._reject(order, now, f"price must be positive and a multiple of the "
+                                               f"tick size {self.book.tick_size}")
+        else:
+            order.status = OrderStatus.ACCEPTED
+            events.append(self._event(now, ExchangeEventType.ORDER_ACCEPTED, order))
+            if order.order_type == OrderType.MARKET:
+                events += self._execute_market_order(order, now)
+            elif order.order_type == OrderType.LIMIT:
+                events += self._execute_limit_order(order, now)
+            else:
+                self._pending_stops.append(order)
 
-        if order.order_type == OrderType.LIMIT and order.limit_price is None:
-            order.status = OrderStatus.REJECTED
-            events.append(ExchangeEvent(
-                timestamp=now,
-                event_type=ExchangeEventType.ORDER_REJECTED,
-                order_id=order.order_id,
-                symbol=order.symbol,
-                details={"reason": "limit order requires limit_price"},
-            ))
-            self.event_log.extend(events)
-            return events
-
-        if order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and order.stop_price is None:
-            order.status = OrderStatus.REJECTED
-            events.append(ExchangeEvent(
-                timestamp=now,
-                event_type=ExchangeEventType.ORDER_REJECTED,
-                order_id=order.order_id,
-                symbol=order.symbol,
-                details={"reason": "stop order requires stop_price"},
-            ))
-            self.event_log.extend(events)
-            return events
-
-        order.status = OrderStatus.ACCEPTED
-        events.append(ExchangeEvent(
-            timestamp=now,
-            event_type=ExchangeEventType.ORDER_ACCEPTED,
-            order_id=order.order_id,
-            symbol=order.symbol,
-        ))
-
-        # Route by order type
-        if order.order_type == OrderType.MARKET:
-            events.extend(self._execute_market_order(order, now))
-        elif order.order_type == OrderType.LIMIT:
-            events.extend(self._execute_limit_order(order, now))
-        elif order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
-            self._pending_stops.append(order)
-        
         self.event_log.extend(events)
         return events
 
-    def cancel_order(self, order_id: str) -> list[ExchangeEvent]:
-        """Cancel a resting or pending order."""
+    def cancel_order(self, order_id: str, timestamp: float | None = None) -> list[ExchangeEvent]:
+        """Cancel a resting order or an untriggered stop."""
+        now = timestamp if timestamp is not None else time.time()
         events: list[ExchangeEvent] = []
-        now = time.time()
-
-        # Check pending stops
         for i, o in enumerate(self._pending_stops):
             if o.order_id == order_id:
                 o.status = OrderStatus.CANCELLED
                 self._pending_stops.pop(i)
-                events.append(ExchangeEvent(
-                    timestamp=now,
-                    event_type=ExchangeEventType.ORDER_CANCELLED,
-                    order_id=order_id,
-                    symbol=o.symbol,
-                ))
-                self.event_log.extend(events)
-                return events
-
-        # Check book orders
-        order = self.book.cancel_order(order_id)
-        if order:
-            events.append(ExchangeEvent(
-                timestamp=now,
-                event_type=ExchangeEventType.ORDER_CANCELLED,
-                order_id=order_id,
-                symbol=order.symbol,
-                details={"filled_quantity": order.filled_quantity},
-            ))
+                events.append(self._event(now, ExchangeEventType.ORDER_CANCELLED, o))
+                break
+        else:
+            order = self.book.cancel_order(order_id)
+            if order:
+                events.append(self._event(now, ExchangeEventType.ORDER_CANCELLED, order,
+                                          filled_quantity=order.filled_quantity))
         self.event_log.extend(events)
         return events
 
-    # ---- Market order execution ----------------------------------------
+    # ---- Execution ------------------------------------------------------
 
     def _execute_market_order(self, order: Order, now: float) -> list[ExchangeEvent]:
-        """Execute a market order by consuming book liquidity."""
-        events: list[ExchangeEvent] = []
-
-        fills = self.book.consume_liquidity(
-            side=order.side,
-            quantity=order.quantity,
-            timestamp=now,
-        )
-
-        for fill in fills:
-            fill.order_id = order.order_id
-            fill.aggressor = True
-            order.filled_quantity += fill.fill_quantity
-            order.avg_fill_price = (
-                (order.avg_fill_price * (order.filled_quantity - fill.fill_quantity) +
-                 fill.fill_price * fill.fill_quantity) / order.filled_quantity
-                if order.filled_quantity > 0 else fill.fill_price
-            )
-
-        if order.filled_quantity >= order.quantity:
-            order.status = OrderStatus.FILLED
-            events.append(ExchangeEvent(
-                timestamp=now,
-                event_type=ExchangeEventType.ORDER_FILLED,
-                order_id=order.order_id,
-                symbol=order.symbol,
-                details={"avg_price": round(order.avg_fill_price, 8),
-                          "quantity": order.quantity},
-            ))
-        elif order.filled_quantity > 0:
-            order.status = OrderStatus.PARTIALLY_FILLED
-            events.append(ExchangeEvent(
-                timestamp=now,
-                event_type=ExchangeEventType.ORDER_PARTIALLY_FILLED,
-                order_id=order.order_id,
-                symbol=order.symbol,
-                details={"filled": order.filled_quantity,
-                          "remaining": order.remaining_quantity},
-            ))
-        else:
-            # No liquidity available
-            order.status = OrderStatus.REJECTED
-            events.append(ExchangeEvent(
-                timestamp=now,
-                event_type=ExchangeEventType.ORDER_REJECTED,
-                order_id=order.order_id,
-                symbol=order.symbol,
-                details={"reason": "insufficient liquidity"},
-            ))
-
+        events = self._take(order, now, limit_price=None)
+        if order.filled_quantity <= _EPS:
+            return events + self._reject(order, now, "insufficient liquidity")
+        if order.remaining_quantity > _EPS:
+            # A market order never rests: the unfilled remainder is cancelled.
+            order.status = OrderStatus.CANCELLED
+            events.append(self._event(now, ExchangeEventType.ORDER_CANCELLED, order,
+                                      reason="unfilled market remainder cancelled",
+                                      filled_quantity=order.filled_quantity))
         return events
 
-    # ---- Limit order execution -----------------------------------------
-
     def _execute_limit_order(self, order: Order, now: float) -> list[ExchangeEvent]:
-        """Process a limit order: check for immediate cross, then rest."""
-        events: list[ExchangeEvent] = []
+        if order.time_in_force == TimeInForce.FOK:
+            if self._available(order.side, order.limit_price) + _EPS < order.quantity:
+                return self._reject(order, now, "FOK - insufficient liquidity for full fill")
 
-        # Check for immediate cross (marketable limit)
-        if self._is_marketable(order):
-            fills = self.book.consume_liquidity(
-                side=order.side,
-                quantity=order.quantity,
-                timestamp=now,
-                limit_price=order.limit_price,
-            )
-            for fill in fills:
-                fill.order_id = order.order_id
-                fill.aggressor = True
-                order.filled_quantity += fill.fill_quantity
-                order.avg_fill_price = (
-                    (order.avg_fill_price * (order.filled_quantity - fill.fill_quantity) +
-                     fill.fill_price * fill.fill_quantity) / order.filled_quantity
-                    if order.filled_quantity > 0 else fill.fill_price
-                )
-
-            if order.remaining_quantity <= 0:
-                order.status = OrderStatus.FILLED
-                events.append(ExchangeEvent(
-                    timestamp=now,
-                    event_type=ExchangeEventType.ORDER_FILLED,
-                    order_id=order.order_id,
-                    symbol=order.symbol,
-                    details={"avg_price": round(order.avg_fill_price, 8)},
-                ))
-                return events
-
-        # Handle IOC: cancel unfilled portion
-        if order.time_in_force == TimeInForce.IOC:
-            if order.filled_quantity > 0:
-                order.status = OrderStatus.PARTIALLY_FILLED
-                events.append(ExchangeEvent(
-                    timestamp=now,
-                    event_type=ExchangeEventType.ORDER_PARTIALLY_FILLED,
-                    order_id=order.order_id,
-                    symbol=order.symbol,
-                    details={"filled": order.filled_quantity, "cancelled_remainder": True},
-                ))
-            else:
-                order.status = OrderStatus.CANCELLED
-                events.append(ExchangeEvent(
-                    timestamp=now,
-                    event_type=ExchangeEventType.ORDER_CANCELLED,
-                    order_id=order.order_id,
-                    symbol=order.symbol,
-                    details={"reason": "IOC - no immediate fill"},
-                ))
+        events = self._take(order, now, order.limit_price) if self._is_marketable(order) else []
+        if order.remaining_quantity <= _EPS:
             return events
 
-        # Handle FOK: must fill entirely or reject
-        if order.time_in_force == TimeInForce.FOK:
-            if order.filled_quantity < order.quantity:
-                order.status = OrderStatus.REJECTED
-                events.append(ExchangeEvent(
-                    timestamp=now,
-                    event_type=ExchangeEventType.ORDER_REJECTED,
-                    order_id=order.order_id,
-                    symbol=order.symbol,
-                    details={"reason": "FOK - insufficient liquidity for full fill"},
-                ))
-                return events
+        if order.time_in_force in (TimeInForce.IOC, TimeInForce.FOK):
+            order.status = OrderStatus.CANCELLED
+            events.append(self._event(now, ExchangeEventType.ORDER_CANCELLED, order,
+                                      reason=f"{order.time_in_force.value} remainder cancelled",
+                                      filled_quantity=order.filled_quantity))
+            return events
 
-        # Rest remaining quantity on the book
-        if order.remaining_quantity > 0:
-            if order.filled_quantity > 0:
-                # Marketable limit that partially filled against the book
-                # before its unfilled remainder rests — surface the fill
-                # that already happened, not just the queue event.
-                events.append(ExchangeEvent(
-                    timestamp=now,
-                    event_type=ExchangeEventType.ORDER_PARTIALLY_FILLED,
-                    order_id=order.order_id,
-                    symbol=order.symbol,
-                    details={"filled": order.filled_quantity,
-                              "remaining": order.remaining_quantity},
-                ))
-            self.book.add_order(order, timestamp=now)
-            events.append(ExchangeEvent(
-                timestamp=now,
-                event_type=ExchangeEventType.ORDER_QUEUED,
-                order_id=order.order_id,
-                symbol=order.symbol,
-                details={"price": order.limit_price,
-                          "quantity": order.remaining_quantity,
-                          "queue_ahead": order.queue_ahead},
-            ))
-
+        self.book.add_order(order, timestamp=now)
+        events.append(self._event(now, ExchangeEventType.ORDER_QUEUED, order,
+                                  price=order.limit_price, quantity=order.remaining_quantity,
+                                  queue_ahead=order.queue_ahead))
         return events
 
     def _is_marketable(self, order: Order) -> bool:
-        """Check if a limit order crosses the current book."""
+        if order.limit_price is None:
+            return False
         if order.side == TradeSide.BUY:
             best_ask = self.book.best_ask
-            return best_ask is not None and order.limit_price is not None and order.limit_price >= best_ask
-        else:
-            best_bid = self.book.best_bid
-            return best_bid is not None and order.limit_price is not None and order.limit_price <= best_bid
+            return best_ask is not None and order.limit_price >= best_ask - _EPS
+        best_bid = self.book.best_bid
+        return best_bid is not None and order.limit_price <= best_bid + _EPS
 
-    # ---- Market event processing ---------------------------------------
+    # ---- Market data ----------------------------------------------------
 
     def on_market_event(self, event: BookEvent) -> list[ExchangeEvent]:
-        """Process an incoming market data event.
-
-        Updates the book, checks stop triggers, and processes queue fills.
-        """
-        exchange_events: list[ExchangeEvent] = []
+        """Apply one L2 feed event: book update, maker fills, stop triggers."""
         now = event.timestamp
-
-        if event.event_type == BookEventType.TRADE:
-            # Check stop triggers
-            exchange_events.extend(self._check_stop_triggers(event.price, now))
-
-            # Update queue positions for resting orders at the traded price
-            # Trades on the ask side affect BUY orders; trades on bid side affect SELL orders
-            if event.side == TradeSide.BUY:
-                # Buyer aggressed → ask liquidity consumed → our SELL orders at this price may fill
-                fills = self.book.update_queue_positions(event.price, event.size, TradeSide.SELL, timestamp=now)
-            else:
-                # Seller aggressed → bid liquidity consumed → our BUY orders may fill
-                fills = self.book.update_queue_positions(event.price, event.size, TradeSide.BUY, timestamp=now)
-
-            for fill in fills:
-                etype = ExchangeEventType.ORDER_FILLED if not fill.is_partial else ExchangeEventType.ORDER_PARTIALLY_FILLED
-                exchange_events.append(ExchangeEvent(
-                    timestamp=now,
-                    event_type=etype,
-                    order_id=fill.order_id,
-                    symbol=self.book.symbol,
-                    details=fill.to_dict(),
-                ))
-
-        self.event_log.extend(exchange_events)
-        return exchange_events
-
-    def _check_stop_triggers(self, trade_price: float, now: float) -> list[ExchangeEvent]:
-        """Check if any pending stop orders are triggered."""
         events: list[ExchangeEvent] = []
-        triggered = []
-
-        for i, order in enumerate(self._pending_stops):
-            is_triggered = False
-            if order.side == TradeSide.BUY and trade_price >= (order.stop_price or float("inf")):
-                is_triggered = True
-            elif order.side == TradeSide.SELL and trade_price <= (order.stop_price or 0):
-                is_triggered = True
-
-            if is_triggered:
-                triggered.append(i)
-                if order.order_type == OrderType.STOP:
-                    # Convert to market order
-                    order.order_type = OrderType.MARKET
-                    events.extend(self._execute_market_order(order, now))
-                elif order.order_type == OrderType.STOP_LIMIT:
-                    # Convert to limit order
-                    order.order_type = OrderType.LIMIT
-                    events.extend(self._execute_limit_order(order, now))
-
-        # Remove triggered orders (reverse order to preserve indices)
-        for i in reversed(triggered):
-            self._pending_stops.pop(i)
-
+        for fill in self.book.apply_market_event(event):
+            order = self.book.get_order(fill.order_id)
+            if order is not None:
+                events.append(self._fill_event(order, fill.fill_price, fill.fill_quantity, now,
+                                               aggressor=False))
+        if event.event_type == BookEventType.TRADE:
+            events.extend(self._check_stop_triggers(event.price, now))
+        self.event_log.extend(events)
         return events
 
-    # ---- Expiry check ---------------------------------------------------
+    def _check_stop_triggers(self, trade_price: float, now: float) -> list[ExchangeEvent]:
+        events: list[ExchangeEvent] = []
+        still_pending = []
+        for order in self._pending_stops:
+            triggered = (trade_price >= order.stop_price - _EPS if order.side == TradeSide.BUY
+                         else trade_price <= order.stop_price + _EPS)
+            if not triggered:
+                still_pending.append(order)
+                continue
+            events.append(self._event(now, ExchangeEventType.ORDER_TRIGGERED, order,
+                                      trigger_price=trade_price))
+            if order.order_type == OrderType.STOP:
+                order.order_type = OrderType.MARKET
+                events += self._execute_market_order(order, now)
+            else:
+                order.order_type = OrderType.LIMIT
+                events += self._execute_limit_order(order, now)
+        self._pending_stops = still_pending
+        return events
+
+    # ---- Expiry ---------------------------------------------------------
 
     def expire_orders(self, current_time: float | None = None) -> list[ExchangeEvent]:
-        """Expire orders past their expiry time or DAY orders at EOD."""
-        if current_time is None:
-            current_time = time.time()
-
+        """Expire resting orders and untriggered stops whose expires_at has passed."""
+        now = current_time if current_time is not None else time.time()
         events: list[ExchangeEvent] = []
-        to_cancel: list[str] = []
-
-        for oid, order in self.book._orders.items():
-            if not order.is_active:
-                continue
-            if order.expires_at and current_time >= order.expires_at:
-                to_cancel.append(oid)
-
-        for oid in to_cancel:
-            order = self.book.cancel_order(oid)
-            if order:
+        for oid, order in list(self.book._orders.items()):
+            if order.owner == Owner.PAPER and order.is_active and order.expires_at and now >= order.expires_at:
+                if self.book.cancel_order(oid):
+                    order.status = OrderStatus.EXPIRED
+                    events.append(self._event(now, ExchangeEventType.ORDER_EXPIRED, order))
+        kept = []
+        for order in self._pending_stops:
+            if order.expires_at and now >= order.expires_at:
                 order.status = OrderStatus.EXPIRED
-                events.append(ExchangeEvent(
-                    timestamp=current_time,
-                    event_type=ExchangeEventType.ORDER_EXPIRED,
-                    order_id=oid,
-                    symbol=order.symbol,
-                ))
-
+                events.append(self._event(now, ExchangeEventType.ORDER_EXPIRED, order))
+            else:
+                kept.append(order)
+        self._pending_stops = kept
         self.event_log.extend(events)
         return events

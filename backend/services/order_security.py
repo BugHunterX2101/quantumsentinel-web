@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..config import ENVIRONMENT
+from ..config import ENVIRONMENT, PAPER_MAX_POSITION_FRACTION
 from ..crypto import pqc
 from . import security_service
 
@@ -154,6 +154,18 @@ def _validate_idempotency_key(key: str | None) -> None:
         raise HTTPException(400, "invalid Idempotency-Key")
 
 
+def release_idempotency(db: Session, user_id: str, key: str | None) -> None:
+    """Drop an in-progress reservation whose order was never created, so a
+    retry of a request that failed validation is not stuck at 409 forever."""
+    if not key:
+        return
+    record = models.IdempotencyRecord
+    db.query(record).filter(
+        record.user_id == user_id, record.idempotency_key == key, record.response_json.is_(None),
+    ).delete(synchronize_session=False)
+    db.commit()
+
+
 def complete_idempotency(db: Session, user_id: str, key: str | None, response: dict) -> None:
     if not key:
         return
@@ -189,8 +201,9 @@ async def assert_risk_gate_async(*, user_id: str, asset: str, side: str, quantit
         raise HTTPException(423, "trading kill switch is active")
 
     notional = quantity * price
-    if notional > account_equity * 0.05:
-        raise HTTPException(400, "risk gate: order exceeds 5% account-equity notional limit")
+    if notional > account_equity * PAPER_MAX_POSITION_FRACTION:
+        raise HTTPException(400, f"risk gate: order exceeds {PAPER_MAX_POSITION_FRACTION:.0%} "
+                                 f"account-equity notional limit")
     if side == "sell" and quantity > held_quantity:
         raise HTTPException(400, "risk gate: sell quantity exceeds available paper position")
     if current_gross_exposure + (notional if side == "buy" else 0) > account_equity:
@@ -221,8 +234,9 @@ def assert_risk_gate(*, user_id: str, asset: str, side: str, quantity: float,
     if blocked:
         raise HTTPException(423, "trading kill switch is active")
     notional = quantity * price
-    if notional > account_equity * 0.05:
-        raise HTTPException(400, "risk gate: order exceeds 5% account-equity notional limit")
+    if notional > account_equity * PAPER_MAX_POSITION_FRACTION:
+        raise HTTPException(400, f"risk gate: order exceeds {PAPER_MAX_POSITION_FRACTION:.0%} "
+                                 f"account-equity notional limit")
     if side == "sell" and quantity > held_quantity:
         raise HTTPException(400, "risk gate: sell quantity exceeds available paper position")
     if current_gross_exposure + (notional if side == "buy" else 0) > account_equity:

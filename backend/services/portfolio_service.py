@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from .. import models
-from .trading_service import get_last_price
+from ..config import PAPER_INITIAL_CASH
+from . import trading_service
 
 # ---------------------------------------------------------------------------
 # SPY benchmark history cache
@@ -85,22 +86,27 @@ def get_positions_with_pnl(db: Session, user_id: str) -> list[dict]:
     ).scalars().all()
     out = []
     for p in positions:
-        current_price = get_last_price(p.asset)
-        unrealized = (current_price - float(p.avg_entry_price)) * float(p.quantity)
+        quantity, avg_entry = float(p.quantity), float(p.avg_entry_price)
+        current_price, stale = trading_service.get_mark_price(p.asset)
+        if current_price is None:
+            # Never observed a price: carry at cost rather than inventing one.
+            current_price = avg_entry
+        unrealized = (current_price - avg_entry) * quantity
         out.append({
             "asset": p.asset,
-            "quantity": float(p.quantity),
-            "avg_entry_price": float(p.avg_entry_price),
+            "quantity": quantity,
+            "avg_entry_price": avg_entry,
             "current_price": current_price,
+            "price_stale": stale,
             "unrealized_pnl": round(unrealized, 2),
             "realized_pnl": float(p.realized_pnl),
-            "market_value": round(current_price * float(p.quantity), 2),
+            "market_value": round(current_price * quantity, 2),
         })
     return out
 
 
 def equity_curve_from_trades(
-    db: Session, user_id: str, starting_capital: float = 100_000.0
+    db: Session, user_id: str, starting_capital: float = PAPER_INITIAL_CASH
 ) -> list[float]:
     """Build a mark-to-market equity curve from filled trades.
 
@@ -115,11 +121,13 @@ def equity_curve_from_trades(
         ).order_by(models.Trade.filled_at)
     ).scalars().all()
 
-    # One live-price fetch per unique asset — not per trade event
-    unique_assets = {t.asset for t in trades}
-    current_prices: dict[str, float] = {
-        asset: get_last_price(asset) for asset in unique_assets
-    }
+    # One mark per unique asset — not per trade event. Without any observed
+    # price, an asset is carried at its most recent fill price.
+    last_fill: dict[str, float] = {t.asset: float(t.filled_price or 0) for t in trades}
+    current_prices: dict[str, float] = {}
+    for asset in last_fill:
+        mark, _stale = trading_service.get_mark_price(asset)
+        current_prices[asset] = mark if mark is not None else last_fill[asset]
 
     equity = starting_capital
     curve = [equity]

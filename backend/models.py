@@ -3,7 +3,7 @@ import uuid
 import datetime as dt
 
 from sqlalchemy import (
-    Column, String, Boolean, DateTime, Numeric, Integer, ForeignKey, Text, JSON,
+    Column, String, Boolean, DateTime, Numeric, Integer, BigInteger, ForeignKey, Text, JSON,
     UniqueConstraint, Sequence,
 )
 from sqlalchemy.orm import relationship
@@ -141,6 +141,21 @@ class Position(Base):
     updated_at = Column(DateTime(timezone=True), default=utcnow)
 
     user = relationship("User", back_populates="positions")
+
+
+class PaperAccount(Base):
+    """Server-side paper-trading cash ledger, one row per user.
+
+    Money is stored as integer micro-dollars so that the atomic
+    compare-and-swap reservations in paper_broker are exact on every backend
+    (SQLite has no decimal type and would otherwise compare binary floats).
+    """
+    __tablename__ = "paper_accounts"
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    cash_micros = Column(BigInteger, nullable=False)
+    reserved_micros = Column(BigInteger, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class SignalRecord(Base):

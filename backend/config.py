@@ -63,6 +63,16 @@ TRUSTED_SERVER_DSA_FINGERPRINT = _setting("TRUSTED_SERVER_DSA_FINGERPRINT")
 # rather than mutable by anything the application itself can write to.
 ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
 
+# --- Paper-trading ledger -------------------------------------------------------
+# Starting capital is a server-side constant: clients never choose their own
+# buying power.
+PAPER_INITIAL_CASH = float(os.getenv("PAPER_INITIAL_CASH", "100000"))
+# Per-asset concentration cap as a fraction of account equity.
+PAPER_MAX_POSITION_FRACTION = float(os.getenv("PAPER_MAX_POSITION_FRACTION", "0.05"))
+# Resting conditional orders are filled by a background sweeper, never by reads.
+ORDER_SWEEPER_ENABLED = os.getenv("ORDER_SWEEPER_ENABLED", "true").lower() == "true"
+ORDER_SWEEP_INTERVAL_SECONDS = float(os.getenv("ORDER_SWEEP_INTERVAL_SECONDS", "5"))
+
 DATABASE_URL = _setting("DATABASE_URL", "sqlite:///./quantumsentinel.db")
 REDIS_URL = _setting("REDIS_URL")
 PQC_PROVIDER = _setting("PQC_PROVIDER", "reference")

@@ -76,7 +76,7 @@ class TestRecomputePositions:
 
 class TestEquityCurveFromTrades:
     def test_buy_reduces_cash_then_marks_to_market(self, db, user, monkeypatch):
-        monkeypatch.setattr(portfolio_service, "get_last_price", lambda asset: 150.0)
+        monkeypatch.setattr(portfolio_service.trading_service, "get_last_price", lambda asset: 150.0)
         _add_trade(db, user.id, "AAPL", "buy", 10, 100.0)
         curve = portfolio_service.equity_curve_from_trades(db, user.id, starting_capital=100_000.0)
         # cash = 100000 - 1000 = 99000; open value = 10*150 = 1500 -> 100500
@@ -88,7 +88,7 @@ class TestEquityCurveFromTrades:
         # left to push the book negative (a phantom short position that
         # would silently corrupt the equity curve and every risk metric
         # derived from it).
-        monkeypatch.setattr(portfolio_service, "get_last_price", lambda asset: 100.0)
+        monkeypatch.setattr(portfolio_service.trading_service, "get_last_price", lambda asset: 100.0)
         _add_trade(db, user.id, "AAPL", "buy", 5, 100.0)
         _add_trade(db, user.id, "AAPL", "sell", 20, 110.0)
         curve = portfolio_service.equity_curve_from_trades(db, user.id, starting_capital=100_000.0)

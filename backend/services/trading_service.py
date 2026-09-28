@@ -1,108 +1,129 @@
-"""QuantumSentinel — Trading Engine.
+"""QuantumSentinel — market prices and the internal paper broker's fill rules.
 
-If ALPACA_API_KEY + ALPACA_SECRET_KEY env vars are set, orders route to the
-real Alpaca paper-trading REST API (https://paper-api.alpaca.markets).
-Otherwise falls back to a built-in paper broker that fills orders against
-live Yahoo Finance prices — so the whole order lifecycle works end-to-end
-even with zero external credentials configured.
+Execution is paper-only by construction: this codebase contains no external
+broker client, so there is no configuration that can route an order to a
+real-money venue. Orders fill against live Yahoo Finance prices, and the cash
+ledger is owned by ``paper_broker``.
 """
-import os
+import math
 import time
-import requests
+
+import numpy as np
 import yfinance as yf
 
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-
-_price_cache: dict[str, tuple[float, float]] = {}  # asset -> (price, ts)
+_price_cache: dict[str, tuple[float, float]] = {}  # asset -> (price, fetched_at)
 PRICE_CACHE_TTL = 20
 
 
-def alpaca_enabled() -> bool:
-    return bool(ALPACA_API_KEY and ALPACA_SECRET_KEY)
+class MarketDataUnavailable(Exception):
+    """No trustworthy price could be obtained. Callers must reject, never guess."""
+
+
+def _valid_price(value) -> float | None:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(price) and price > 0):
+        return None
+    # Yahoo delivers many prices as float32 widened to float64, e.g. 341.07
+    # arrives as 341.0700073242. When a value is exactly float32-representable,
+    # its shortest float32 repr is the decimal the provider meant; genuine
+    # float64 prices are left untouched.
+    as_f32 = np.float32(price)
+    if float(as_f32) == price:
+        price = float(np.format_float_positional(as_f32, unique=True))
+    return price
+
+
+def _fast_info_price(asset: str) -> float | None:
+    try:
+        fast = yf.Ticker(asset).fast_info
+    except Exception:
+        return None
+    # fast_info is an object, not a dict; individual attributes can raise.
+    for attr in ("last_price", "regularMarketPrice"):
+        try:
+            price = _valid_price(getattr(fast, attr, None))
+        except Exception:
+            price = None
+        if price is not None:
+            return price
+    return None
+
+
+def _last_close(asset: str) -> float | None:
+    try:
+        hist = yf.Ticker(asset).history(period="5d")
+    except Exception:
+        return None
+    if not len(hist):
+        return None
+    return _valid_price(hist["Close"].iloc[-1])
 
 
 def get_last_price(asset: str) -> float:
+    """Latest executable price, at most PRICE_CACHE_TTL seconds old.
+
+    Raises MarketDataUnavailable when no finite positive price exists.
+    """
     now = time.time()
     cached = _price_cache.get(asset)
     if cached and now - cached[1] < PRICE_CACHE_TTL:
         return cached[0]
-    try:
-        fast = yf.Ticker(asset).fast_info
-        # FIX TR1: fast_info is an object, not a dict — `.get()` raises AttributeError.
-        # Chain getattr calls with explicit None fallback.
-        price = getattr(fast, "last_price", None) or getattr(fast, "regularMarketPrice", None)
-        if price is None or not isinstance(price, (int, float)):
-            raise ValueError("no price attribute")
-        price = float(price)
-    except Exception:
-        hist = yf.Ticker(asset).history(period="1d")
-        price = float(hist["Close"].iloc[-1]) if len(hist) else 100.0
+    price = _fast_info_price(asset) or _last_close(asset)
+    if price is None:
+        raise MarketDataUnavailable(f"no market price available for {asset}")
     _price_cache[asset] = (price, now)
     return price
 
 
-def _alpaca_headers():
-    return {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-        "Content-Type": "application/json",
-    }
+def get_mark_price(asset: str) -> tuple[float | None, bool]:
+    """Best available price for valuation only — never for execution.
 
-
-def submit_alpaca_order(asset: str, side: str, qty: float, order_type: str,
-                         limit_price: float | None, stop_price: float | None,
-                         time_in_force: str) -> dict:
-    body = {
-        "symbol": asset, "qty": str(qty), "side": side,
-        "type": order_type, "time_in_force": time_in_force,
-    }
-    if order_type == "limit" and limit_price:
-        body["limit_price"] = str(limit_price)
-    if order_type in ("stop", "stop_limit") and stop_price:
-        body["stop_price"] = str(stop_price)
-    if order_type == "stop_limit" and limit_price:
-        body["limit_price"] = str(limit_price)
-    resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders", json=body,
-                          headers=_alpaca_headers(), timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    Returns (price, is_stale). Falls back to the last cached observation of
+    any age when a fresh fetch fails, and to (None, True) when nothing was
+    ever observed.
+    """
+    try:
+        return get_last_price(asset), False
+    except MarketDataUnavailable:
+        cached = _price_cache.get(asset)
+        return (cached[0], True) if cached else (None, True)
 
 
 def simulate_fill(asset: str, side: str, qty: float, order_type: str,
-                   limit_price: float | None, stop_price: float | None = None) -> dict:
-    """Local paper-broker matching engine using the latest real market price."""
-    last_price = get_last_price(asset)
+                   limit_price: float | None, stop_price: float | None = None,
+                   last_price: float | None = None) -> dict:
+    """Paper-broker fill rule against the latest real market price."""
+    if last_price is None:
+        last_price = get_last_price(asset)
     if order_type == "market":
-        return {"status": "FILLED", "filled_price": last_price, "alpaca_order_id": None}
+        return {"status": "FILLED", "filled_price": last_price}
     if order_type in ("stop", "stop_limit"):
         triggered = (side == "buy" and last_price >= (stop_price or float("inf"))) or \
                     (side == "sell" and last_price <= (stop_price or 0))
         if not triggered:
-            return {"status": "ACCEPTED", "filled_price": None, "alpaca_order_id": None}
+            return {"status": "ACCEPTED", "filled_price": None}
         if order_type == "stop":
-            return {"status": "FILLED", "filled_price": last_price, "alpaca_order_id": None}
-    # limit and triggered stop-limit: fill if marketable at best available price
+            return {"status": "FILLED", "filled_price": last_price}
     if limit_price is None:
-        # stop_limit without a limit_price — treat as market fill at stop trigger price
-        return {"status": "FILLED", "filled_price": last_price, "alpaca_order_id": None}
+        return {"status": "FILLED", "filled_price": last_price}
     marketable = (side == "buy" and last_price <= limit_price) or \
                  (side == "sell" and last_price >= limit_price)
     if marketable:
-        # FIX T3: fill at the BETTER of market price and limit (price improvement)
-        # Buy: fill at min(last_price, limit_price); Sell: fill at max(last_price, limit_price)
+        # Price improvement: a buy never pays above its limit, a sell never
+        # receives below it, and both get the better market price when available.
         fill_px = min(last_price, limit_price) if side == "buy" else max(last_price, limit_price)
-        return {"status": "FILLED", "filled_price": round(fill_px, 6 if fill_px < 1 else 2), "alpaca_order_id": None}
-    return {"status": "ACCEPTED", "filled_price": None, "alpaca_order_id": None}
+        return {"status": "FILLED", "filled_price": round(fill_px, 6 if fill_px < 1 else 2)}
+    return {"status": "ACCEPTED", "filled_price": None}
 
 
-def check_pending_limit_fill(asset: str, side: str, limit_price: float) -> float | None:
-    """Called on read to see if a pending limit order has become marketable.
-    Returns the fill price with best-price improvement (mirrors simulate_fill).
-    FIX TR2: was returning limit_price even when market was better.
-    """
-    last_price = get_last_price(asset)
+def check_pending_limit_fill(asset: str, side: str, limit_price: float,
+                             last_price: float | None = None) -> float | None:
+    """Fill price for a resting limit order if it is now marketable, else None."""
+    if last_price is None:
+        last_price = get_last_price(asset)
     if side == "buy" and last_price <= limit_price:
         return round(min(last_price, limit_price), 6 if last_price < 1 else 2)
     if side == "sell" and last_price >= limit_price:

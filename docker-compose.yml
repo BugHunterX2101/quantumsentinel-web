@@ -16,9 +16,6 @@ services:
       - SERVER_DSA_PRIVATE_KEY=${SERVER_DSA_PRIVATE_KEY:-}
       - SERVER_DSA_PUBLIC_KEY=${SERVER_DSA_PUBLIC_KEY:-}
       - SERVER_DSA_CREATED_AT=${SERVER_DSA_CREATED_AT:-}
-      # Optional: Alpaca paper trading
-      - ALPACA_API_KEY=${ALPACA_API_KEY:-}
-      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY:-}
       - ENVIRONMENT=${ENVIRONMENT:-development}
     volumes:
       - qs_data:/data

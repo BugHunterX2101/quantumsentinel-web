@@ -241,6 +241,16 @@ class ResearchExperiment(Base):
     manifest_signature = Column(Text, nullable=False, default="")
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Provenance captured at creation / completion (manifest v2)
+    strategy_hash = Column(String(64), nullable=True)
+    dependency_lock_hash = Column(String(64), nullable=True)
+    engine_version = Column(String(32), nullable=True)
+    signing_key_id = Column(String, nullable=True)
+    # The exact manifest that was signed, stored verbatim so verification
+    # never depends on re-deriving it from lossy column types.
+    manifest_json = Column(JSON, nullable=True)
+    approved_by = Column(String, ForeignKey("users.id"), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class AuditChainLink(Base):

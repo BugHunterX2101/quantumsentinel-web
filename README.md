@@ -623,9 +623,13 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 | `GET` | `/api/exchange/book/{ticker}` | Synthetic order book seeded at the latest price |
 | `POST` | `/api/execution/analysis` | Implementation shortfall decomposition (delay + spread + impact + fees) |
 | `POST` | `/api/execution/capacity` | Strategy capacity analysis across capital sizes |
-| `POST` | `/api/experiments/create` | Create experiment with dataset/strategy/parameter hashes |
-| `GET` | `/api/experiments/{id}` | Get experiment with signed manifest |
-| `POST` | `/api/experiments/{id}/replay` | Deterministic replay — same seed/data = same hashes |
+| `POST` | `/api/experiments/create` | Create experiment; records dataset, parameter and strategy-code hashes, code commit and dependency-lock hash |
+| `GET` | `/api/experiments/{id}` | Get experiment |
+| `POST` | `/api/experiments/{id}/run` | Execute a platform strategy (`obi_momentum`) on the stored inputs; results are recorded once and the manifest is ML-DSA-signed |
+| `GET` | `/api/experiments/{id}/manifest` | The signed manifest exactly as signed, verified with the key that signed it (valid after key rotation) |
+| `POST` | `/api/experiments/{id}/replay` | Verify inputs by hash; for executable strategies, re-execute from stored inputs and compare the result hash |
+| `POST` | `/api/experiments/{id}/validate` | Integrity gates (signature, manifest consistency, inputs unchanged, result reproduced) plus deployment gates |
+| `POST` | `/api/experiments/{id}/approve` | Operator-only, four-eyes approval of a validated experiment (audit-logged) |
 | `GET` | `/api/latency/presets` | List all latency presets (zero → retail, 0ms → 50ms) |
 
 ### Research Report — 7-Section JSON Structure

@@ -2293,28 +2293,36 @@ def cpp_status_endpoint(user: models.User = Depends(get_current_user)):
 # Market Microstructure endpoints
 # --------------------------------------------------------------------------
 
-@app.get("/api/microstructure/snapshot/{ticker}", status_code=200)
-def microstructure_snapshot(ticker: str, levels: int = 10, user: models.User = Depends(get_current_user)):
-    """Generate a synthetic order-book snapshot for a ticker.
+def _synthetic_tick(price: float) -> float:
+    """Tick grid for a synthetic book seeded at ``price``."""
+    return 0.0001 if price < 1 else 0.01
 
-    Uses the latest cached price to seed the synthetic L2 generator,
-    then returns the snapshot with analytics (OBI, microprice, spread, depth).
+
+def _seed_bar(price: float, spread_pct: float, volume: float) -> dict:
+    # Simulation clocks start at 0 so a given seed reproduces the same result.
+    return {"timestamp": 0.0, "open": price, "high": price * (1 + spread_pct),
+            "low": price * (1 - spread_pct), "close": price, "volume": volume}
+
+
+@app.get("/api/microstructure/snapshot/{ticker}", status_code=200)
+def microstructure_snapshot(ticker: str, levels: int = Query(10, ge=1, le=50),
+                            user: models.User = Depends(get_current_user)):
+    """SYNTHETIC order-book snapshot seeded at the latest price.
+
+    The book is generated, not observed venue depth; analytics (OBI,
+    microprice, spread, depth) describe that synthetic book.
     """
-    from .services.market_microstructure import (
-        generate_synthetic_l2, build_snapshot_from_events, snapshot_to_dict,
-    )
+    from .services.market_microstructure import generate_synthetic_l2, build_snapshot_from_events, snapshot_to_dict
     price_data = signal_engine.get_live_price(ticker)
     if not price_data or not price_data.get("price"):
         raise HTTPException(404, f"No price data for {ticker}")
-    price = price_data["price"]
-    bar = {
-        "timestamp": time.time(),
-        "open": price * 0.999, "high": price * 1.002,
-        "low": price * 0.998, "close": price, "volume": 50_000,
-    }
-    events = generate_synthetic_l2([bar], levels=levels, seed=int(price * 100))
-    snap = build_snapshot_from_events(events, levels=levels)
-    return snapshot_to_dict(snap)
+    price = float(price_data["price"])
+    tick = _synthetic_tick(price)
+    events = generate_synthetic_l2([_seed_bar(price, 0.002, 50_000)], levels=levels,
+                                   seed=int(price * 100), tick_size=tick)
+    d = snapshot_to_dict(build_snapshot_from_events(events, levels=levels, tick_size=tick))
+    d.update({"symbol": ticker.upper(), "data_source": "synthetic", "reference_price": price, "tick_size": tick})
+    return d
 
 
 @app.post("/api/microstructure/analytics", status_code=200)
@@ -2330,9 +2338,18 @@ def microstructure_analytics(request_body: dict, user: models.User = Depends(get
         compute_spread_bps, compute_depth, compute_mid_price,
         compute_microprice_deviation,
     )
-    bids = [PriceLevel(b["price"], b["size"]) for b in request_body.get("bids", [])]
-    asks = [PriceLevel(a["price"], a["size"]) for a in request_body.get("asks", [])]
-    levels = request_body.get("levels", 5)
+    try:
+        bids = sorted((PriceLevel(float(b["price"]), float(b["size"])) for b in request_body.get("bids", [])),
+                      key=lambda lvl: -lvl.price)
+        asks = sorted((PriceLevel(float(a["price"]), float(a["size"])) for a in request_body.get("asks", [])),
+                      key=lambda lvl: lvl.price)
+        levels = int(request_body.get("levels", 5))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(422, "bids/asks must be lists of {price, size} numbers") from exc
+    if any(lvl.price <= 0 or lvl.size < 0 for lvl in bids + asks):
+        raise HTTPException(422, "prices must be positive and sizes non-negative")
+    if bids and asks and bids[0].price >= asks[0].price:
+        raise HTTPException(422, "book is crossed or locked (best bid >= best ask)")
     snap = OrderBookSnapshot(timestamp=time.time(), bids=bids, asks=asks)
     return {
         "mid_price": compute_mid_price(snap),
@@ -2346,97 +2363,112 @@ def microstructure_analytics(request_body: dict, user: models.User = Depends(get
 
 
 @app.post("/api/microstructure/replay", status_code=200)
-def microstructure_replay(request_body: dict, user: models.User = Depends(get_current_user)):
-    """Replay L2 events through the OBI-momentum strategy.
+def microstructure_replay(req: schemas.MicrostructureReplayRequest,
+                          user: models.User = Depends(get_current_user)):
+    """Replay SYNTHETIC L2 (generated from the given OHLCV bars) through the
+    OBI-momentum strategy.
 
-    Accepts ``bars`` (OHLCV list) and optional ``seed``, ``events_per_bar``,
-    ``obi_threshold`` parameters.
+    With ``execute`` the strategy trades through the paper exchange —
+    latency preset, queue-aware matching, fills, portfolio and execution
+    analytics are returned. Deterministic for a given seed.
     """
-    from .services.l2_event_replay import (
-        L2EventStream, ReplayConfig, replay_session, obi_momentum_strategy,
+    from .services.l2_event_replay import L2EventStream, ReplayConfig, replay_session, obi_momentum_strategy
+    from .services.latency_model import LATENCY_PRESETS
+    from .services.paper_exchange import PaperExchange
+    if req.latency_preset not in LATENCY_PRESETS:
+        raise HTTPException(422, f"latency_preset must be one of {sorted(LATENCY_PRESETS)}")
+    stream = L2EventStream.from_synthetic([b.model_dump() for b in req.bars], seed=req.seed,
+                                          events_per_bar=req.events_per_bar, tick_size=req.tick_size)
+    config = ReplayConfig(
+        snapshot_interval=req.snapshot_interval, warmup_events=req.warmup_events,
+        tick_size=req.tick_size, order_quantity=req.order_quantity, order_style=req.order_style,
+        cancel_after_events=req.cancel_after_events,
     )
-    bars = request_body.get("bars", [])
-    if not bars:
-        raise HTTPException(400, "bars list is required")
-    seed = request_body.get("seed", 42)
-    events_per_bar = request_body.get("events_per_bar", 50)
-    obi_threshold = request_body.get("obi_threshold", 0.3)
-    stream = L2EventStream.from_synthetic(bars, seed=seed, events_per_bar=events_per_bar)
+    exchange = None
+    if req.execute:
+        exchange = PaperExchange(symbol="SYNTHETIC", tick_size=req.tick_size,
+                                 latency_ms=LATENCY_PRESETS[req.latency_preset].total_latency_ms)
 
     def strategy(snap, trades):
-        return obi_momentum_strategy(snap, trades, obi_threshold=obi_threshold)
+        return obi_momentum_strategy(snap, trades, obi_threshold=req.obi_threshold)
 
-    config = ReplayConfig(
-        snapshot_interval=request_body.get("snapshot_interval", 10),
-        warmup_events=request_body.get("warmup_events", 50),
-    )
-    result = replay_session(stream, strategy_fn=strategy, config=config)
-    return result.to_dict()
+    result = replay_session(stream, strategy_fn=strategy, config=config, exchange=exchange).to_dict()
+    result["latency_preset"] = req.latency_preset
+    return result
 
 
 # --------------------------------------------------------------------------
-# Paper Exchange endpoints
+# Paper Exchange (research simulation) endpoints
 # --------------------------------------------------------------------------
+
+_SEED_EVENTS = 60
+
 
 @app.post("/api/exchange/order", status_code=200)
-def exchange_submit_order(request_body: dict, user: models.User = Depends(get_current_user)):
-    """Submit a paper order to the exchange.
+def exchange_submit_order(req: schemas.ExchangeSimulationRequest,
+                          user: models.User = Depends(get_current_user)):
+    """Simulate one paper order against a SYNTHETIC L2 book.
 
-    Accepts ``symbol``, ``side`` (BUY/SELL), ``quantity``, ``order_type``
-    (market/limit/stop/stop_limit), optional ``limit_price``, ``stop_price``.
+    A book is generated around the latest price, the order is submitted
+    (after ``latency_ms``), and ``flow_events`` further synthetic events are
+    replayed so a resting order can fill through its queue. Deterministic
+    for a given seed. This is a research simulation: it never touches the
+    user's paper account, and starting cash is fixed server-side.
     """
-    from .services.paper_exchange import PaperExchange, TradingMode
+    from .services.market_microstructure import TradeSide, generate_synthetic_l2
     from .services.order_book import OrderType, TimeInForce
-    from .services.market_microstructure import TradeSide
+    from .services.paper_exchange import PaperExchange, PaperPosition, TradingMode
 
-    symbol = request_body.get("symbol", "AAPL")
-    exchange = PaperExchange(symbol=symbol, initial_cash=request_body.get("initial_cash", 100_000))
-
-    # Seed book with synthetic liquidity from current price
-    price_data = signal_engine.get_live_price(symbol)
-    if price_data and price_data.get("price"):
-        from .services.order_book import Order
-        price = price_data["price"]
-        for i in range(5):
-            exchange.book.add_order(Order(
-                symbol=symbol, side=TradeSide.SELL, order_type=OrderType.LIMIT,
-                quantity=100 * (i + 1), limit_price=round(price * (1 + 0.001 * (i + 1)), 2),
-            ))
-            exchange.book.add_order(Order(
-                symbol=symbol, side=TradeSide.BUY, order_type=OrderType.LIMIT,
-                quantity=100 * (i + 1), limit_price=round(price * (1 - 0.001 * (i + 1)), 2),
-            ))
-
-    side = TradeSide(request_body.get("side", "BUY"))
+    price_data = signal_engine.get_live_price(req.symbol)
+    if not price_data or not price_data.get("price"):
+        raise HTTPException(404, f"No price data for {req.symbol}")
+    price = float(price_data["price"])
+    tick = req.tick_size or _synthetic_tick(price)
+    events = generate_synthetic_l2([_seed_bar(price, 0.003, 100_000)], seed=req.seed,
+                                   events_per_bar=_SEED_EVENTS + req.flow_events, tick_size=tick)
+    exchange = PaperExchange(symbol=req.symbol, latency_ms=req.latency_ms, tick_size=tick)
+    for event in events[:_SEED_EVENTS]:
+        exchange.on_market_event(event)
+    if req.initial_position > 0:
+        basis = exchange.book.mid_price or price
+        exchange.positions[req.symbol] = PaperPosition(symbol=req.symbol, quantity=req.initial_position,
+                                                       avg_entry_price=basis)
     order = exchange.submit_order(
-        side=side,
-        quantity=float(request_body.get("quantity", 1)),
-        order_type=OrderType(request_body.get("order_type", "market")),
-        limit_price=request_body.get("limit_price"),
-        stop_price=request_body.get("stop_price"),
+        side=TradeSide(req.side), quantity=req.quantity, order_type=OrderType(req.order_type),
+        limit_price=req.limit_price, stop_price=req.stop_price,
+        time_in_force=TimeInForce(req.time_in_force),
     )
+    for event in events[_SEED_EVENTS:]:
+        exchange.on_market_event(event)
+    exchange.advance_to(exchange.current_time + req.latency_ms / 1000.0)
     return {
+        "data_source": "synthetic",
+        "reference_price": price,
+        "tick_size": tick,
+        "seed": req.seed,
         "order": order.to_dict(),
+        "order_events": [e.to_dict() for e in exchange.event_log if e.order_id == order.order_id],
+        "fills": [f.to_dict() for f in exchange.fill_history],
         "portfolio": exchange.portfolio_summary(),
         "exchange_stats": exchange.exchange_stats(),
+        "execution": exchange.execution_report(),
         "trading_mode": TradingMode.PAPER.value,
     }
 
 
 @app.get("/api/exchange/book/{ticker}", status_code=200)
 def exchange_book(ticker: str, user: models.User = Depends(get_current_user)):
-    """Return a synthetic order book for a ticker."""
+    """SYNTHETIC order book seeded at the latest price (not venue depth)."""
     from .services.market_microstructure import generate_synthetic_l2, build_snapshot_from_events, snapshot_to_dict
     price_data = signal_engine.get_live_price(ticker)
     if not price_data or not price_data.get("price"):
         raise HTTPException(404, f"No price data for {ticker}")
-    price = price_data["price"]
-    bar = {"timestamp": time.time(), "open": price, "high": price * 1.003,
-           "low": price * 0.997, "close": price, "volume": 100_000}
-    events = generate_synthetic_l2([bar], levels=10, seed=int(price * 100), events_per_bar=100)
-    snap = build_snapshot_from_events(events, levels=10)
-    d = snapshot_to_dict(snap)
-    d["symbol"] = ticker
+    price = float(price_data["price"])
+    tick = _synthetic_tick(price)
+    events = generate_synthetic_l2([_seed_bar(price, 0.003, 100_000)], levels=10,
+                                   seed=int(price * 100), events_per_bar=100, tick_size=tick)
+    d = snapshot_to_dict(build_snapshot_from_events(events, levels=10, tick_size=tick))
+    d.update({"symbol": ticker.upper(), "data_source": "synthetic", "reference_price": price, "tick_size": tick})
     return d
 
 

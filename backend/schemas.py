@@ -809,3 +809,87 @@ class ReportRequest(BaseModel):
             raise ValueError(f"strategy_type must be one of {valid}")
         return v
 
+
+
+# ---------------------------------------------------------------------------
+# Market microstructure / paper-exchange simulation
+# ---------------------------------------------------------------------------
+
+class OHLCVBar(BaseModel):
+    timestamp: float
+    open: float = Field(gt=0)
+    high: float = Field(gt=0)
+    low: float = Field(gt=0)
+    close: float = Field(gt=0)
+    volume: float = Field(default=10_000, ge=0)
+
+    @model_validator(mode="after")
+    def consistent_range(self):
+        if not self.low <= min(self.open, self.close) <= max(self.open, self.close) <= self.high:
+            raise ValueError("bar must satisfy low <= open, close <= high")
+        return self
+
+
+class MicrostructureReplayRequest(BaseModel):
+    bars: list[OHLCVBar] = Field(min_length=1, max_length=500)
+    seed: int = 42
+    events_per_bar: int = Field(default=50, ge=2, le=500)
+    obi_threshold: float = Field(default=0.3, gt=0, lt=1)
+    snapshot_interval: int = Field(default=10, ge=1, le=10_000)
+    warmup_events: int = Field(default=50, ge=0)
+    tick_size: float = Field(default=0.01, gt=0, le=100)
+    # Closed-loop execution through the paper exchange
+    execute: bool = False
+    order_quantity: float = Field(default=100, gt=0, le=1_000_000)
+    order_style: Literal["aggressive", "passive"] = "aggressive"
+    cancel_after_events: int | None = Field(default=None, ge=1)
+    latency_preset: str = "zero"
+
+    @model_validator(mode="after")
+    def bounded_work(self):
+        if len(self.bars) * self.events_per_bar > 100_000:
+            raise ValueError("bars x events_per_bar must not exceed 100,000 events")
+        return self
+
+
+class ExchangeSimulationRequest(BaseModel):
+    """One paper order simulated against a synthetic L2 book.
+
+    Starting cash is fixed server-side; unknown fields (e.g. ``initial_cash``)
+    are rejected rather than silently ignored.
+    """
+    model_config = {"extra": "forbid"}
+
+    symbol: str = Field(default="AAPL", min_length=1, max_length=20)
+    side: str = "BUY"
+    quantity: float = Field(default=1, gt=0, le=1_000_000)
+    order_type: Literal["market", "limit", "stop", "stop_limit"] = "market"
+    limit_price: float | None = Field(default=None, gt=0)
+    stop_price: float | None = Field(default=None, gt=0)
+    time_in_force: str = "GTC"
+    seed: int = 42
+    flow_events: int = Field(default=200, ge=0, le=5_000)
+    latency_ms: float = Field(default=0, ge=0, le=10_000)
+    tick_size: float | None = Field(default=None, gt=0, le=100)
+    initial_position: float = Field(default=0, ge=0, le=1_000_000)
+
+    @field_validator("symbol")
+    @classmethod
+    def normalized_symbol(cls, value: str) -> str:
+        return OrderRequest.normalized_asset(value)
+
+    @field_validator("side")
+    @classmethod
+    def valid_side(cls, value: str) -> str:
+        value = value.upper()
+        if value not in {"BUY", "SELL"}:
+            raise ValueError("side must be BUY or SELL")
+        return value
+
+    @field_validator("time_in_force")
+    @classmethod
+    def valid_tif(cls, value: str) -> str:
+        value = value.upper()
+        if value not in {"DAY", "GTC", "IOC", "FOK"}:
+            raise ValueError("time_in_force must be DAY, GTC, IOC or FOK")
+        return value

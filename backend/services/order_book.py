@@ -1,23 +1,37 @@
 """QuantumSentinel — L2 Order Book.
 
-In-memory limit order book with price-time priority, supporting the
-paper exchange's queue-aware matching engine.
+In-memory limit order book with price-time priority for the research paper
+exchange.
 
-The book maintains sorted bid/ask sides with O(log n) insert/delete.
-Each price level is a FIFO queue of resting orders, enabling realistic
-queue-position tracking for paper-trading simulation.
+Design
+------
+* **Integer ticks.** Price levels are keyed by ``round(price / tick_size)``,
+  so 100.1, 100.10 and 100.100000001 are the same level. Prices are exposed
+  as ``ticks * tick_size`` rounded to the tick's decimal places.
+* **Explicit ownership.** Every resting order is either ``MARKET`` liquidity
+  (replayed from the L2 feed, or seeded) or a ``PAPER`` order (ours). Both
+  sit in one FIFO queue per level, in arrival order, which is what gives a
+  paper order a meaningful queue position.
+* **Queue position is derived, not decremented.** ``queue_ahead`` is the
+  remaining size of everything in front of the order in its level's FIFO,
+  recomputed whenever the level changes. Fills or cancels of orders ahead
+  therefore advance every order behind them.
+* **Full event model.** ``apply_market_event`` handles ADD, CANCEL, MODIFY
+  and TRADE, so replaying a feed evolves the book like the venue's book.
 """
 
 from __future__ import annotations
 
+import bisect
 import time
 import uuid
-from collections import OrderedDict
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
-from typing import Iterator
 
 from backend.services.market_microstructure import (
+    BookEvent,
+    BookEventType,
     OrderBookSnapshot,
     PriceLevel,
     TradeSide,
@@ -53,13 +67,21 @@ class TimeInForce(str, Enum):
     FOK = "FOK"       # Fill or kill
 
 
+class Owner(str, Enum):
+    MARKET = "MARKET"   # liquidity from the replayed feed (or seeded)
+    PAPER = "PAPER"     # our simulated orders
+
+
+_EPS = 1e-9
+
+
 # ---------------------------------------------------------------------------
 # Order
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Order:
-    """A paper-trading order with queue-position tracking."""
+    """A resting or working order with queue-position tracking."""
     order_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
     symbol: str = ""
     side: TradeSide = TradeSide.BUY
@@ -70,8 +92,9 @@ class Order:
     time_in_force: TimeInForce = TimeInForce.GTC
     submitted_at: float = field(default_factory=time.time)
     expires_at: float | None = None
+    owner: Owner = Owner.MARKET
 
-    # -- Mutable state (managed by matching engine) --
+    # -- Mutable state (managed by the book / matching engine) --
     status: OrderStatus = OrderStatus.SUBMITTED
     filled_quantity: float = 0.0
     avg_fill_price: float = 0.0
@@ -80,6 +103,7 @@ class Order:
     queue_ahead_peak: float = 0.0
     entered_book_at: float | None = None
     filled_at: float | None = None
+    active_at: float | None = None   # when the order reaches the exchange (latency)
 
     @property
     def remaining_quantity(self) -> float:
@@ -93,11 +117,14 @@ class Order:
             OrderStatus.PARTIALLY_FILLED,
         )
 
-    @property
-    def time_in_queue(self) -> float | None:
-        if self.entered_book_at is None:
-            return None
-        return time.time() - self.entered_book_at
+    def record_fill(self, price: float, quantity: float, timestamp: float) -> None:
+        """Apply one execution: volume-weighted average price and status."""
+        previous = self.filled_quantity
+        self.filled_quantity = previous + quantity
+        self.avg_fill_price = (self.avg_fill_price * previous + price * quantity) / self.filled_quantity
+        self.filled_at = timestamp
+        self.status = (OrderStatus.FILLED if self.remaining_quantity <= _EPS
+                       else OrderStatus.PARTIALLY_FILLED)
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +143,7 @@ class Order:
             "queue_ahead": self.queue_ahead,
             "queue_ahead_at_entry": self.queue_ahead_at_entry,
             "submitted_at": self.submitted_at,
+            "active_at": self.active_at,
         }
 
 
@@ -125,13 +153,14 @@ class Order:
 
 @dataclass(slots=True)
 class Fill:
-    """A single fill event from the matching engine."""
+    """A single execution of one order."""
     order_id: str
     fill_price: float
     fill_quantity: float
     timestamp: float
     is_partial: bool = False
     aggressor: bool = False
+    side: TradeSide | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -140,6 +169,8 @@ class Fill:
             "fill_quantity": round(self.fill_quantity, 8),
             "timestamp": self.timestamp,
             "is_partial": self.is_partial,
+            "liquidity": "taker" if self.aggressor else "maker",
+            "side": self.side.value if self.side else None,
         }
 
 
@@ -149,13 +180,18 @@ class Fill:
 
 @dataclass
 class LevelQueue:
-    """FIFO queue of orders at a single price level."""
+    """FIFO queue of orders (market and paper) at one price level."""
     price: float
+    ticks: int = 0
     orders: list[Order] = field(default_factory=list)
 
     @property
     def total_size(self) -> float:
         return sum(o.remaining_quantity for o in self.orders)
+
+    @property
+    def market_size(self) -> float:
+        return sum(o.remaining_quantity for o in self.orders if o.owner == Owner.MARKET)
 
     def add(self, order: Order) -> None:
         self.orders.append(order)
@@ -167,7 +203,16 @@ class LevelQueue:
         return None
 
     def is_empty(self) -> bool:
-        return len(self.orders) == 0 or self.total_size <= 0
+        return self.total_size <= _EPS
+
+    def refresh_queue_positions(self) -> None:
+        """queue_ahead of each paper order = remaining size in front of it."""
+        ahead = 0.0
+        for o in self.orders:
+            if o.owner == Owner.PAPER:
+                o.queue_ahead = ahead
+                o.queue_ahead_peak = max(o.queue_ahead_peak, ahead)
+            ahead += o.remaining_quantity
 
 
 # ---------------------------------------------------------------------------
@@ -175,49 +220,90 @@ class LevelQueue:
 # ---------------------------------------------------------------------------
 
 class OrderBook:
-    """In-memory L2 limit order book with price-time priority.
+    """L2 limit order book with price-time priority on an integer tick grid."""
 
-    Bid side: sorted descending by price (best bid first).
-    Ask side: sorted ascending by price (best ask first).
-
-    Each price level maintains a FIFO queue of resting orders.
-    """
-
-    def __init__(self, symbol: str = ""):
+    def __init__(self, symbol: str = "", tick_size: float = 0.01):
+        if tick_size <= 0:
+            raise ValueError("tick_size must be positive")
         self.symbol = symbol
-        self._bids: dict[float, LevelQueue] = {}  # price -> queue
-        self._asks: dict[float, LevelQueue] = {}
-        self._orders: dict[str, Order] = {}        # order_id -> order
+        self.tick_size = tick_size
+        self._decimals = max(0, -Decimal(str(tick_size)).normalize().as_tuple().exponent)
+        self._bids: dict[int, LevelQueue] = {}
+        self._asks: dict[int, LevelQueue] = {}
+        self._bid_ticks: list[int] = []   # ascending; best bid is last
+        self._ask_ticks: list[int] = []   # ascending; best ask is first
+        self._orders: dict[str, Order] = {}
         self._last_trade_price: float | None = None
         self._last_trade_size: float | None = None
+        self._last_event_time: float = 0.0
+
+    # ---- Tick grid ------------------------------------------------------
+
+    def to_ticks(self, price: float) -> int:
+        return int(round(price / self.tick_size))
+
+    def from_ticks(self, ticks: int) -> float:
+        return round(ticks * self.tick_size, self._decimals)
+
+    def is_on_grid(self, price: float) -> bool:
+        units = price / self.tick_size
+        return abs(units - round(units)) < 1e-6
+
+    # ---- Level bookkeeping ----------------------------------------------
+
+    def _side(self, side: TradeSide) -> tuple[dict[int, LevelQueue], list[int]]:
+        return (self._bids, self._bid_ticks) if side == TradeSide.BUY else (self._asks, self._ask_ticks)
+
+    def _level(self, side: TradeSide, ticks: int, create: bool = False) -> LevelQueue | None:
+        levels, keys = self._side(side)
+        level = levels.get(ticks)
+        if level is None and create:
+            level = LevelQueue(price=self.from_ticks(ticks), ticks=ticks)
+            levels[ticks] = level
+            bisect.insort(keys, ticks)
+        return level
+
+    def _prune(self, side: TradeSide, ticks: int) -> None:
+        """Drop exhausted orders from a level, refresh queues, drop empty level."""
+        levels, keys = self._side(side)
+        level = levels.get(ticks)
+        if level is None:
+            return
+        kept = []
+        for o in level.orders:
+            if o.remaining_quantity > _EPS and o.is_active:
+                kept.append(o)
+            elif o.owner == Owner.MARKET:
+                # Paper orders stay addressable after completion; exhausted
+                # feed orders are dropped so long replays don't grow memory.
+                self._orders.pop(o.order_id, None)
+        level.orders = kept
+        level.refresh_queue_positions()
+        if not level.orders:
+            del levels[ticks]
+            idx = bisect.bisect_left(keys, ticks)
+            if idx < len(keys) and keys[idx] == ticks:
+                keys.pop(idx)
 
     # ---- Sorted level accessors -----------------------------------------
 
     @property
     def bid_levels(self) -> list[LevelQueue]:
-        """Bid levels sorted best-first (descending price)."""
-        return sorted(
-            (q for q in self._bids.values() if not q.is_empty()),
-            key=lambda q: -q.price,
-        )
+        """Bid levels best-first (descending price)."""
+        return [self._bids[t] for t in reversed(self._bid_ticks)]
 
     @property
     def ask_levels(self) -> list[LevelQueue]:
-        """Ask levels sorted best-first (ascending price)."""
-        return sorted(
-            (q for q in self._asks.values() if not q.is_empty()),
-            key=lambda q: q.price,
-        )
+        """Ask levels best-first (ascending price)."""
+        return [self._asks[t] for t in self._ask_ticks]
 
     @property
     def best_bid(self) -> float | None:
-        levels = self.bid_levels
-        return levels[0].price if levels else None
+        return self.from_ticks(self._bid_ticks[-1]) if self._bid_ticks else None
 
     @property
     def best_ask(self) -> float | None:
-        levels = self.ask_levels
-        return levels[0].price if levels else None
+        return self.from_ticks(self._ask_ticks[0]) if self._ask_ticks else None
 
     @property
     def mid_price(self) -> float | None:
@@ -233,59 +319,49 @@ class OrderBook:
             return None
         return ba - bb
 
-    # ---- Order management -----------------------------------------------
+    # ---- Resting orders -------------------------------------------------
 
     def add_order(self, order: Order, timestamp: float | None = None) -> None:
-        """Add a resting order to the book.
+        """Rest an order at the back of its price level's FIFO.
 
-        ``timestamp``, when given, should be on the same clock as the
-        caller's other order timestamps (e.g. simulated replay time during
-        a backtest) so that later fill-time analytics aren't comparing
-        wall-clock and simulated time. Defaults to wall-clock for callers
-        that don't track their own clock.
+        ``timestamp`` should be on the caller's clock (simulated time during
+        a replay) so later fill-time analytics compare like with like.
         """
-        side_book = self._bids if order.side == TradeSide.BUY else self._asks
-        price = order.limit_price
-        if price is None:
-            return  # Market orders don't rest
-
-        if price not in side_book:
-            side_book[price] = LevelQueue(price=price)
-
-        # Calculate queue-ahead (total resting volume at this price before us)
-        queue_ahead = side_book[price].total_size
-        order.queue_ahead = queue_ahead
-        order.queue_ahead_at_entry = queue_ahead
-        order.queue_ahead_peak = queue_ahead
+        if order.limit_price is None:
+            return  # market orders never rest
+        ticks = self.to_ticks(order.limit_price)
+        if order.owner == Owner.MARKET:
+            order.limit_price = self.from_ticks(ticks)  # feed noise snaps to the grid
+        level = self._level(order.side, ticks, create=True)
+        ahead = level.total_size
+        order.queue_ahead = ahead
+        order.queue_ahead_at_entry = ahead
+        order.queue_ahead_peak = ahead
         order.entered_book_at = timestamp if timestamp is not None else time.time()
-        # A marketable limit order can partially fill before resting the
-        # remainder — don't stomp that PARTIALLY_FILLED status with QUEUED.
+        # A marketable limit that partially filled before resting keeps
+        # its PARTIALLY_FILLED status.
         if order.filled_quantity <= 0:
             order.status = OrderStatus.QUEUED
-
-        side_book[price].add(order)
+        level.add(order)
         self._orders[order.order_id] = order
 
     def cancel_order(self, order_id: str) -> Order | None:
-        """Cancel a resting order and remove from book."""
+        """Cancel a resting order and remove it from its level."""
         order = self._orders.get(order_id)
-        if order is None or not order.is_active:
+        if order is None or not order.is_active or order.limit_price is None:
             return None
-
-        side_book = self._bids if order.side == TradeSide.BUY else self._asks
-        price = order.limit_price
-        if price and price in side_book:
-            side_book[price].remove(order_id)
-            if side_book[price].is_empty():
-                del side_book[price]
-
+        ticks = self.to_ticks(order.limit_price)
+        level = self._level(order.side, ticks)
         order.status = OrderStatus.CANCELLED
+        if level is not None:
+            level.remove(order_id)
+            self._prune(order.side, ticks)
         return order
 
     def get_order(self, order_id: str) -> Order | None:
         return self._orders.get(order_id)
 
-    # ---- Book consumption (for market orders) ---------------------------
+    # ---- Aggressive execution (our marketable orders) -------------------
 
     def consume_liquidity(
         self,
@@ -293,196 +369,177 @@ class OrderBook:
         quantity: float,
         timestamp: float,
         limit_price: float | None = None,
+        skip_paper: bool = True,
     ) -> list[Fill]:
-        """Consume liquidity from the opposite side of the book.
+        """Execute an aggressor of ``side`` against the opposite side.
 
-        For a BUY aggressor, consume from asks (ascending price).
-        For a SELL aggressor, consume from bids (descending price).
+        Walks levels best-first and FIFO within each level. ``limit_price``
+        bounds the sweep (a limit order never trades through its limit).
+        ``skip_paper`` prevents our own resting paper orders from being
+        matched by our own aggressor (self-trade prevention).
 
-        ``limit_price``, when given, bounds the sweep: a BUY will never
-        consume a level priced above it, and a SELL will never consume a
-        level priced below it (a limit order must never trade through its
-        own limit). Leave it ``None`` for an unbounded market-order sweep.
-
-        Returns a list of fills generated.
+        Returns one Fill per resting order touched, priced at its level; the
+        fills' ``order_id`` is the *resting* order's id.
         """
-        levels = self.ask_levels if side == TradeSide.BUY else self.bid_levels
+        opposite = TradeSide.SELL if side == TradeSide.BUY else TradeSide.BUY
+        levels, keys = self._side(opposite)
+        ordered = list(keys) if side == TradeSide.BUY else list(reversed(keys))
+        limit_ticks = self.to_ticks(limit_price) if limit_price is not None else None
         fills: list[Fill] = []
         remaining = quantity
 
-        for level in levels:
-            if remaining <= 0:
+        for ticks in ordered:
+            if remaining <= _EPS:
                 break
-            if limit_price is not None:
-                if side == TradeSide.BUY and level.price > limit_price:
+            if limit_ticks is not None:
+                if side == TradeSide.BUY and ticks > limit_ticks:
                     break
-                if side == TradeSide.SELL and level.price < limit_price:
+                if side == TradeSide.SELL and ticks < limit_ticks:
                     break
-
-            orders_to_remove = []
-            for order in level.orders:
-                if remaining <= 0:
+            level = levels[ticks]
+            for resting in list(level.orders):
+                if remaining <= _EPS:
                     break
-
-                fill_qty = min(remaining, order.remaining_quantity)
-                order.filled_quantity += fill_qty
-                remaining -= fill_qty
-
-                is_fully_filled = order.remaining_quantity <= 0
-                if is_fully_filled:
-                    order.status = OrderStatus.FILLED
-                    orders_to_remove.append(order.order_id)
-                else:
-                    order.status = OrderStatus.PARTIALLY_FILLED
-                order.filled_at = timestamp
-
-                order.avg_fill_price = (
-                    (order.avg_fill_price * (order.filled_quantity - fill_qty) +
-                     level.price * fill_qty) / order.filled_quantity
-                )
-
-                fills.append(Fill(
-                    order_id=order.order_id,
-                    fill_price=level.price,
-                    fill_quantity=fill_qty,
-                    timestamp=timestamp,
-                    is_partial=not is_fully_filled,
-                ))
-
-            # Clean up fully filled orders
-            for oid in orders_to_remove:
-                level.remove(oid)
-
-        # Clean up empty levels
-        side_book = self._asks if side == TradeSide.BUY else self._bids
-        empty_prices = [p for p, q in side_book.items() if q.is_empty()]
-        for p in empty_prices:
-            del side_book[p]
+                if skip_paper and resting.owner == Owner.PAPER:
+                    continue
+                qty = min(remaining, resting.remaining_quantity)
+                if qty <= _EPS:
+                    continue
+                resting.record_fill(level.price, qty, timestamp)
+                remaining -= qty
+                fills.append(Fill(order_id=resting.order_id, fill_price=level.price,
+                                  fill_quantity=qty, timestamp=timestamp,
+                                  is_partial=resting.status != OrderStatus.FILLED,
+                                  side=resting.side))
+            self._prune(opposite, ticks)
 
         if fills:
             self._last_trade_price = fills[-1].fill_price
             self._last_trade_size = sum(f.fill_quantity for f in fills)
-
         return fills
 
-    # ---- Queue updates (when external trades occur at a price level) ----
+    # ---- Market data (L2 feed) ------------------------------------------
 
-    def update_queue_positions(
-        self,
-        price: float,
-        executed_volume: float,
-        side: TradeSide,
-        timestamp: float | None = None,
-    ) -> list[Fill]:
-        """Update queue positions when an external trade occurs at a level.
+    def market_depth(self, side: TradeSide, price: float) -> float:
+        level = self._level(side, self.to_ticks(price))
+        return level.market_size if level else 0.0
 
-        When an execution event arrives at a price on our side, we
-        decrement ``queue_ahead`` for each resting order.  If queue_ahead
-        drops to zero, the order fills.
+    def apply_market_event(self, event: BookEvent) -> list[Fill]:
+        """Apply one L2 feed event to the book.
 
-        ``timestamp`` should be on the same clock the caller used for
-        ``entered_book_at`` (see ``add_order``), so fill-time analytics
-        aren't comparing wall-clock and simulated time. Defaults to
-        wall-clock when not given.
+        ADD / CANCEL / MODIFY change market liquidity on ``event.side``
+        (the side of the resting order). A CANCEL or MODIFY that names a
+        known order changes that order; otherwise (aggregated L2) the change
+        is spread over the level's market orders in proportion to their
+        size — the unbiased estimate of where in the queue it happened.
+
+        TRADE is an aggressor of ``event.side`` printing ``event.size`` at
+        ``event.price``. It consumes the passive side FIFO, best level first,
+        through every level at or better than the print. Resting paper
+        orders in its path are filled at their own price: an order priced
+        through the print would have had priority, so it fills too.
+
+        Returns the fills of resting paper orders caused by the event.
         """
-        side_book = self._bids if side == TradeSide.BUY else self._asks
-        if price not in side_book:
+        self._last_event_time = event.timestamp
+        ticks = self.to_ticks(event.price)
+        et = event.event_type
+
+        if et == BookEventType.ADD:
+            if event.size > _EPS:
+                self.add_order(Order(
+                    order_id=event.order_id or uuid.uuid4().hex[:16], symbol=self.symbol,
+                    side=event.side, order_type=OrderType.LIMIT, quantity=event.size,
+                    limit_price=self.from_ticks(ticks), submitted_at=event.timestamp,
+                    owner=Owner.MARKET,
+                ), timestamp=event.timestamp)
             return []
 
-        level = side_book[price]
-        fills: list[Fill] = []
-        remaining_exec = executed_volume
-        ts = timestamp if timestamp is not None else time.time()
-
-        for order in list(level.orders):
-            if remaining_exec <= 0:
-                break
-
-            if order.queue_ahead > 0:
-                deducted = min(order.queue_ahead, remaining_exec)
-                order.queue_ahead -= deducted
-                remaining_exec -= deducted
-
-                if order.queue_ahead <= 0:
-                    # Our order is at the front. Only the trade volume left
-                    # over *after* clearing the phantom queue ahead of us
-                    # can fill us — adding `deducted` back here would count
-                    # that volume twice (once against the queue, once
-                    # against our own order), fabricating fills beyond what
-                    # the trade actually executed.
-                    fill_qty = min(order.remaining_quantity, remaining_exec)
-                    if fill_qty <= 0:
-                        # Queue exactly cleared with no leftover volume —
-                        # we're now at the front but not yet executed.
-                        continue
-
-                    order.filled_quantity += fill_qty
-                    remaining_exec -= fill_qty
-                    is_full = order.remaining_quantity <= 0
-                    order.status = OrderStatus.FILLED if is_full else OrderStatus.PARTIALLY_FILLED
-                    order.filled_at = ts
-
-                    order.avg_fill_price = (
-                        (order.avg_fill_price * (order.filled_quantity - fill_qty) +
-                         price * fill_qty) / order.filled_quantity
-                        if order.filled_quantity > 0 else price
-                    )
-
-                    fills.append(Fill(
-                        order_id=order.order_id,
-                        fill_price=price,
-                        fill_quantity=fill_qty,
-                        timestamp=ts,
-                        is_partial=not is_full,
-                    ))
-
-                    if is_full:
-                        level.remove(order.order_id)
+        if et in (BookEventType.CANCEL, BookEventType.MODIFY):
+            level = self._level(event.side, ticks)
+            if level is None:
+                if et == BookEventType.MODIFY and event.size > _EPS:
+                    return self.apply_market_event(BookEvent(event.timestamp, BookEventType.ADD,
+                                                             event.side, event.price, event.size,
+                                                             event.order_id))
+                return []
+            known = self._orders.get(event.order_id) if event.order_id else None
+            if known is not None and known.owner == Owner.MARKET and any(o is known for o in level.orders):
+                if et == BookEventType.CANCEL:
+                    known.quantity = max(known.filled_quantity, known.quantity - event.size)
+                elif event.size <= known.remaining_quantity:
+                    known.quantity = known.filled_quantity + event.size   # decrease keeps priority
+                else:
+                    level.remove(known.order_id)                          # increase loses priority
+                    known.quantity = known.filled_quantity + event.size
+                    level.add(known)
             else:
-                # Already at front, this trade fills us
-                fill_qty = min(order.remaining_quantity, remaining_exec)
-                order.filled_quantity += fill_qty
-                remaining_exec -= fill_qty
+                current = level.market_size
+                target = max(0.0, current - event.size) if et == BookEventType.CANCEL else event.size
+                if target < current:
+                    self._reduce_market(level, current - target)
+                elif target > current + _EPS:
+                    self.add_order(Order(
+                        order_id=event.order_id or uuid.uuid4().hex[:16], symbol=self.symbol,
+                        side=event.side, order_type=OrderType.LIMIT, quantity=target - current,
+                        limit_price=level.price, submitted_at=event.timestamp, owner=Owner.MARKET,
+                    ), timestamp=event.timestamp)
+            self._prune(event.side, ticks)
+            return []
 
-                is_full = order.remaining_quantity <= 0
-                order.status = OrderStatus.FILLED if is_full else OrderStatus.PARTIALLY_FILLED
-                order.avg_fill_price = price
-                order.filled_at = ts
+        if et == BookEventType.TRADE:
+            self._last_trade_price = self.from_ticks(ticks)
+            self._last_trade_size = event.size
+            passive = TradeSide.SELL if event.side == TradeSide.BUY else TradeSide.BUY
+            levels, keys = self._side(passive)
+            if event.side == TradeSide.BUY:
+                path = [t for t in keys if t <= ticks]
+            else:
+                path = [t for t in reversed(keys) if t >= ticks]
+            remaining = event.size
+            fills: list[Fill] = []
+            for level_ticks in path:
+                if remaining <= _EPS:
+                    break
+                level = levels[level_ticks]
+                for resting in list(level.orders):
+                    if remaining <= _EPS:
+                        break
+                    qty = min(remaining, resting.remaining_quantity)
+                    if qty <= _EPS:
+                        continue
+                    remaining -= qty
+                    if resting.owner == Owner.PAPER:
+                        resting.record_fill(level.price, qty, event.timestamp)
+                        fills.append(Fill(order_id=resting.order_id, fill_price=level.price,
+                                          fill_quantity=qty, timestamp=event.timestamp,
+                                          is_partial=resting.status != OrderStatus.FILLED,
+                                          side=resting.side))
+                    else:
+                        resting.quantity -= qty
+                self._prune(passive, level_ticks)
+            return fills
 
-                fills.append(Fill(
-                    order_id=order.order_id,
-                    fill_price=price,
-                    fill_quantity=fill_qty,
-                    timestamp=ts,
-                    is_partial=not is_full,
-                ))
+        return []
 
-                if is_full:
-                    level.remove(order.order_id)
-
-        # Update peak queue for remaining orders
-        for order in level.orders:
-            order.queue_ahead_peak = max(order.queue_ahead_peak, order.queue_ahead)
-
-        if level.is_empty():
-            del side_book[price]
-
-        return fills
+    @staticmethod
+    def _reduce_market(level: LevelQueue, amount: float) -> None:
+        market = [o for o in level.orders if o.owner == Owner.MARKET and o.remaining_quantity > _EPS]
+        total = sum(o.remaining_quantity for o in market)
+        if total <= _EPS:
+            return
+        share = min(1.0, amount / total)
+        for o in market:
+            o.quantity -= o.remaining_quantity * share
 
     # ---- Snapshot -------------------------------------------------------
 
     def snapshot(self, levels: int = 10) -> OrderBookSnapshot:
-        """Generate an ``OrderBookSnapshot`` of the current book state."""
-        bids = [
-            PriceLevel(q.price, q.total_size)
-            for q in self.bid_levels[:levels]
-        ]
-        asks = [
-            PriceLevel(q.price, q.total_size)
-            for q in self.ask_levels[:levels]
-        ]
+        """Current book state (market and paper liquidity), best levels first."""
+        bids = [PriceLevel(q.price, q.total_size) for q in self.bid_levels[:levels]]
+        asks = [PriceLevel(q.price, q.total_size) for q in self.ask_levels[:levels]]
         return OrderBookSnapshot(
-            timestamp=time.time(),
+            timestamp=self._last_event_time,
             bids=bids,
             asks=asks,
             last_trade_price=self._last_trade_price,
@@ -490,11 +547,10 @@ class OrderBook:
         )
 
     def to_dict(self) -> dict:
-        """JSON-serialisable representation of the book."""
         from backend.services.market_microstructure import snapshot_to_dict
-        snap = self.snapshot()
-        d = snapshot_to_dict(snap)
+        d = snapshot_to_dict(self.snapshot())
         d["symbol"] = self.symbol
+        d["tick_size"] = self.tick_size
         d["total_bid_orders"] = sum(len(q.orders) for q in self._bids.values())
         d["total_ask_orders"] = sum(len(q.orders) for q in self._asks.values())
         return d

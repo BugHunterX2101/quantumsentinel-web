@@ -20,6 +20,7 @@ import math
 import random
 import hashlib
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
 from typing import Sequence
 
@@ -314,151 +315,242 @@ def generate_synthetic_l2(
     base_depth: float = 100.0,
     events_per_bar: int = 50,
     seed: int | None = None,
+    tick_size: float = 0.01,
 ) -> list[BookEvent]:
-    """Generate realistic L2 book events from OHLCV daily bars.
+    """Generate a synthetic, internally consistent L2 event stream from OHLCV bars.
 
-    This is a research tool for backtesting microstructure strategies
-    when real L2 data is unavailable.  The generated events reproduce
-    statistical properties of real order flow (Poisson arrival, power-law
-    depth, spread correlation with volatility) without claiming tick-level
-    fidelity.
+    This is *synthetic* data for research when real L2 is unavailable — it
+    does not claim tick-level fidelity to any venue. What it does guarantee
+    is that the stream is a valid book history:
 
-    Parameters
-    ----------
-    ohlcv_bars : list of dicts
-        Each dict must have keys ``open``, ``high``, ``low``, ``close``,
-        ``volume``, ``timestamp`` (epoch seconds).
-    levels : int
-        Number of price levels on each side.
-    base_spread_bps : float
-        Typical quoted spread in basis points.
-    base_depth : float
-        Average depth per level (shares).
-    events_per_bar : int
-        Number of L2 events to generate per OHLCV bar.
-    seed : int | None
-        Random seed for deterministic replay.
+    * every price is on the ``tick_size`` grid;
+    * the book is never crossed or locked (best bid < best ask);
+    * CANCEL / MODIFY target a live level and never remove more than rests;
+    * each TRADE executes against the current best opposite level and never
+      exceeds its size;
+    * the book mid follows the bar's open→close path (aggressor side and
+      quote placement lean toward it), staying within the bar's range.
 
-    Returns
-    -------
-    list[BookEvent]
-        Time-sorted sequence of L2 events.
+    MODIFY carries the level's new total size (aggregated-L2 semantics).
+    Exactly ``events_per_bar`` events are emitted per bar.
     """
     rng = random.Random(seed)
     events: list[BookEvent] = []
+    book: dict[TradeSide, dict[int, float]] = {TradeSide.BUY: {}, TradeSide.SELL: {}}
+    decimals = max(0, -Decimal(str(tick_size)).normalize().as_tuple().exponent)
+    seq = 0
+
+    def to_ticks(price: float) -> int:
+        return int(round(price / tick_size))
+
+    def px(ticks: int) -> float:
+        return round(ticks * tick_size, decimals)
+
+    def depth_size() -> float:
+        return round(max(1.0, rng.paretovariate(1.5) * base_depth * 0.1), 2)
 
     for bar in ohlcv_bars:
         ts_start = bar["timestamp"]
-        bar_open = bar["open"]
-        bar_close = bar["close"]
-        bar_high = bar["high"]
-        bar_low = bar["low"]
+        bar_open, bar_close = bar["open"], bar["close"]
+        bar_high, bar_low = bar["high"], bar["low"]
         bar_volume = bar.get("volume", 10_000)
 
-        # Scale spread by bar volatility
         bar_range = (bar_high - bar_low) / bar_open if bar_open else 0
         vol_scale = max(0.5, min(3.0, bar_range / 0.02))
-        spread = bar_open * base_spread_bps / 10_000.0 * vol_scale
+        spread_ticks = max(1, to_ticks(bar_open * base_spread_bps / 10_000.0 * vol_scale))
+        low_t, high_t = to_ticks(bar_low), to_ticks(bar_high)
+        trade_scale = max(1.0, bar_volume / max(events_per_bar, 1))
 
-        # Interpolate price path within bar
         for i in range(events_per_bar):
             frac = i / max(events_per_bar - 1, 1)
-            ts = ts_start + frac * 86400.0 * 0.27  # ~6.5 trading hours
-            # Simple linear interpolation with noise
-            mid = bar_open + (bar_close - bar_open) * frac
-            mid += rng.gauss(0, spread * 0.5)
-            mid = max(bar_low, min(bar_high, mid))
+            ts = round(ts_start + frac * 86400.0 * 0.27, 6)   # ~6.5 trading hours
+            path = bar_open + (bar_close - bar_open) * frac
+            target = min(high_t, max(low_t, to_ticks(path) + int(round(rng.gauss(0, spread_ticks * 0.5)))))
+            bids, asks = book[TradeSide.BUY], book[TradeSide.SELL]
+            best_bid = max(bids) if bids else None
+            best_ask = min(asks) if asks else None
 
-            # Generate event
-            event_type = rng.choices(
-                [BookEventType.ADD, BookEventType.CANCEL,
-                 BookEventType.MODIFY, BookEventType.TRADE],
-                weights=[40, 25, 15, 20],
-            )[0]
-
-            side = TradeSide.BUY if rng.random() < 0.5 else TradeSide.SELL
-            if event_type == BookEventType.TRADE:
-                # Trades at or near mid
-                price = mid + rng.gauss(0, spread * 0.1)
-                size = max(1, rng.expovariate(1.0 / (bar_volume / events_per_bar)))
-            else:
-                # Orders around spread
-                offset = rng.expovariate(1.0 / spread) if spread > 0 else 0
+            if best_bid is None or best_ask is None:
+                # Replenish an empty side first, anchored so it cannot cross.
+                side = TradeSide.BUY if best_bid is None else TradeSide.SELL
+                half = max(1, spread_ticks // 2)
                 if side == TradeSide.BUY:
-                    price = mid - spread / 2 - offset
+                    ticks = target - half if best_ask is None else min(target - half, best_ask - 1)
                 else:
-                    price = mid + spread / 2 + offset
-                size = max(1, rng.paretovariate(1.5) * base_depth * 0.1)
+                    ticks = target + half if best_bid is None else max(target + half, best_bid + 1)
+                ticks = max(1, ticks)
+                etype, size = BookEventType.ADD, depth_size()
+                book[side][ticks] = book[side].get(ticks, 0.0) + size
+            else:
+                etype = rng.choices(
+                    [BookEventType.ADD, BookEventType.CANCEL, BookEventType.MODIFY, BookEventType.TRADE],
+                    weights=[40, 25, 15, 20],
+                )[0]
+                drift = target - (best_bid + best_ask) / 2.0
+                lean = max(-0.45, min(0.45, drift / (2.0 * spread_ticks)))
+                # When the mid lags the bar's path by more than a spread,
+                # flow on the path's side becomes urgent: aggressors clear the
+                # whole best level and quotes improve inside the spread.
+                urgent = abs(drift) > spread_ticks
+                toward = TradeSide.BUY if drift > 0 else TradeSide.SELL
+                in_the_way = TradeSide.SELL if toward == TradeSide.BUY else TradeSide.BUY
+                if etype == BookEventType.TRADE:
+                    side = TradeSide.BUY if rng.random() < 0.5 + lean else TradeSide.SELL
+                    passive = TradeSide.SELL if side == TradeSide.BUY else TradeSide.BUY
+                    ticks = best_ask if side == TradeSide.BUY else best_bid
+                    available = book[passive][ticks]
+                    if urgent and side == toward:
+                        size = round(available, 2)
+                    else:
+                        size = round(min(available, max(1.0, rng.expovariate(1.0 / trade_scale))), 2)
+                    if len(book[passive]) == 1:
+                        size = _keep_side_alive(size, available)
+                    if size <= 0:
+                        # Nothing tradable without emptying the side: replenish it instead.
+                        etype, side, size = BookEventType.ADD, passive, depth_size()
+                        book[passive][ticks] = available + size
+                    else:
+                        remaining = round(available - size, 2)
+                        if remaining <= 0:
+                            del book[passive][ticks]
+                        else:
+                            book[passive][ticks] = remaining
+                elif etype == BookEventType.ADD:
+                    if urgent and len(book[in_the_way]) == 1:
+                        # Re-quote the blocking side near the path first, so its
+                        # stale last level can be cleared without emptying it.
+                        side = in_the_way
+                    else:
+                        side = TradeSide.BUY if rng.random() < 0.5 + lean else TradeSide.SELL
+                    gap = best_ask - best_bid
+                    offset = min(levels - 1, int(rng.expovariate(0.5)))
+                    half = max(1, spread_ticks // 2)
+                    if urgent and side == toward:
+                        # Quote toward the path, as far as the far side allows.
+                        ticks = (min(best_ask - 1, target - half) if side == TradeSide.BUY
+                                 else max(best_bid + 1, target + half))
+                        if (side == TradeSide.BUY and ticks <= best_bid) or (side == TradeSide.SELL and ticks >= best_ask):
+                            ticks = best_bid if side == TradeSide.BUY else best_ask
+                    elif urgent:
+                        # The side in the way re-quotes at the path, not at its stale best.
+                        ticks = (min(best_bid - offset, target - half) if side == TradeSide.BUY
+                                 else max(best_ask + offset, target + half))
+                    elif gap > 1 and rng.random() < 0.3:
+                        # Improve the quote inside the spread, never crossing it.
+                        ticks = best_bid + 1 if side == TradeSide.BUY else best_ask - 1
+                    else:
+                        ticks = best_bid - offset if side == TradeSide.BUY else best_ask + offset
+                    ticks = max(1, ticks)
+                    size = depth_size()
+                    book[side][ticks] = book[side].get(ticks, 0.0) + size
+                else:
+                    if urgent and rng.random() < 0.5 + abs(lean):
+                        side = in_the_way
+                    else:
+                        side = TradeSide.BUY if rng.random() < 0.5 else TradeSide.SELL
+                    side_book = book[side]
+                    choices = sorted(side_book)
+                    if urgent and side == in_the_way:
+                        ticks = max(choices) if side == TradeSide.BUY else min(choices)
+                    else:
+                        ticks = rng.choices(choices, weights=[side_book[t] for t in choices])[0]
+                    level_size = side_book[ticks]
+                    if etype == BookEventType.CANCEL:
+                        low = 1.0 if urgent and side == in_the_way else 0.2
+                        size = round(min(level_size, max(0.01, level_size * rng.uniform(low, 1.0))), 2)
+                        if len(side_book) == 1:
+                            size = _keep_side_alive(size, level_size)
+                        remaining = round(level_size - size, 2)
+                        if remaining <= 0:
+                            del side_book[ticks]
+                        else:
+                            side_book[ticks] = remaining
+                    else:
+                        size = round(max(1.0, level_size * rng.uniform(0.5, 1.5)), 2)
+                        side_book[ticks] = size
 
             events.append(BookEvent(
-                timestamp=round(ts, 6),
-                event_type=event_type,
+                timestamp=ts,
+                event_type=etype,
                 side=side,
-                price=round(price, 4),
-                size=round(size, 2),
-                order_id=hashlib.md5(f"{ts}:{i}:{seed}".encode()).hexdigest()[:12],
+                price=px(ticks),
+                size=size,
+                order_id=f"syn-{seed}-{seq}",
             ))
+            seq += 1
 
     events.sort(key=lambda e: e.timestamp)
     return events
 
 
+def _keep_side_alive(size: float, available: float) -> float:
+    """Cap a trade/cancel so it never empties the last level on a side."""
+    if size < available:
+        return size
+    return max(0.01, round(available / 2, 2)) if available > 0.02 else 0.0
+
+
+class L2DataError(ValueError):
+    """An L2 event stream violates a market-data invariant."""
+
+
+def validate_events(events: Sequence[BookEvent], tick_size: float = 0.01,
+                    max_issues: int = 20) -> list[str]:
+    """Check an L2 stream against market-data invariants.
+
+    * price is finite and > 0, size is finite and >= 0 (TRADE size > 0)
+    * timestamps never decrease
+    * ADD order ids are unique
+    * after every event the book is neither crossed nor locked (bid < ask)
+
+    Returns the list of violations (empty when the stream is valid).
+    """
+    from backend.services.order_book import OrderBook
+
+    issues: list[str] = []
+    book = OrderBook(tick_size=tick_size)
+    seen_ids: set[str] = set()
+    last_ts = -math.inf
+    for i, ev in enumerate(events):
+        if len(issues) >= max_issues:
+            break
+        if not (math.isfinite(ev.price) and ev.price > 0):
+            issues.append(f"event {i}: price must be finite and positive (got {ev.price})")
+            continue
+        if not (math.isfinite(ev.size) and ev.size >= 0) or (ev.event_type == BookEventType.TRADE and ev.size <= 0):
+            issues.append(f"event {i}: invalid size {ev.size} for {ev.event_type.value}")
+            continue
+        if ev.timestamp < last_ts:
+            issues.append(f"event {i}: timestamp {ev.timestamp} is earlier than the previous event")
+        last_ts = max(last_ts, ev.timestamp)
+        if ev.event_type == BookEventType.ADD and ev.order_id:
+            if ev.order_id in seen_ids:
+                issues.append(f"event {i}: duplicate order id {ev.order_id}")
+            seen_ids.add(ev.order_id)
+        book.apply_market_event(ev)
+        bb, ba = book.best_bid, book.best_ask
+        if bb is not None and ba is not None and bb >= ba:
+            issues.append(f"event {i}: book crossed or locked (bid {bb} >= ask {ba})")
+    return issues
+
+
 def build_snapshot_from_events(
     events: Sequence[BookEvent],
     levels: int = 10,
+    tick_size: float = 0.01,
 ) -> OrderBookSnapshot:
-    """Build an ``OrderBookSnapshot`` from a sequence of book events.
+    """Snapshot of the book after applying ``events`` in order.
 
-    Maintains a simplified book state by accumulating ADDs and
-    subtracting CANCELs/TRADEs at each price level.
+    Uses the same ``OrderBook.apply_market_event`` semantics as the replay
+    engine and paper exchange, so a snapshot here always matches what they
+    would see after the same events.
     """
-    bid_levels: dict[float, float] = {}
-    ask_levels: dict[float, float] = {}
-    last_trade_price: float | None = None
-    last_trade_size: float | None = None
-    last_ts = 0.0
+    from backend.services.order_book import OrderBook
 
+    book = OrderBook(tick_size=tick_size)
     for ev in events:
-        last_ts = ev.timestamp
-        if ev.event_type == BookEventType.TRADE:
-            last_trade_price = ev.price
-            last_trade_size = ev.size
-            # Trades remove liquidity from the passive side
-            book = ask_levels if ev.side == TradeSide.BUY else bid_levels
-            if ev.price in book:
-                book[ev.price] = max(0, book[ev.price] - ev.size)
-                if book[ev.price] <= 0:
-                    del book[ev.price]
-        elif ev.event_type == BookEventType.ADD:
-            book = bid_levels if ev.side == TradeSide.BUY else ask_levels
-            book[ev.price] = book.get(ev.price, 0) + ev.size
-        elif ev.event_type == BookEventType.CANCEL:
-            book = bid_levels if ev.side == TradeSide.BUY else ask_levels
-            if ev.price in book:
-                book[ev.price] = max(0, book[ev.price] - ev.size)
-                if book[ev.price] <= 0:
-                    del book[ev.price]
-        elif ev.event_type == BookEventType.MODIFY:
-            book = bid_levels if ev.side == TradeSide.BUY else ask_levels
-            book[ev.price] = ev.size
-
-    # Build sorted levels
-    bids = sorted(
-        [PriceLevel(p, s) for p, s in bid_levels.items() if s > 0],
-        key=lambda x: -x.price,
-    )[:levels]
-    asks = sorted(
-        [PriceLevel(p, s) for p, s in ask_levels.items() if s > 0],
-        key=lambda x: x.price,
-    )[:levels]
-
-    return OrderBookSnapshot(
-        timestamp=last_ts,
-        bids=bids,
-        asks=asks,
-        last_trade_price=last_trade_price,
-        last_trade_size=last_trade_size,
-    )
+        book.apply_market_event(ev)
+    return book.snapshot(levels)
 
 
 def snapshot_to_dict(snap: OrderBookSnapshot) -> dict:

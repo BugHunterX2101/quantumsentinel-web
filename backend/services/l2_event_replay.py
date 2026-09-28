@@ -1,38 +1,40 @@
 """QuantumSentinel — L2 Event Replay Engine.
 
-Replays time-stamped Level-2 order-book events through strategies and
-the paper exchange, producing fills that respect queue position and
-realistic latency.
+Replays time-stamped Level-2 events through one incrementally maintained
+order book and, optionally, a strategy trading through the paper exchange:
 
-The replay engine is the bridge between:
-  - Historical or synthetic L2 data
-  - The paper exchange / matching engine
-  - Research strategies that consume microstructure signals
+    L2 event → order-book update → snapshot → strategy → signal →
+    paper order (latency) → queue-aware matching → fill → portfolio →
+    execution analytics
 
-Usage
------
->>> from backend.services.l2_event_replay import L2EventStream, replay_session
->>> stream = L2EventStream.from_synthetic(ohlcv_bars, seed=42)
->>> results = replay_session(stream, strategy_fn, exchange)
+Data sources (``L2EventStream``):
+
+* ``from_synthetic`` — SYNTHETIC L2 generated from OHLCV bars. It is a
+  consistent book history for research, not historical venue data.
+* ``from_records`` / ``from_csv`` — external L2 (e.g. vendor exports),
+  validated against market-data invariants on load.
+* ``from_events`` — a pre-built event list, used as given.
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 from dataclasses import dataclass, field
-from typing import Callable, Iterator, Sequence
+from typing import Callable, Iterator
 
 from backend.services.market_microstructure import (
     BookEvent,
     BookEventType,
+    L2DataError,
     OrderBookSnapshot,
-    PriceLevel,
     TradeEvent,
     TradeSide,
-    build_snapshot_from_events,
     generate_synthetic_l2,
     snapshot_to_dict,
+    validate_events,
 )
 
 
@@ -42,24 +44,16 @@ from backend.services.market_microstructure import (
 
 @dataclass
 class L2EventStream:
-    """Iterable container for a sequence of time-sorted L2 book events.
-
-    The stream can be created from:
-    - Synthetic generation (``from_synthetic``)
-    - Raw event lists (``from_events``)
-    - CSV/dict data (``from_records``)
-    """
+    """Time-sorted sequence of L2 book events with a provenance hash."""
     events: list[BookEvent]
     dataset_id: str = ""
     dataset_hash: str = ""
+    source: str = "external"          # "synthetic" | "external"
 
     def __post_init__(self):
         if not self.dataset_hash:
-            # Hash the complete, canonical replay input. A prefix hash could
-            # attest two streams that diverge after event 1,000, while a
-            # concatenated string omitted fields (side/order identity) that
-            # affect book state and matching. JSON framing also avoids field
-            # boundary ambiguities inherent in simple string concatenation.
+            # Hash the complete, canonical replay input: every event and every
+            # field that affects book state and matching, JSON-framed.
             canonical_events = [
                 {
                     "timestamp": event.timestamp,
@@ -90,38 +84,54 @@ class L2EventStream:
         events_per_bar: int = 50,
         seed: int = 42,
         dataset_id: str = "synthetic",
+        tick_size: float = 0.01,
     ) -> L2EventStream:
-        """Generate a stream from OHLCV daily bars."""
+        """Synthetic L2 generated from OHLCV bars (not historical venue data)."""
         events = generate_synthetic_l2(
-            ohlcv_bars,
-            levels=levels,
-            base_spread_bps=base_spread_bps,
-            base_depth=base_depth,
-            events_per_bar=events_per_bar,
-            seed=seed,
+            ohlcv_bars, levels=levels, base_spread_bps=base_spread_bps, base_depth=base_depth,
+            events_per_bar=events_per_bar, seed=seed, tick_size=tick_size,
         )
-        return cls(events=events, dataset_id=dataset_id)
+        return cls(events=events, dataset_id=dataset_id, source="synthetic")
 
     @classmethod
     def from_events(cls, events: list[BookEvent], dataset_id: str = "raw") -> L2EventStream:
-        """Wrap a pre-built event list."""
+        """Wrap a pre-built event list as given."""
         return cls(events=events, dataset_id=dataset_id)
 
     @classmethod
-    def from_records(cls, records: list[dict], dataset_id: str = "csv") -> L2EventStream:
-        """Build from dicts with keys: timestamp, event_type, side, price, size."""
+    def from_records(cls, records: list[dict], dataset_id: str = "csv",
+                     tick_size: float = 0.01, validate: bool = True) -> L2EventStream:
+        """Build from dicts with keys timestamp, event_type, side, price, size[, order_id].
+
+        Records are stably sorted by timestamp and, when ``validate`` is set,
+        rejected with ``L2DataError`` if they violate a market-data invariant.
+        """
         events = []
-        for r in records:
-            events.append(BookEvent(
-                timestamp=float(r["timestamp"]),
-                event_type=BookEventType(r["event_type"]),
-                side=TradeSide(r["side"]),
-                price=float(r["price"]),
-                size=float(r["size"]),
-                order_id=r.get("order_id"),
-            ))
+        for i, r in enumerate(records):
+            try:
+                events.append(BookEvent(
+                    timestamp=float(r["timestamp"]),
+                    event_type=BookEventType(str(r["event_type"]).upper()),
+                    side=TradeSide(str(r["side"]).upper()),
+                    price=float(r["price"]),
+                    size=float(r["size"]),
+                    order_id=(str(r["order_id"]) if r.get("order_id") not in (None, "") else None),
+                ))
+            except (KeyError, ValueError, TypeError) as exc:
+                raise L2DataError(f"record {i}: {exc}") from exc
         events.sort(key=lambda e: e.timestamp)
+        if validate:
+            issues = validate_events(events, tick_size=tick_size)
+            if issues:
+                raise L2DataError("; ".join(issues))
         return cls(events=events, dataset_id=dataset_id)
+
+    @classmethod
+    def from_csv(cls, text: str, dataset_id: str = "csv", tick_size: float = 0.01,
+                 validate: bool = True) -> L2EventStream:
+        """Parse CSV text with a header row naming the ``from_records`` fields."""
+        return cls.from_records(list(csv.DictReader(io.StringIO(text))), dataset_id=dataset_id,
+                                tick_size=tick_size, validate=validate)
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +141,16 @@ class L2EventStream:
 @dataclass
 class ReplayConfig:
     """Configuration for an L2 replay session."""
-    snapshot_interval: int = 10      # Build snapshot every N events
-    warmup_events: int = 100         # Events to skip before strategy starts
+    snapshot_interval: int = 10      # Snapshot (and consult the strategy) every N events
+    warmup_events: int = 100         # Events before the strategy is consulted
     max_events: int | None = None    # Cap for debugging / partial replays
+    snapshot_levels: int = 10
+    tick_size: float = 0.01
+    # Execution — used when replay_session is given a PaperExchange
+    order_quantity: float = 100.0
+    order_style: str = "aggressive"  # "aggressive": market orders | "passive": join the best quote
+    cancel_after_events: int | None = None   # cancel a passive order unfilled after N events
+    adverse_selection_horizons_s: tuple[float, ...] = (1.0, 10.0, 60.0)
 
 
 @dataclass
@@ -145,96 +162,139 @@ class ReplayResult:
     trades_observed: int = 0
     dataset_id: str = ""
     dataset_hash: str = ""
+    data_source: str = ""
     snapshot_history: list[dict] = field(default_factory=list)
     signal_history: list[dict] = field(default_factory=list)
+    execution: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "total_events": self.total_events,
             "snapshots_generated": self.snapshots_generated,
             "strategy_signals": self.strategy_signals,
             "trades_observed": self.trades_observed,
             "dataset_id": self.dataset_id,
             "dataset_hash": self.dataset_hash,
+            "data_source": self.data_source,
             "snapshot_count": len(self.snapshot_history),
             "signal_count": len(self.signal_history),
         }
+        if self.execution is not None:
+            d["execution"] = self.execution
+        return d
+
+
+_WORKING_STATUSES = ("SUBMITTED", "ACCEPTED", "QUEUED", "PARTIALLY_FILLED")
 
 
 def replay_session(
     stream: L2EventStream,
     strategy_fn: Callable[[OrderBookSnapshot, list[TradeEvent]], dict | None] | None = None,
     config: ReplayConfig | None = None,
+    exchange=None,
 ) -> ReplayResult:
-    """Replay an L2 event stream, building snapshots and invoking the strategy.
+    """Replay an L2 stream through one incrementally updated book.
 
     Parameters
     ----------
     stream : L2EventStream
-        The event data to replay.
     strategy_fn : callable, optional
-        A function ``(snapshot, recent_trades) -> signal_dict | None``.
-        Called at each snapshot interval after the warmup period.
-        If None, only snapshots and analytics are computed.
+        ``(snapshot, recent_trades) -> {"signal": "BUY"|"SELL", ...} | None``,
+        consulted every ``snapshot_interval`` events after warm-up.
     config : ReplayConfig, optional
-        Replay parameters.
-
-    Returns
-    -------
-    ReplayResult
-        Summary of the replay including snapshot history and signals.
+    exchange : PaperExchange, optional
+        When given, events flow through the exchange and signals become
+        paper orders: BUY opens ``order_quantity`` when flat, SELL closes
+        the position (long only). Orders are subject to the exchange's
+        latency and queue model, and the result carries its fills,
+        portfolio and execution analytics.
     """
-    if config is None:
-        config = ReplayConfig()
+    from backend.services.order_book import OrderBook, OrderType
 
-    result = ReplayResult(
-        dataset_id=stream.dataset_id,
-        dataset_hash=stream.dataset_hash,
-    )
-
-    event_buffer: list[BookEvent] = []
+    config = config or ReplayConfig()
+    result = ReplayResult(dataset_id=stream.dataset_id, dataset_hash=stream.dataset_hash,
+                          data_source=stream.source)
+    book = exchange.book if exchange is not None else OrderBook(tick_size=config.tick_size)
     recent_trades: list[TradeEvent] = []
+    working: dict[str, int] = {}          # passive order id -> event index at submission
 
     for i, event in enumerate(stream):
         if config.max_events is not None and i >= config.max_events:
             break
-
         result.total_events += 1
-        event_buffer.append(event)
+        if exchange is not None:
+            exchange.on_market_event(event)
+        else:
+            book.apply_market_event(event)
 
-        # Track trade events
         if event.event_type == BookEventType.TRADE:
             result.trades_observed += 1
-            recent_trades.append(TradeEvent(
-                timestamp=event.timestamp,
-                price=event.price,
-                size=event.size,
-                aggressor_side=event.side,
-            ))
-            # Keep last 100 trades
+            recent_trades.append(TradeEvent(timestamp=event.timestamp, price=event.price,
+                                            size=event.size, aggressor_side=event.side))
             if len(recent_trades) > 100:
                 recent_trades = recent_trades[-100:]
 
-        # Build snapshot at interval
-        if len(event_buffer) % config.snapshot_interval == 0:
-            snap = build_snapshot_from_events(event_buffer)
-            result.snapshots_generated += 1
+        if exchange is not None and config.cancel_after_events is not None:
+            for oid, submitted_at in list(working.items()):
+                order = exchange._by_id.get(oid)
+                if order is None or order.status.value not in _WORKING_STATUSES:
+                    working.pop(oid)
+                elif i - submitted_at >= config.cancel_after_events:
+                    exchange.cancel_order(oid)
+                    working.pop(oid)
 
-            snap_dict = snapshot_to_dict(snap)
-            result.snapshot_history.append(snap_dict)
-            # Keep snapshot history bounded for memory
-            if len(result.snapshot_history) > 500:
-                result.snapshot_history = result.snapshot_history[-250:]
+        if (i + 1) % config.snapshot_interval != 0:
+            continue
+        snap = book.snapshot(config.snapshot_levels)
+        result.snapshots_generated += 1
+        result.snapshot_history.append(snapshot_to_dict(snap))
+        if len(result.snapshot_history) > 500:
+            result.snapshot_history = result.snapshot_history[-250:]
 
-            # Call strategy after warmup
-            if strategy_fn and i >= config.warmup_events:
-                signal = strategy_fn(snap, recent_trades)
-                if signal is not None:
-                    signal["timestamp"] = event.timestamp
-                    result.signal_history.append(signal)
-                    result.strategy_signals += 1
+        if not strategy_fn or i < config.warmup_events:
+            continue
+        signal = strategy_fn(snap, recent_trades)
+        if signal is None:
+            continue
+        signal["timestamp"] = event.timestamp
+        result.strategy_signals += 1
+        if exchange is not None:
+            order = _order_for_signal(exchange, signal.get("signal"), config, OrderType)
+            if order is not None:
+                signal["order_id"] = order.order_id
+                signal["order_status"] = order.status.value
+                if config.order_style == "passive":
+                    working[order.order_id] = i
+        result.signal_history.append(signal)
 
+    if exchange is not None:
+        result.execution = {
+            "portfolio": exchange.portfolio_summary(),
+            "exchange_stats": exchange.exchange_stats(),
+            "orders": exchange.order_summary(),
+            "fills": [f.to_dict() for f in exchange.fill_history],
+            "analytics": exchange.execution_report(config.adverse_selection_horizons_s),
+        }
     return result
+
+
+def _order_for_signal(exchange, signal: str | None, config: ReplayConfig, OrderType):
+    """Translate a BUY/SELL signal into a long-only paper order, or None."""
+    if any(o.status.value in _WORKING_STATUSES for o in exchange.order_history):
+        return None
+    held = exchange.position_quantity()
+    if signal == "BUY" and held <= 0:
+        side, qty = TradeSide.BUY, config.order_quantity
+    elif signal == "SELL" and held > 0:
+        side, qty = TradeSide.SELL, held
+    else:
+        return None
+    if config.order_style == "passive":
+        price = exchange.book.best_bid if side == TradeSide.BUY else exchange.book.best_ask
+        if price is None:
+            return None
+        return exchange.submit_order(side, qty, OrderType.LIMIT, limit_price=price)
+    return exchange.submit_order(side, qty, OrderType.MARKET)
 
 
 # ---------------------------------------------------------------------------

@@ -928,6 +928,9 @@ _WS_MAX_PER_USER = 3
 _WS_PUSH_INTERVAL = 30
 _WS_MAX_MESSAGE_SIZE = 65536  # 64KB
 _WS_COUNTER_TTL = 120         # refreshed while connected; bounds leaks from crashed workers
+# asyncio timers can fire up to one clock resolution early (~15.6 ms on
+# Windows); close this close to expiry rather than push once more.
+_WS_EXPIRY_GRACE = 0.25
 
 
 async def _ws_acquire(user_id: str) -> tuple[bool, bool]:
@@ -982,7 +985,9 @@ async def signal_stream(websocket: WebSocket):
         await websocket.close(code=4401)
         return
     user_id = payload["sub"]
-    expires_at = float(payload["exp"])
+    # Expiry as a monotonic deadline: the waits below run on the event loop's
+    # monotonic clock, so checking against wall-clock time could disagree.
+    deadline = time.monotonic() + (float(payload["exp"]) - time.time())
     acquired, in_redis = await _ws_acquire(user_id)
     if not acquired:
         await websocket.close(code=4429)  # too many connections
@@ -997,7 +1002,7 @@ async def signal_stream(websocket: WebSocket):
         await websocket.accept(subprotocol="qs" if "qs" in offered else None)
         seq = 0
         while True:
-            if time.time() >= expires_at:
+            if deadline - time.monotonic() <= _WS_EXPIRY_GRACE:
                 await websocket.close(code=4401, reason="session expired")
                 break
             # Re-read the user every cycle: deactivation and watchlist edits
@@ -1038,7 +1043,7 @@ async def signal_stream(websocket: WebSocket):
             try:
                 message = await asyncio.wait_for(
                     websocket.receive_text(),
-                    timeout=max(0.0, min(_WS_PUSH_INTERVAL, expires_at - time.time())),
+                    timeout=max(0.0, min(_WS_PUSH_INTERVAL, deadline - time.monotonic())),
                 )
                 if len(message.encode("utf-8")) > _WS_MAX_MESSAGE_SIZE:
                     await websocket.close(code=1009, reason="message too large")

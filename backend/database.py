@@ -48,6 +48,11 @@ def get_db():
 def init_db():
     from . import models  # noqa: F401  (ensure models are registered)
     Base.metadata.create_all(bind=engine)
+    # Dialect-agnostic additive migrations (SQLite and PostgreSQL).
+    user_columns = {c["name"] for c in inspect(engine).get_columns("users")}
+    if "role" not in user_columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(32) NOT NULL DEFAULT 'user'"))
     # Lightweight compatibility migration for the portable SQLite demo.
     # A production deployment must use versioned migrations (Alembic).
     if _is_sqlite:

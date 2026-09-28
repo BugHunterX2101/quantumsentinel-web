@@ -28,6 +28,8 @@ else:
     JWT_VERIFY_KEY = _jwt_private.public_key().public_bytes(serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo)
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "900"))
+JWT_ISSUER = _setting("JWT_ISSUER", "quantumsentinel")
+JWT_AUDIENCE = _setting("JWT_AUDIENCE", "quantumsentinel-api")
 REFRESH_SESSION_SECONDS = int(os.getenv("REFRESH_SESSION_SECONDS", "3600"))
 
 # --- Refresh-token rotation ---------------------------------------------------
@@ -57,11 +59,10 @@ SERVER_DSA_CREATED_AT = _setting("SERVER_DSA_CREATED_AT")
 # --- Server identity pinning (Item 4) ----------------------------------------
 TRUSTED_SERVER_DSA_FINGERPRINT = _setting("TRUSTED_SERVER_DSA_FINGERPRINT")
 
-# Operators permitted to arm/clear platform-wide (global/asset) kill switches.
-# Deliberately config-driven rather than a DB flag: it fails closed when unset
-# (nobody holds the privilege) and the privileged set is fixed at deploy time
-# rather than mutable by anything the application itself can write to.
-ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+# Operator privileges come from users.role, provisioned with
+# `python -m backend.manage set-role <email> <role>` — never from anything a
+# self-registering user controls (such as registering a configured email).
+OPERATOR_ROLES = frozenset({"admin", "risk_admin"})
 
 # --- Paper-trading ledger -------------------------------------------------------
 # Starting capital is a server-side constant: clients never choose their own

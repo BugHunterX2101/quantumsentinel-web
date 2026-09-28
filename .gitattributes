@@ -1,0 +1,2 @@
+# Vendored third-party files are pinned by hash: never convert their line endings.
+frontend/vendor/** -text

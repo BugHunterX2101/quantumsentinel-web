@@ -46,9 +46,12 @@ jobs:
           python-version: '3.12'
       - name: Install Bandit
         run: pip install bandit[toml]
-      - name: Run Bandit (Python SAST)
+      - name: Run Bandit (Python SAST) — full report
         run: bandit -r backend -f json -o bandit-report.json --severity-level medium || true
+      - name: Fail on high-severity, high-confidence findings
+        run: bandit -r backend -q --severity-level high --confidence-level high
       - name: Upload Bandit report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bandit-report
@@ -66,9 +69,10 @@ jobs:
         run: pip install -r requirements.txt
       - name: Install pip-audit
         run: pip install pip-audit
-      - name: Run pip-audit (dependency CVE scan)
-        run: pip-audit --format json --output pip-audit-report.json || true
+      - name: Run pip-audit (dependency CVE scan, blocking)
+        run: pip-audit --format json --output pip-audit-report.json
       - name: Upload pip-audit report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pip-audit-report
@@ -112,4 +116,7 @@ jobs:
           image-ref: quantumsentinel:ci
           format: table
           severity: CRITICAL,HIGH
-          exit-code: 0
+          # Block on HIGH/CRITICAL that have a fix; unfixed base-image CVEs
+          # are reported by upstream but cannot be remediated here.
+          ignore-unfixed: true
+          exit-code: 1

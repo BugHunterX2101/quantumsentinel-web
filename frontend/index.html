@@ -22,7 +22,7 @@
 <link rel="icon" href="/favicon.ico" type="image/x-icon">
 <link rel="stylesheet" href="/assets/styles.css">
 <!-- Three.js for 3D background (deferred so it doesn't block render) -->
-<script src="https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.min.js" defer></script>
+<script type="module" src="/assets/vendor/three-global.js"></script>
 </head>
 <body>
 
@@ -859,8 +859,9 @@
         </div>
         <div class="card">
           <h3>PQC Handshake Trace</h3>
-          <p class="hint" data-beginner>Live cryptographic trace of your current session: classical X25519 Diffie-Hellman combined with post-quantum ML-KEM-768 encapsulation into a single composite session key.</p>
+          <p class="hint" data-beginner>Research prototype of a hybrid key agreement: classical X25519 combined with post-quantum ML-KEM-768, run on the server. Your browser session itself is protected by TLS and HttpOnly cookies.</p>
           <div id="handshake-trace"></div>
+          <button id="repin-server" class="btn-secondary ripple-btn" style="margin-top:14px"><span class="btn-label">Re-pin server identity</span></button>
         </div>
         <div class="card wide">
           <h3>ML-DSA-65 Signed Audit Log</h3>

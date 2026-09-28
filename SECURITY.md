@@ -19,10 +19,17 @@
   nonces, algorithm identifiers, and session context), not just a partial
   hash. Client nonces are atomically consumed via Redis `SET NX EX 300`
   to prevent replay attacks.
-- **Server identity pinning**: the frontend pins the server's ML-DSA-65
-  fingerprint (SHA-256 of the public key) in `sessionStorage` and warns
-  on unexpected changes. Production deployments can set
-  `TRUSTED_SERVER_DSA_FINGERPRINT` for additional verification.
+- **Server identity pinning**: when `TRUSTED_SERVER_DSA_FINGERPRINT` is set,
+  the server refuses to start unless its ML-DSA-65 key has exactly that
+  fingerprint (SHA-256 of the public key). The browser additionally pins the
+  first fingerprint it sees in `localStorage`; a later mismatch marks the
+  handshake untrusted (hard failure, not a warning) until the user
+  deliberately re-pins after a verified rotation.
+- **Scope of the handshake**: the hybrid X25519 + ML-KEM-768 handshake is a
+  research prototype. Key encapsulation, derivation and transcript signing
+  run on the server; the browser holds no ML-KEM key and does not verify
+  ML-DSA signatures. Browser sessions are protected by TLS and HttpOnly
+  cookies, not by the handshake's session key.
 - Production trade orders use a deterministic `QS-ORDER-V1` canonical payload,
   client-held ML-DSA-65 signing key, bounded expiry, and one-time nonce. The
   reference development UI uses clearly labelled server attestation only, so
@@ -74,9 +81,10 @@
   p-values, metric names) — never raw user or third-party text — so this is
   a rendering-convenience choice, not an unescaped-user-input path.
 - **Content Security Policy (CSP)**:
-  - `script-src 'self' https://cdn.jsdelivr.net` — only self-hosted scripts
-    and the pinned Three.js CDN are allowed; no `unsafe-inline` or
-    `unsafe-eval`.
+  - `script-src 'self'` — only same-origin scripts; no `unsafe-inline` or
+    `unsafe-eval`. Three.js is self-hosted (`frontend/vendor`, npm tarball
+    verified against its published sha512 integrity), so no third-party
+    script host is trusted.
   - `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com` — the
     Research/Lab result panels and parts of the base markup use inline
     `style="..."` attributes rather than a stylesheet, so `unsafe-inline` is

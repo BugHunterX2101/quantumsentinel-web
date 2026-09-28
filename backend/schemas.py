@@ -612,10 +612,10 @@ class ApiKeyRequest(BaseModel):
     @field_validator("scopes")
     @classmethod
     def valid_scopes(cls, value: list[str]) -> list[str]:
-        allowed = {"read", "trade", "admin"}
+        allowed = {"read", "trade"}
         scopes = sorted(set(value))
         if not scopes or not set(scopes).issubset(allowed):
-            raise ValueError("scopes must be read, trade, and/or admin")
+            raise ValueError("scopes must be read and/or trade")
         return scopes
 
 

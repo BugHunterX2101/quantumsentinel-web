@@ -29,6 +29,7 @@ import heapq
 from dataclasses import dataclass
 from enum import Enum
 
+from backend.config import PAPER_INITIAL_CASH
 from backend.services.market_microstructure import BookEvent, TradeSide
 from backend.services.order_book import (
     Fill,
@@ -58,9 +59,9 @@ class TradingMode(str, Enum):
 
 TRADING_MODE = TradingMode.PAPER  # Immutable runtime constant
 
-# Starting capital of a simulation. Fixed server-side: API callers cannot
-# choose their own buying power.
-SIM_INITIAL_CASH = 100_000.0
+# Starting capital of a simulation: the same server-side constant as the
+# live paper account. API callers cannot choose their own buying power.
+SIM_INITIAL_CASH = PAPER_INITIAL_CASH
 
 _EPS = 1e-9
 _WORKING = (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.QUEUED,

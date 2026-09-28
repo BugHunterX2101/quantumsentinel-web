@@ -188,7 +188,9 @@ class TestWebSocket:
 
     def test_cookie_session_streams_and_closes_at_token_expiry(self, Session, client, quiet_signals, monkeypatch):
         user = make_user(Session, "ws@example.com")
-        monkeypatch.setattr(auth_service, "JWT_EXPIRE_SECONDS", 1)
+        # JWT times are whole seconds (exp = int(now) + N), so N=1 can leave
+        # well under a second of validity; 3 guarantees at least 2 s.
+        monkeypatch.setattr(auth_service, "JWT_EXPIRE_SECONDS", 3)
         with self._connect(client, auth_service.create_access_token(user.id, "free")) as ws:
             assert ws.receive_json()["sequence"] == 0
             with pytest.raises(WebSocketDisconnect) as exc:

@@ -2599,13 +2599,44 @@ def experiment_get(experiment_id: str, user: models.User = Depends(get_current_u
     return exp.to_dict()
 
 
+@app.post("/api/experiments/{experiment_id}/run", status_code=200)
+def experiment_run(experiment_id: str, user: models.User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    """Execute a platform strategy on the experiment's stored inputs, then
+    record the result and sign the manifest. Results are recorded once."""
+    from .services.experiment_registry import ExperimentError, PersistentExperimentRegistry
+    registry = PersistentExperimentRegistry(db, user.id)
+    try:
+        exp = registry.run(experiment_id)
+    except ExperimentError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not exp:
+        raise HTTPException(404, f"Experiment {experiment_id} not found")
+    security_service.write_audit_log(db, user.id, "EXPERIMENT_RUN", "experiment", experiment_id,
+                                     {"result_hash": exp.result_hash})
+    return {**exp.to_dict(), "results": exp.results}
+
+
+@app.get("/api/experiments/{experiment_id}/manifest", status_code=200)
+def experiment_manifest(experiment_id: str, user: models.User = Depends(get_current_user),
+                        db: Session = Depends(get_db)):
+    """The signed manifest exactly as signed, verified against the key that signed it."""
+    from .services.experiment_registry import PersistentExperimentRegistry
+    manifest = PersistentExperimentRegistry(db, user.id).get_manifest(experiment_id)
+    if manifest is None:
+        raise HTTPException(404, f"Experiment {experiment_id} not found")
+    return manifest
+
+
 @app.post("/api/experiments/{experiment_id}/replay", status_code=200)
 def experiment_replay(experiment_id: str, request_body: dict, user: models.User = Depends(get_current_user),
                       db: Session = Depends(get_db)):
-    """Deterministic replay of an experiment.
+    """Deterministic verification of an experiment.
 
-    Verifies that the same dataset + parameters + seed produces
-    the same result hash.
+    Always verifies inputs: the (optionally supplied) dataset, parameters and
+    seed are hashed and compared with the recorded ones. For a completed
+    platform-executable experiment it then re-executes the strategy from the
+    stored inputs and compares the result hash (true replay).
     """
     from .services.experiment_registry import PersistentExperimentRegistry, hash_dataset, hash_parameters
     registry = PersistentExperimentRegistry(db, user.id)
@@ -2619,16 +2650,61 @@ def experiment_replay(experiment_id: str, request_body: dict, user: models.User 
     seed = request_body.get("random_seed", stored_seed)
     d_hash = hash_dataset(dataset) if dataset is not None else ""
     p_hash = hash_parameters(parameters)
-    return {
+    matches = d_hash == exp.dataset_hash and p_hash == exp.parameter_hash and seed == exp.random_seed
+    response = {
         "experiment_id": experiment_id,
         "dataset_hash": d_hash,
         "parameter_hash": p_hash,
         "random_seed": seed,
-        "matches_experiment": (
-            d_hash == exp.dataset_hash and p_hash == exp.parameter_hash and seed == exp.random_seed
-        ),
-        "replay_status": "deterministic_hashes_computed",
+        "matches_experiment": matches,
+        "replay_status": "deterministic_input_verification",
+        "result_reproduced": None,
     }
+    if matches and exp.result_hash:
+        replay = registry.reexecute(experiment_id)
+        if replay and replay["executed"]:
+            response.update(replay_status="re-executed", result_hash=replay["result_hash"],
+                            recorded_result_hash=exp.result_hash,
+                            result_reproduced=replay["result_reproduced"],
+                            engine_version_matches=replay["engine_version_matches"])
+    return response
+
+
+@app.post("/api/experiments/{experiment_id}/validate", status_code=200)
+def experiment_validate(experiment_id: str, user: models.User = Depends(get_current_user),
+                        db: Session = Depends(get_db)):
+    """Run integrity and deployment gates; VALIDATED only if every gate passes."""
+    from .services.experiment_registry import ExperimentError, PersistentExperimentRegistry
+    try:
+        report = PersistentExperimentRegistry(db, user.id).validate(experiment_id)
+    except ExperimentError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if report is None:
+        raise HTTPException(404, f"Experiment {experiment_id} not found")
+    security_service.write_audit_log(db, user.id, "EXPERIMENT_VALIDATED", "experiment", experiment_id,
+                                     {"all_gates_passed": report["all_gates_passed"]})
+    return report
+
+
+@app.post("/api/experiments/{experiment_id}/approve", status_code=200)
+def experiment_approve(experiment_id: str, user: models.User = Depends(get_current_user),
+                       db: Session = Depends(get_db)):
+    """Approve a VALIDATED experiment for paper deployment.
+
+    Operator role required; the owner cannot approve their own experiment.
+    """
+    from .services.experiment_registry import ExperimentError, approve_experiment
+    if not _is_admin(user):
+        raise HTTPException(403, "approving experiments requires an operator role")
+    try:
+        exp = approve_experiment(db, experiment_id, user.id)
+    except LookupError as exc:
+        raise HTTPException(404, f"Experiment {experiment_id} not found") from exc
+    except ExperimentError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    security_service.write_audit_log(db, user.id, "EXPERIMENT_APPROVED", "experiment", experiment_id,
+                                     {"result_hash": exp.result_hash})
+    return exp.to_dict()
 
 
 # --------------------------------------------------------------------------

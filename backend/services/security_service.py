@@ -164,6 +164,7 @@ class ServerIdentity:
         old_created = self.created_at
 
         # Retire old key in DB
+        old_record = None
         if db and old_key_id:
             old_record = db.execute(
                 select(models.ServerSigningKey).where(
@@ -174,8 +175,9 @@ class ServerIdentity:
                 old_record.status = "retired"
                 old_record.retired_at = dt.datetime.now(dt.timezone.utc)
                 db.commit()
-        elif db and old_pk and old_fingerprint:
-            # Key was never registered — register it as retired
+        if db and old_record is None and old_pk and old_fingerprint:
+            # Key was never registered here — record it as retired, or
+            # everything it signed becomes unverifiable after rotation.
             record = models.ServerSigningKey(
                 key_id=old_key_id or models.gen_uuid(),
                 algorithm="ML-DSA-65",

@@ -53,6 +53,14 @@ def init_db():
     if "role" not in user_columns:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(32) NOT NULL DEFAULT 'user'"))
+    experiment_columns = {c["name"] for c in inspect(engine).get_columns("research_experiments")}
+    for name, ddl in (("strategy_hash", "VARCHAR(64)"), ("dependency_lock_hash", "VARCHAR(64)"),
+                      ("engine_version", "VARCHAR(32)"), ("signing_key_id", "VARCHAR"),
+                      ("manifest_json", "JSON"), ("approved_by", "VARCHAR"),
+                      ("approved_at", "TIMESTAMP WITH TIME ZONE" if not _is_sqlite else "DATETIME")):
+        if name not in experiment_columns:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE research_experiments ADD COLUMN {name} {ddl}"))
     # Lightweight compatibility migration for the portable SQLite demo.
     # A production deployment must use versioned migrations (Alembic).
     if _is_sqlite:

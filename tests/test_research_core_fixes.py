@@ -3,6 +3,7 @@ with a one-bar decision delay, multi-asset walk-forward, a calibrated
 Deflated Sharpe test with server-counted trials, a race-free audit chain, and
 no execution against stale quotes. All offline (yfinance is faked)."""
 import math
+import sys
 import threading
 import time
 
@@ -14,6 +15,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from backend import main, models, schemas
+from backend.crypto import pqc
 from backend.database import Base
 from backend.services import (backtest_service, event_simulator, historical_data, paper_broker,
                               research_trials, security_service, stat_tests, strategy_signals,
@@ -330,8 +332,37 @@ def file_db(tmp_path):
     return sessionmaker(bind=engine)
 
 
+@pytest.fixture
+def frequent_thread_switches():
+    """Switch threads every microsecond so interleavings that a busy server
+    hits only occasionally happen on every run."""
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    yield
+    sys.setswitchinterval(previous)
+
+
+class TestPqcThreadSafety:
+    def test_concurrent_ml_dsa_signatures_all_verify(self, frequent_thread_switches):
+        pk, sk, _ = pqc.dsa_keygen()
+        results = []
+
+        def signer(n):
+            for i in range(4):
+                message = f"signer-{n}-{i}".encode()
+                signature, _ = pqc.dsa_sign(sk, message)
+                results.append(pqc.dsa_verify(pk, message, signature))
+
+        threads = [threading.Thread(target=signer, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [True] * 16
+
+
 class TestAuditChain:
-    def test_concurrent_writers_keep_one_contiguous_valid_chain(self, file_db):
+    def test_concurrent_writers_keep_one_contiguous_valid_chain(self, file_db, frequent_thread_switches):
         security_service.write_audit_log(file_db(), None, "GENESIS")
         errors = []
 
@@ -355,7 +386,8 @@ class TestAuditChain:
         sequences = [s for (s,) in db.execute(text("SELECT sequence FROM audit_chain_links ORDER BY sequence"))]
         assert sequences == list(range(1, 50))
         status = security_service.audit_chain_status(db)
-        assert status["valid"] and status["links"] == 49 and status["unchained_events"] == 0
+        assert status == {"valid": True, "links": 49, "unchained_events": 0,
+                          "first_invalid_sequence": None, "reason": None}
 
     def test_postgres_lock_is_taken_before_the_chain_head_is_read(self, db, monkeypatch):
         executed = []

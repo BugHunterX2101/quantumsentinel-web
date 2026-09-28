@@ -16,6 +16,7 @@ Classical leg of the hybrid handshake uses X25519 from `cryptography`
 import base64
 import hashlib
 import hmac
+import threading
 import time
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
@@ -89,25 +90,36 @@ def kem_decapsulate(sk: bytes, ciphertext: bytes):
 # --------------------------------------------------------------------------
 # ML-DSA-65 (FIPS 204)
 # --------------------------------------------------------------------------
+# Without the optional `xoflib` package, dilithium-py hashes through one
+# module-level SHAKE-256 object whose buffer is shared by every caller, so two
+# threads signing or verifying at once read each other's XOF stream and
+# produce invalid signatures. Serialise all ML-DSA operations; the pure-Python
+# implementation holds the GIL throughout, so this costs no parallelism.
+_ml_dsa_lock = threading.Lock()
+
+
 def dsa_keygen():
     _assert_pqc_backend()
-    t0 = time.perf_counter()
-    pk, sk = ML_DSA_65.keygen()
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    with _ml_dsa_lock:
+        t0 = time.perf_counter()
+        pk, sk = ML_DSA_65.keygen()
+        elapsed_ms = (time.perf_counter() - t0) * 1000
     return pk, sk, elapsed_ms
 
 
 def dsa_sign(sk: bytes, message: bytes):
     _assert_pqc_backend()
-    t0 = time.perf_counter()
-    signature = ML_DSA_65.sign(sk, message)
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    with _ml_dsa_lock:
+        t0 = time.perf_counter()
+        signature = ML_DSA_65.sign(sk, message)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
     return signature, elapsed_ms
 
 
 def dsa_verify(pk: bytes, message: bytes, signature: bytes) -> bool:
     _assert_pqc_backend()
-    return ML_DSA_65.verify(pk, message, signature)
+    with _ml_dsa_lock:
+        return ML_DSA_65.verify(pk, message, signature)
 
 
 # --------------------------------------------------------------------------

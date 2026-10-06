@@ -14,8 +14,10 @@ from .config import DATABASE_URL
 _is_sqlite = DATABASE_URL.startswith("sqlite")
 
 if _is_sqlite:
-    # SQLite: single writer, disable pool (StaticPool handles thread safety)
-    connect_args = {"check_same_thread": False}
+    # SQLite: single writer, disable pool (StaticPool handles thread safety).
+    # The API and the research worker are separate processes writing this
+    # file, so a writer waits up to 30 s for the lock instead of pysqlite's 5 s.
+    connect_args = {"check_same_thread": False, "timeout": 30}
     engine = create_engine(
         DATABASE_URL,
         connect_args=connect_args,

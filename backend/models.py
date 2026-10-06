@@ -4,7 +4,7 @@ import datetime as dt
 
 from sqlalchemy import (
     Column, String, Boolean, DateTime, Numeric, Integer, BigInteger, ForeignKey, Text, JSON,
-    UniqueConstraint, Sequence,
+    UniqueConstraint, Sequence, Index,
 )
 from sqlalchemy.orm import relationship
 
@@ -271,6 +271,47 @@ class ResearchTrial(Base):
     config_hash = Column(String(64), nullable=False)
     source = Column(String(32), nullable=False)  # backtest | walk_forward | event_backtest
     created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class ResearchJob(Base):
+    """A research computation queued by the API and run by a worker process.
+
+    status: queued -> running -> succeeded | failed | cancelled. A running
+    job is owned by ``worker_id`` only while ``lease_expires_at`` is in the
+    future; every write a worker makes is conditional on still holding it.
+    """
+    __tablename__ = "research_jobs"
+    __table_args__ = (Index("ix_research_jobs_status_created", "status", "created_at"),
+                      Index("ix_research_jobs_user_status", "user_id", "status"))
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    kind = Column(String(64), nullable=False)
+    params_json = Column(JSON, nullable=False)
+    status = Column(String(16), nullable=False, default="queued")
+    cancel_requested = Column(Boolean, nullable=False, default=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=2)
+    worker_id = Column(String(128), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    result_json = Column(JSON, nullable=True)
+    error_status = Column(Integer, nullable=True)   # HTTP-style status of a failure
+    error_detail = Column(Text, nullable=True)      # user-safe message, never a traceback
+
+
+class ResearchWorker(Base):
+    """Liveness record of a research worker process (heartbeat)."""
+    __tablename__ = "research_workers"
+
+    id = Column(String(128), primary_key=True)
+    hostname = Column(String(255), nullable=False)
+    pid = Column(Integer, nullable=False)
+    started_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    current_job_id = Column(String, nullable=True)
 
 
 class AuditChainLink(Base):

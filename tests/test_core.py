@@ -3,7 +3,6 @@ import pytest
 
 from backend import models, schemas
 from backend.crypto import pqc
-from backend.database import Base
 from backend.services import integration_service, signal_engine, trading_service
 
 
@@ -26,12 +25,9 @@ def test_schema_rejects_unsafe_webhook():
         schemas.WebhookRequest(url="http://127.0.0.1/hook")
 
 
-def test_api_key_scope_and_hashing():
-    from sqlalchemy import create_engine
+def test_api_key_scope_and_hashing(make_engine):
     from sqlalchemy.orm import sessionmaker
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+    session = sessionmaker(bind=make_engine())()
     raw, prefix, digest, _hmac_secret = integration_service.generate_api_key()
     user = models.User(email="scope@example.com", password_hash="x")
     session.add(user); session.commit()

@@ -11,12 +11,11 @@ import numpy as np
 import pandas as pd
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from backend import main, models, schemas
 from backend.crypto import pqc
-from backend.database import Base
 from backend.services import (backtest_service, event_simulator, historical_data, paper_broker,
                               research_trials, security_service, stat_tests, strategy_signals,
                               trading_service, walk_forward)
@@ -42,10 +41,8 @@ def random_walk(seed: int, n: int, drift: float = 0.0) -> np.ndarray:
 
 
 @pytest.fixture
-def db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+def db(make_engine):
+    session = sessionmaker(bind=make_engine())()
     yield session
     session.close()
 
@@ -325,11 +322,8 @@ class TestResearchTrials:
 # ── 6. Audit hash chain ─────────────────────────────────────────────────────
 
 @pytest.fixture
-def file_db(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'audit.db'}",
-                           connect_args={"check_same_thread": False, "timeout": 30})
-    Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine)
+def file_db(make_engine):
+    return sessionmaker(bind=make_engine())
 
 
 @pytest.fixture
@@ -394,13 +388,9 @@ class TestAuditChain:
         real_execute = db.execute
 
         def recording_execute(statement, *args, **kwargs):
-            sql = str(statement)
-            executed.append(sql)
-            if "pg_advisory_xact_lock" in sql:
-                return None
+            executed.append(str(statement))
             return real_execute(statement, *args, **kwargs)
 
-        monkeypatch.setattr(security_service, "_is_postgres", True)
         monkeypatch.setattr(db, "execute", recording_execute)
         security_service.write_audit_log(db, None, "LOCK_ORDER")
         lock = next(i for i, s in enumerate(executed) if "pg_advisory_xact_lock" in s)

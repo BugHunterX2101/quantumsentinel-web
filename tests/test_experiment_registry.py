@@ -11,11 +11,9 @@ Covers:
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend import models
-from backend.database import Base
 from backend.services.experiment_registry import (
     Experiment,
     ExperimentRegistry,
@@ -32,10 +30,8 @@ from backend.services.experiment_registry import (
 
 
 @pytest.fixture
-def db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+def db(make_engine):
+    session = sessionmaker(bind=make_engine())()
     yield session
     session.close()
 

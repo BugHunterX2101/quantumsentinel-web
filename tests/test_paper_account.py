@@ -7,19 +7,15 @@ import threading
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend import main, models, schemas
-from backend.database import Base
 from backend.services import order_security, paper_broker, portfolio_service, trading_service
 
 
 @pytest.fixture
-def db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+def db(make_engine):
+    session = sessionmaker(bind=make_engine())()
     yield session
     session.close()
 
@@ -187,11 +183,8 @@ class TestReservations:
             order(db, user, key="retry_key_0001", order_type="limit", limit_price=100.0, quantity=10)
         assert db.query(models.IdempotencyRecord).filter_by(idempotency_key="retry_key_0001").count() == 0
 
-    def test_reservation_is_atomic_under_concurrency(self, tmp_path):
-        engine = create_engine(f"sqlite:///{tmp_path / 'ledger.db'}",
-                               connect_args={"check_same_thread": False, "timeout": 30})
-        Base.metadata.create_all(engine)
-        Session = sessionmaker(bind=engine)
+    def test_reservation_is_atomic_under_concurrency(self, make_engine):
+        Session = sessionmaker(bind=make_engine())
         setup = Session()
         u = models.User(email="race@example.com", password_hash="x")
         setup.add(u)
@@ -232,6 +225,74 @@ class TestSells:
         order(db, user, side="sell", order_type="limit", limit_price=200.0, quantity=10)
         with pytest.raises(HTTPException, match="available paper position"):
             order(db, user, side="sell", quantity=5)
+
+    def test_a_replayed_order_nonce_is_refused_and_nothing_else_is_reported_as_one(self, db, user, market,
+                                                                                   monkeypatch):
+        import time
+        market["AAPL"] = 100.0
+        now = int(time.time())
+        envelope = {"timestamp": now, "expires_at": now + 60, "nonce": "replayed-nonce-0001"}
+        order(db, user, order_id="order-0000001", **envelope)
+        with pytest.raises(HTTPException) as exc:
+            order(db, user, order_id="order-0000002", **envelope)
+        assert exc.value.status_code == 409 and "nonce" in exc.value.detail
+        # Any other failure while committing an order is not a nonce replay.
+        monkeypatch.setattr(db, "commit", lambda: (_ for _ in ()).throw(RuntimeError("database down")))
+        with pytest.raises(RuntimeError, match="database down"):
+            order(db, user, order_id="order-0000003", nonce="fresh-nonce-000001",
+                  timestamp=now, expires_at=now + 60)
+
+    def test_concurrent_sells_of_one_holding_are_credited_once(self, make_engine, market):
+        """Each concurrent sell used to check the holding against the
+        positions projection, which is rebuilt only after a fill commits, so
+        several sells of the same 5 shares were all filled and all credited."""
+        Session = sessionmaker(bind=make_engine())
+        market["AAPL"] = 100.0
+        with Session() as setup:
+            u = models.User(email="race-sell@example.com", password_hash="x")
+            setup.add(u)
+            setup.commit()
+            order(setup, u, quantity=5)                                    # holds 5 AAPL
+            sells = [models.Trade(user_id=u.id, asset="AAPL", side="sell", quantity=5,
+                                  order_type="limit", limit_price=100, status="ACCEPTED") for _ in range(6)]
+            setup.add_all(sells)
+            setup.commit()
+            user_id, sell_ids = u.id, [t.id for t in sells]
+            cash_before = paper_broker.get_or_create_account(setup, user_id).cash_micros
+        outcomes, barrier = [], threading.Barrier(len(sell_ids))
+
+        def fill(trade_id):
+            with Session() as s:
+                trade = s.get(models.Trade, trade_id)
+                barrier.wait()
+                outcomes.append(paper_broker.fill_order(s, trade, 100.0).status)
+
+        threads = [threading.Thread(target=fill, args=(tid,)) for tid in sell_ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(outcomes) == ["FILLED"] + ["REJECTED"] * 5
+        with Session() as check:
+            cash_after = check.get(models.PaperAccount, user_id).cash_micros
+            assert cash_after - cash_before == paper_broker.to_micros(500)   # one sale of 5 x $100
+            assert paper_broker.held_quantity(check, user_id, "AAPL") == 0
+
+    def test_the_fill_time_holding_agrees_with_the_positions_shown_to_the_user(self, db, user):
+        """An account damaged by the old double-sell race has two filled sells
+        of one 5-share buy. Positions clamp each sell at zero; the holding the
+        sell check uses must count the same way, or a later legitimate sell of
+        newly bought shares would be refused."""
+        import datetime as dt
+
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        for minutes, side in enumerate(["buy", "sell", "sell", "buy"]):
+            db.add(models.Trade(user_id=user.id, asset="AAPL", side=side, quantity=5, order_type="market",
+                                status="FILLED", filled_price=100, filled_at=start + dt.timedelta(minutes=minutes)))
+        db.commit()
+        portfolio_service.recompute_positions(db, user.id)
+        shown = db.query(models.Position).filter_by(user_id=user.id, asset="AAPL").one().quantity
+        assert paper_broker.held_quantity(db, user.id, "AAPL") == shown == 5
 
     def test_sell_fill_larger_than_holding_is_rejected_not_credited(self, db, user, market):
         market["AAPL"] = 100.0
@@ -295,6 +356,57 @@ class TestLifecycle:
             main.cancel_order(placed["order_id"], user, db)
         assert exc.value.status_code == 400
         assert account(db, user)["reserved_cash"] == 0.0
+
+    def test_the_sweep_loads_exactly_the_orders_the_price_can_act_on(self, db, user):
+        """The SQL pre-filter must select precisely the resting orders the
+        sweep loop would fill or convert: none left behind, none loaded in vain."""
+        import random
+
+        from sqlalchemy import select
+
+        rng = random.Random(20261006)
+        last = 100.0
+        prices = [None, 99.99, 100.0, 100.01, 50.0, 150.0]
+        for _ in range(400):
+            db.add(models.Trade(user_id=user.id, asset="AAPL", status="ACCEPTED", quantity=1,
+                                side=rng.choice(["buy", "sell"]),
+                                order_type=rng.choice(["limit", "stop", "stop_limit", "market"]),
+                                limit_price=rng.choice(prices), stop_price=rng.choice(prices)))
+        db.commit()
+
+        def acts_on(t):  # the sweep loop's own decision, order by order
+            limit = float(t.limit_price) if t.limit_price is not None else None
+            stop = float(t.stop_price) if t.stop_price is not None else None
+            if t.order_type == "limit" and limit is not None:
+                return trading_service.check_pending_limit_fill("AAPL", t.side, limit, last_price=last) is not None
+            if t.order_type in ("stop", "stop_limit") and stop is not None:
+                fill = trading_service.simulate_fill("AAPL", t.side, 1, t.order_type, limit, stop, last_price=last)
+                return fill["status"] == "FILLED" or (t.order_type == "stop_limit"
+                                                      and paper_broker.stop_triggered(t.side, stop, last))
+            return True
+
+        every = db.execute(select(models.Trade).where(models.Trade.status == "ACCEPTED")).scalars().all()
+        expected = {t.id for t in every if acts_on(t)}
+        selected = set(db.execute(select(models.Trade.id).where(
+            models.Trade.status == "ACCEPTED", paper_broker._actionable(last))).scalars())
+        assert selected == expected
+        assert 0 < len(expected) < len(every)
+
+    def test_only_one_process_sweeps_at_a_time(self, db, user, market, monkeypatch):
+        from sqlalchemy import func, select
+
+        from backend.database import engine
+        monkeypatch.setattr(main, "SessionLocal", lambda: db)
+        monkeypatch.setattr(db, "close", lambda: None)
+        market["AAPL"] = 150.0
+        order(db, user, order_type="limit", limit_price=100.0, quantity=10)
+        market["AAPL"] = 95.0
+        with engine.connect() as other_process:
+            assert other_process.execute(select(func.pg_try_advisory_lock(main._SWEEP_LOCK_KEY))).scalar()
+            assert main.sweep_open_orders_once() == 0          # another sweeper holds the tick
+            other_process.execute(select(func.pg_advisory_unlock(main._SWEEP_LOCK_KEY)))
+            other_process.commit()
+        assert main.sweep_open_orders_once() == 1
 
     def test_sweep_writes_audit_entries_for_fills(self, db, user, market, monkeypatch):
         monkeypatch.setattr(main, "SessionLocal", lambda: db)

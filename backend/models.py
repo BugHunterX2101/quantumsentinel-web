@@ -4,7 +4,7 @@ import datetime as dt
 
 from sqlalchemy import (
     Column, String, Boolean, DateTime, Numeric, Integer, BigInteger, ForeignKey, Text, JSON,
-    UniqueConstraint, Sequence, Index,
+    UniqueConstraint, Sequence, Index, text,
 )
 from sqlalchemy.orm import relationship
 
@@ -43,7 +43,7 @@ class User(Base):
 class KeyPair(Base):
     __tablename__ = "key_pairs"
     id = Column(String, primary_key=True, default=gen_uuid)
-    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
     algorithm = Column(String(50), nullable=False)  # ML-KEM-768 | ML-DSA-65 | X25519
     public_key = Column(Text, nullable=False)  # base64
     private_key = Column(Text, nullable=True)  # base64 — demo only; a real client keeps this on-device
@@ -58,6 +58,7 @@ class KeyPair(Base):
 
 class Strategy(Base):
     __tablename__ = "strategies"
+    __table_args__ = (Index("ix_strategies_user_created", "user_id", "created_at"),)
     id = Column(String, primary_key=True, default=gen_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     name = Column(String, nullable=False)
@@ -105,7 +106,8 @@ class Webhook(Base):
     id = Column(String, primary_key=True, default=gen_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
     url = Column(String(2048), nullable=False)
-    secret_hash = Column(String(128), nullable=False)
+    # Fernet ciphertext of the signing secret (about 140 characters), not a hash.
+    secret_hash = Column(Text, nullable=False)
     event_types = Column(JSON, default=list)
     is_active = Column(Boolean, default=True)
     last_delivery_at = Column(DateTime(timezone=True), nullable=True)
@@ -114,6 +116,11 @@ class Webhook(Base):
 
 class Trade(Base):
     __tablename__ = "trades"
+    # Every per-user read (orders, positions, exposure, holdings) filters on
+    # user_id and usually status; the sweeper reads only resting orders, by asset.
+    __table_args__ = (Index("ix_trades_user_status_filled", "user_id", "status", "filled_at"),
+                      Index("ix_trades_accepted_asset", "asset", "submitted_at",
+                            postgresql_where=text("status = 'ACCEPTED'")))
     id = Column(String, primary_key=True, default=gen_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     asset = Column(String, nullable=False)
@@ -135,6 +142,7 @@ class Trade(Base):
 
 class Position(Base):
     __tablename__ = "positions"
+    __table_args__ = (Index("ix_positions_user_asset", "user_id", "asset"),)
     id = Column(String, primary_key=True, default=gen_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     asset = Column(String, nullable=False)
@@ -175,6 +183,7 @@ class SignalRecord(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
+    __table_args__ = (Index("ix_audit_logs_user_created", "user_id", "created_at"),)
     id = Column(String, primary_key=True, default=gen_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=True)
     action = Column(String, nullable=False)
@@ -202,6 +211,11 @@ class OrderSecurityRecord(Base):
     signature = Column(Text, nullable=False)
     signature_mode = Column(String(32), nullable=False)  # client_mldsa | development_server
     created_at = Column(DateTime(timezone=True), default=utcnow)
+
+    # Declares the dependency on trades so a flush that adds an order and its
+    # record together inserts the trade first; without it the record could be
+    # inserted first and violate its foreign key.
+    trade = relationship("Trade")
 
 
 class IdempotencyRecord(Base):
@@ -319,7 +333,7 @@ class AuditChainLink(Base):
     __tablename__ = "audit_chain_links"
 
     id = Column(String, primary_key=True, default=gen_uuid)
-    sequence = Column(Integer, nullable=False, unique=True)
+    sequence = Column(BigInteger, nullable=False, unique=True)
     audit_log_id = Column(String, ForeignKey("audit_logs.id"), nullable=False, unique=True, index=True)
     previous_hash = Column(String(64), nullable=False)
     entry_hash = Column(String(64), nullable=False, unique=True)
@@ -337,7 +351,7 @@ class RefreshToken(Base):
 
     id = Column(String, primary_key=True, default=gen_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
-    token_hash = Column(String(64), nullable=False, index=True)  # SHA-256 of the opaque token
+    token_hash = Column(String(64), nullable=False)  # SHA-256 of the opaque token (unique: uq_refresh_token_hash)
     family_id = Column(String, nullable=False, index=True)       # rotation chain family
     is_used = Column(Boolean, default=False)                     # set True on rotation
     is_revoked = Column(Boolean, default=False)                  # set True on reuse-detection

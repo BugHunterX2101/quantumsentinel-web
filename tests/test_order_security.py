@@ -2,19 +2,18 @@ import datetime as dt
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend import models
-from backend.database import Base
 from backend.services import order_security, security_service
 
 
 @pytest.fixture
-def db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+def db(make_engine):
+    session = sessionmaker(bind=make_engine())()
+    # PostgreSQL enforces foreign keys: the user these tests act as must exist.
+    session.add(models.User(id="u1", email="u1@example.com", password_hash="x"))
+    session.commit()
     yield session
     session.close()
 
@@ -38,6 +37,32 @@ def test_idempotency_returns_original_response_and_rejects_payload_change(db):
     assert order_security.reserve_idempotency(db, "u1", "key_12345678", "a" * 64) == {"order_id": "one"}
     with pytest.raises(HTTPException, match="different payload"):
         order_security.reserve_idempotency(db, "u1", "key_12345678", "b" * 64)
+
+
+def test_an_integrity_failure_that_is_not_a_key_race_is_raised_not_retried_forever(make_engine):
+    """Only a concurrent reservation of the same key may be retried. Every
+    other IntegrityError (here: a user that does not exist) used to be
+    retried recursively, without end, pinning a CPU core."""
+    import threading
+
+    from sqlalchemy.exc import IntegrityError
+
+    session = sessionmaker(bind=make_engine())()
+    outcome = []
+
+    def reserve():
+        try:
+            order_security.reserve_idempotency(session, "no-such-user", "key_12345678", "a" * 64)
+            outcome.append("returned")
+        except Exception as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=reserve, daemon=True)
+    worker.start()
+    worker.join(30)
+    session.close()
+    assert outcome, "reserve_idempotency never returned"
+    assert isinstance(outcome[0], IntegrityError)
 
 
 def test_risk_gate_honours_asset_kill_switch():

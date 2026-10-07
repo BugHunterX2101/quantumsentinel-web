@@ -17,11 +17,10 @@ import numpy as np
 import pandas as pd
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from backend import main, models, schemas, worker
-from backend.database import Base
 from backend.services import (backtest_service, research_jobs, research_tasks, research_trials,
                               security_service)
 
@@ -29,12 +28,8 @@ from backend.services import (backtest_service, research_jobs, research_tasks, r
 # ── fixtures and helpers ──────────────────────────────────────────────────────
 
 @pytest.fixture
-def Session(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'jobs.db'}",
-                           connect_args={"check_same_thread": False, "timeout": 30})
-    Base.metadata.create_all(engine)
-    yield sessionmaker(bind=engine)
-    engine.dispose()
+def Session(make_engine):
+    return sessionmaker(bind=make_engine())
 
 
 @pytest.fixture
@@ -629,12 +624,11 @@ def test_results_are_encoded_like_the_api_did_with_nan_as_null():
 
 # ── 6. Embedded worker lifecycle ─────────────────────────────────────────────────
 
-def test_embedded_worker_stops_when_the_api_process_dies(tmp_path):
+def test_embedded_worker_stops_when_the_api_process_dies(tmp_path, make_engine):
     """Killed outright (no lifespan shutdown: a hard kill, or uvicorn --reload
     on Windows), the API process must not leave its worker running as an orphan."""
-    db_url = f"sqlite:///{(tmp_path / 'lifeline.db').as_posix()}"
-    engine = create_engine(db_url)
-    Base.metadata.create_all(engine)
+    engine = make_engine(migrated=True)
+    db_url = engine.url.render_as_string(hide_password=False)
     Session = sessionmaker(bind=engine)
     pid_file = tmp_path / "worker.pid"
     # Stands in for the API process: starts the worker exactly as main does.

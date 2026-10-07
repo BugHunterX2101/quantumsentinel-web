@@ -39,13 +39,15 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from starlette.concurrency import run_in_threadpool
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import redis.asyncio as redis
 
 from . import models, schemas
-from .database import get_db, init_db, SessionLocal
+from .database import engine, get_db, init_db, SessionLocal
 from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS,
                      COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
                      REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT, OPERATOR_ROLES,
@@ -271,18 +273,35 @@ async def _order_sweeper() -> None:
             log.exception("order sweeper iteration failed")
 
 
+_SWEEP_LOCK_KEY = 7_316_405_312_119
+
+
 def sweep_open_orders_once() -> int:
-    db = SessionLocal()
-    try:
-        settled = 0
-        for trade, outcome in paper_broker.process_open_orders(db):
-            if outcome.status == "NOT_OPEN":
-                continue
-            _record_order_outcome(db, trade, outcome.reason)
-            settled += 1
-        return settled
-    finally:
-        db.close()
+    """One sweep, by at most one process at a time across the deployment.
+
+    Every API process runs a sweeper; whichever takes the advisory lock
+    first sweeps and the rest skip this tick, instead of all of them loading
+    the same orders and fetching the same prices. Session-level lock on a
+    connection of its own: fills commit several times during a sweep.
+    """
+    with engine.connect() as lock:
+        if not lock.execute(select(func.pg_try_advisory_lock(_SWEEP_LOCK_KEY))).scalar():
+            return 0
+        try:
+            db = SessionLocal()
+            try:
+                settled = 0
+                for trade, outcome in paper_broker.process_open_orders(db):
+                    if outcome.status == "NOT_OPEN":
+                        continue
+                    _record_order_outcome(db, trade, outcome.reason)
+                    settled += 1
+                return settled
+            finally:
+                db.close()
+        finally:
+            lock.execute(select(func.pg_advisory_unlock(_SWEEP_LOCK_KEY)))
+            lock.commit()
 
 
 # /docs, /redoc and the raw OpenAPI schema disclose every route, request/
@@ -313,6 +332,23 @@ async def _risk_state_unavailable(_request, _exc):
     # Security-critical shared state (kill switches) could not be read:
     # refuse the action rather than assume the state is permissive.
     return JSONResponse({"detail": "risk state unavailable"}, status_code=503)
+
+
+@app.exception_handler(SQLAlchemyTimeoutError)
+async def _database_busy(_request, _exc):
+    # Every pooled connection stayed busy for DB_POOL_TIMEOUT_SECONDS: shed
+    # the request with a retryable status instead of a 500.
+    log.warning("database connection pool exhausted")
+    return JSONResponse({"detail": "database busy, retry shortly"}, status_code=503,
+                        headers={"Retry-After": "1"})
+
+
+@app.exception_handler(OperationalError)
+async def _database_unavailable(_request, exc):
+    # Server unreachable, connection lost, or a statement/lock timeout fired.
+    log.error("database operation failed: %s", exc.orig if exc.orig is not None else exc)
+    return JSONResponse({"detail": "database unavailable, retry shortly"}, status_code=503,
+                        headers={"Retry-After": "5"})
 
 HTTP_REQUESTS = Counter("quantumsentinel_http_requests_total", "HTTP requests", ["method", "path", "status"])
 HTTP_LATENCY = Histogram("quantumsentinel_http_request_duration_seconds", "HTTP request latency", ["method", "path"])
@@ -508,7 +544,9 @@ def liveness():
 
 @app.get("/health/ready", include_in_schema=False)
 async def readiness(db: Session = Depends(get_db)):
-    db.execute(select(1))
+    # Blocking I/O: run it off the event loop so a slow or saturated database
+    # cannot stall every other request this process is serving.
+    await run_in_threadpool(db.execute, select(1))
     if _redis_client:
         await _redis_client.ping()
     return {"status": "ready", "database": "ok",
@@ -1348,7 +1386,12 @@ def place_order(req: schemas.OrderRequest, user: models.User = Depends(get_curre
     except Exception as exc:
         db.rollback()
         order_security.release_idempotency(db, user.id, idempotency_key)
-        raise HTTPException(409, "order nonce has already been used") from exc
+        # Only the nonce's own uniqueness constraint means a replayed nonce;
+        # anything else is a real failure and must surface as one.
+        constraint = getattr(getattr(getattr(exc, "orig", None), "diag", None), "constraint_name", None)
+        if isinstance(exc, IntegrityError) and constraint == "uq_order_security_user_nonce":
+            raise HTTPException(409, "order nonce has already been used") from exc
+        raise
     db.refresh(trade)
 
     if quote_stale:

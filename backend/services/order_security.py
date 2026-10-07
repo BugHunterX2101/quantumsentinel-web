@@ -116,8 +116,13 @@ def reserve_idempotency(db: Session, user_id: str, key: str | None,
     db.add(models.IdempotencyRecord(user_id=user_id, idempotency_key=key, request_hash=payload_hash))
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
+        # A concurrent request reserved the same key first: its committed row
+        # now decides (replay, conflict or in progress). Any other integrity
+        # failure is not a race and retrying it would loop forever.
+        if getattr(getattr(exc.orig, "diag", None), "constraint_name", None) != "uq_idempotency_user_key":
+            raise
         return reserve_idempotency(db, user_id, key, payload_hash)
     return None
 

@@ -9,23 +9,20 @@ from pathlib import Path
 import jwt
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from backend import main, models, schemas
-from backend.database import Base, get_db
+from backend.database import get_db
 from backend.services import auth_service, integration_service, order_security, redis_store, security_service
 
 ORIGIN = "http://localhost:8000"
 
 
 @pytest.fixture
-def Session(tmp_path, monkeypatch):
-    engine = create_engine(f"sqlite:///{tmp_path / 'sec.db'}", connect_args={"check_same_thread": False})
-    Base.metadata.create_all(engine)
-    factory = sessionmaker(bind=engine)
+def Session(make_engine, monkeypatch):
+    factory = sessionmaker(bind=make_engine())
     monkeypatch.setattr(main, "SessionLocal", factory)
 
     def override():

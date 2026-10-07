@@ -99,7 +99,7 @@ flowchart TB
     end
 
     subgraph Persistence["Persistence"]
-        DB[("SQLite / PostgreSQL\nSQLAlchemy 2.0\nRefresh tokens · Key history")]
+        DB[("PostgreSQL 16\nSQLAlchemy 2.0 · Alembic\nRefresh tokens · Key history")]
         REDIS[("Redis\nRate limiting · Nonce replay\nKill switches · Refresh cache")]
     end
 
@@ -422,7 +422,8 @@ quantumsentinel-web/
 │   ├── main.py                          ← Central router · middleware · WebSocket · SPA fallback
 │   ├── models.py                        ← SQLAlchemy 2.0 schema (20 tables)
 │   ├── schemas.py                       ← Pydantic v2 request/response validation (all endpoints)
-│   ├── database.py                      ← Engine · session factory · init_db()
+│   ├── database.py                      ← PostgreSQL engine · pool · session limits · migrate()
+│   ├── migrations/                      ← Alembic schema revisions (applied at startup or via manage.py)
 │   ├── config.py                        ← ENV-driven config with production safety constraints
 │   ├── worker.py                        ← Research worker: claims jobs · runs each in a killable child process
 │   │
@@ -493,6 +494,7 @@ quantumsentinel-web/
 │   ├── test_order_security.py           ← Canonical order · nonce/idempotency · risk gate · kill-switch
 │   ├── test_research_governance.py      ← Experiment metadata · data lineage · reproducibility
 │   ├── test_research_jobs.py            ← Job queue · leases · cancel · timeouts · worker lifecycle
+│   ├── test_database.py                 ← Migrations · SQLite import · session limits · DB races
 │   ├── test_security_hardening.py       ← PQC handshake · audit chain · key rotation · CSRF
 │   ├── test_microstructure.py           ← L2 analytics · OBI · microprice · synthetic L2 replay
 │   ├── test_paper_exchange.py           ← Order book · matching engine · paper exchange · FIFO
@@ -507,7 +509,7 @@ quantumsentinel-web/
 │
 ├── .env.example                         ← Development environment template
 ├── Dockerfile                           ← Multi-stage Python image
-├── docker-compose.yml                   ← Dev/demo: SQLite, single container
+├── docker-compose.yml                   ← Dev: app + PostgreSQL 16
 ├── docker-compose.production.yml        ← Prod: PostgreSQL + Redis + Nginx + Gunicorn
 ├── requirements.txt                     ← Pinned dependencies
 ├── SECURITY.md                          ← Threat model · hardening checklist · responsible disclosure
@@ -524,6 +526,7 @@ quantumsentinel-web/
 |---|---|
 | **Python 3.12+** | Official CPython from [python.org](https://python.org) — tested on 3.12 and 3.13 in CI |
 | **Git** | Any recent version |
+| **PostgreSQL 16+** | The only supported database. `docker compose up -d postgres` starts one with the default credentials; any reachable PostgreSQL works via `DATABASE_URL` |
 | **C++ compiler** *(optional)* | MinGW-W64 GCC 16+ (Windows) · GCC 11+ (Linux) · Clang 14+ (macOS) — only needed for C++ kernel speedup |
 
 ### 1 — Clone & Install
@@ -558,8 +561,11 @@ cp .env.example .env
 ### 3 — Run
 
 ```bash
+docker compose up -d postgres        # or point DATABASE_URL at your own PostgreSQL
 uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
 ```
+
+- The schema is created and migrated automatically at startup (Alembic, `backend/migrations`).
 
 - App: **http://127.0.0.1:8000**
 - Interactive API docs: **http://127.0.0.1:8000/docs**
@@ -738,6 +744,7 @@ Research runs as background jobs, never inside the request. The dashboard backte
 - [ ] Configure `WEBHOOK_ENCRYPTION_KEY` and `PRIVATE_KEY_ENCRYPTION_KEY` (Fernet)
 - [ ] Replace `reference` PQC backend with a reviewed liboqs/HSM adapter
 - [ ] Enable PostgreSQL with encrypted connections
+- [ ] Size connection pools: (API processes + research workers) × (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`) must stay below PostgreSQL's `max_connections`
 - [ ] Configure Redis with AUTH password and AOF persistence
 - [ ] Set strict `CORS_ORIGINS` and `ALLOWED_HOSTS` — no wildcards in production
 - [ ] Place TLS 1.3 certificates at `deploy/tls/fullchain.pem` and `deploy/tls/privkey.pem`
@@ -754,7 +761,14 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | Variable | Required | Description |
 |---|---|---|
 | `ENVIRONMENT` | No | `development` (default) or `production` |
-| `DATABASE_URL` | No | SQLite by default; set Postgres DSN for production |
+| `DATABASE_URL` | Prod | PostgreSQL URL (`postgresql+psycopg://user:password@host:5432/db`; `postgresql://` and `postgres://` are accepted). Any other database is refused at startup. Default: the `docker-compose.yml` dev database |
+| `DB_POOL_SIZE` | No | Connections each process keeps open (default 20) |
+| `DB_MAX_OVERFLOW` | No | Extra connections a process may open for bursts; they are closed when returned, so steady load should fit in `DB_POOL_SIZE` (default 0) |
+| `DB_POOL_TIMEOUT_SECONDS` | No | Wait for a free connection before answering 503 (default 10) |
+| `DB_STATEMENT_TIMEOUT_MS` | No | Server-side limit on any one statement (default 30000) |
+| `DB_LOCK_TIMEOUT_MS` | No | Server-side limit on waiting for a lock (default 10000) |
+| `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | No | A session idle inside an open transaction is ended after this long (default 60000) |
+| `DB_MIGRATE_ON_STARTUP` | No | `true` (default): API processes apply pending migrations at startup, serialised by a database lock; `false`: run `python -m backend.manage migrate` as a release step |
 | `JWT_PRIVATE_KEY` | Prod | RS256 private key (PEM, `\n`-escaped) |
 | `JWT_PUBLIC_KEY` | Prod | RS256 public key (PEM, `\n`-escaped) |
 | `WEBHOOK_ENCRYPTION_KEY` | Prod | Fernet key for encrypting webhook signing secrets at rest |
@@ -780,6 +794,30 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 
 ---
 
+## Database (PostgreSQL)
+
+PostgreSQL 16 or newer is the only supported database; any other `DATABASE_URL` is refused at startup.
+
+- **Migrations.** The schema is versioned with Alembic in [`backend/migrations`](backend/migrations). Each API process applies pending revisions at startup, serialised across processes by a database lock and atomic thanks to PostgreSQL's transactional DDL. To migrate as a separate release step instead, set `DB_MIGRATE_ON_STARTUP=false` and run `python -m backend.manage migrate`. Research workers wait until the schema is at their code's revision.
+- **Moving from SQLite** (releases before 1.3): `python -m backend.manage import-sqlite path/to/quantumsentinel.db` copies every row into the configured, empty PostgreSQL database in one transaction, then verifies the row counts and the audit hash chain before committing. It refuses a database that already has rows.
+- **Connection budget.** Every API process and research worker has its own pool: keep (processes) × (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`) below the server's `max_connections` (100 by default), leaving room for maintenance sessions. The default of 20 per process fits four API processes plus their workers.
+- **Large tables.** The indexes added by migration `0002` are created `IF NOT EXISTS`; on a large `trades` or `audit_logs` table, build them first with `CREATE INDEX CONCURRENTLY` under the same names to avoid blocking writes during the upgrade.
+- **Connection poolers.** Each session is configured when it connects (UTC, statement/lock/idle timeouts) and the order sweeper uses a session-level advisory lock, so a PgBouncer in front of the database must use session pooling, not transaction pooling.
+
+### Measured capacity
+
+One run of 1,000,000 requests: 1,000 users, a mix of portfolio, orders, watchlist, jobs, audit-log and settings-update requests, against 4 API processes and PostgreSQL 16 holding 1M trades and 1M audit events, all on one 8-core Windows laptop together with the load generator:
+
+| Requests | Succeeded | Throughput | p50 | p90 | p99 | Peak DB connections |
+|---|---|---|---|---|---|---|
+| 1,000,000 | 99.9963% | 514/s | 101 ms | 158 ms | 257 ms | 76 of 100 |
+
+37 requests did not succeed: 13 answered with a 5xx and 24 ended in a client-side connection error or timeout. Every one of the 13 server-side failures traces to Windows socket-buffer exhaustion (`WinError 10055`) in the event loop during the first minutes of the run, and the server logged no other error, so none traces to application code or the database. The production image runs on Linux.
+
+Requests that write the audit trail (logins, orders, fills) are limited differently: each is signed with the pure-Python ML-DSA reference implementation (about 120–180 ms per signature), and the hash chain signs its checkpoint while holding a lock shared by every process, so audited writes top out at roughly 5–7 per second across a deployment.
+
+---
+
 ## Cache TTL Reference
 
 | Cache | TTL | Description |
@@ -793,7 +831,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 
 ## Docker
 
-### Development (SQLite)
+### Development (app + PostgreSQL 16)
 
 ```bash
 docker compose up --build
@@ -833,8 +871,10 @@ docker compose -f docker-compose.production.yml --env-file .env.production up -d
 ## Verification
 
 ```bash
-# Run the full test suite (CI is the source of truth for the test count)
-pytest tests/ -v
+# Run the full test suite against PostgreSQL (CI is the source of truth for the test count).
+# TEST_DATABASE_URL names a database the suite may use freely; each test gets its own schema.
+docker compose up -d postgres
+TEST_DATABASE_URL=postgresql+psycopg://quantumsentinel:quantumsentinel@localhost:5432/quantumsentinel_test pytest tests/ -v
 
 # Compile every backend module and test
 python -m compileall -q backend tests

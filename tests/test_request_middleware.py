@@ -1,6 +1,8 @@
 """The outermost request middleware: security headers, per-principal rate
 limiting and request metrics, on every kind of HTTP response."""
+import time
 import uuid
+from collections import OrderedDict
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
@@ -268,3 +270,56 @@ class TestMetrics:
         assert requests_counted("GET", label, "404") == before[0] + 10
         assert requests_counted("GET", label, "429") == before[1]
         assert requests_counted("GET", path, "429") == 0
+
+
+class TestRateLimitBuckets:
+    @pytest.fixture(autouse=True)
+    def empty_map(self, monkeypatch):
+        monkeypatch.setattr(main, "_request_windows", OrderedDict())
+
+    def hit(self, key, now):
+        window = main._rate_window(key, now)
+        while window and now - window[0] > main._RATE_WINDOW_SECONDS:
+            window.popleft()
+        window.append(now)
+        return len(window)
+
+    def test_counts_hits_inside_the_window(self):
+        assert [self.hit("a", t) for t in (0.0, 1.0, 2.0)] == [1, 2, 3]
+        assert self.hit("a", 61.5) == 2
+        assert self.hit("b", 61.5) == 1
+
+    def test_expired_buckets_are_dropped(self):
+        for i in range(5):
+            self.hit(f"old-{i}", float(i))
+        self.hit("live", 30.0)
+        self.hit("new", 64.5)
+        assert list(main._request_windows) == ["live", "new"]
+
+    def test_a_bucket_in_use_is_kept_while_older_ones_expire(self):
+        self.hit("busy", 0.0)
+        self.hit("idle", 1.0)
+        self.hit("busy", 50.0)
+        self.hit("other", 70.0)
+        assert list(main._request_windows) == ["busy", "other"]
+        assert self.hit("busy", 100.0) == 2
+
+    def test_cap_evicts_the_least_recently_seen_bucket(self, monkeypatch):
+        monkeypatch.setattr(main, "_RATE_MAX_KEYS", 3)
+        for i, key in enumerate(("a", "b", "c")):
+            self.hit(key, float(i))
+        self.hit("a", 3.0)
+        self.hit("d", 4.0)
+        assert list(main._request_windows) == ["c", "a", "d"]
+        assert len(main._request_windows) == 3
+
+    def test_a_full_map_of_live_buckets_stays_cheap(self):
+        for i in range(main._RATE_MAX_KEYS):
+            self.hit(f"k{i}", i / 1000)
+        started = time.perf_counter()
+        for i in range(5_000):
+            self.hit(f"new{i}", 20.0 + i / 1000)
+        elapsed = time.perf_counter() - started
+        assert len(main._request_windows) == main._RATE_MAX_KEYS
+        # The previous scan-and-sort per call took ~68 s for these 5,000 calls.
+        assert elapsed < 1.0, elapsed

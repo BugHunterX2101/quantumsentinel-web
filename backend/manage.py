@@ -3,6 +3,7 @@
     python -m backend.manage set-role <email> <user|risk_admin|admin>
     python -m backend.manage migrate
     python -m backend.manage import-sqlite <path/to/quantumsentinel.db>
+    python -m backend.manage generate-server-key
 
 Roles are granted only here — out of band, by someone with shell access to
 the deployment — never through the web API, so no self-registered account
@@ -11,7 +12,9 @@ can acquire operator privileges.
 ``migrate`` applies pending schema migrations (the API also does this at
 startup unless DB_MIGRATE_ON_STARTUP=false). ``import-sqlite`` moves the data
 of a deployment that ran on SQLite (releases before 1.3) into the configured
-PostgreSQL database.
+PostgreSQL database. ``generate-server-key`` prints a new server ML-DSA
+signing key as the SERVER_DSA_* settings (run it before those are set: a
+production configuration refuses to load without them).
 """
 import argparse
 import sys
@@ -33,8 +36,12 @@ def main(argv: list[str] | None = None) -> int:
     import_sqlite = commands.add_parser(
         "import-sqlite", help="copy every row of a SQLite database into the (empty) PostgreSQL database")
     import_sqlite.add_argument("path", type=Path)
+    commands.add_parser("generate-server-key",
+                        help="print a new ML-DSA-65 server signing key as SERVER_DSA_* settings")
     args = parser.parse_args(argv)
 
+    if args.command == "generate-server-key":
+        return _generate_server_key()
     if args.command == "migrate":
         from .database import migrate
         print(f"database schema at revision {migrate()}")
@@ -59,6 +66,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         db.close()
+
+
+def _generate_server_key() -> int:
+    """Print a new server signing key, ready to paste into the environment.
+
+    The private key is a 32-byte FIPS 204 seed, which signs through native
+    ML-DSA. Expanded keys made by earlier releases keep working but sign
+    through the much slower dilithium-py. Replacing a key never orphans what
+    it signed: every key a process has signed with is kept in
+    server_signing_keys, which is what audit verification reads.
+    """
+    import datetime as dt
+    import hashlib
+
+    from .crypto import pqc
+
+    pk, sk, _ = pqc.dsa_keygen()
+    print(f"SERVER_DSA_PRIVATE_KEY={pqc.b64(sk)}")
+    print(f"SERVER_DSA_PUBLIC_KEY={pqc.b64(pk)}")
+    print(f"SERVER_DSA_CREATED_AT={dt.datetime.now(dt.timezone.utc).isoformat()}")
+    print(f"TRUSTED_SERVER_DSA_FINGERPRINT={hashlib.sha256(pk).hexdigest()}")
+    return 0
 
 
 def _import_sqlite(path: Path, target_engine=None) -> int:

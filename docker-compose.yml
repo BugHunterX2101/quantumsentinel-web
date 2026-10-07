@@ -32,7 +32,7 @@ services:
       - WEBHOOK_ENCRYPTION_KEY=${WEBHOOK_ENCRYPTION_KEY:-}
       - PRIVATE_KEY_ENCRYPTION_KEY=${PRIVATE_KEY_ENCRYPTION_KEY:-}
       # Persist server DSA identity so audit logs remain verifiable across restarts.
-      # Generate once with the /api/security/rotate-keys endpoint and copy SERVER_DSA_* from the response.
+      # Generate once with: python -m backend.manage generate-server-key
       - SERVER_DSA_PRIVATE_KEY=${SERVER_DSA_PRIVATE_KEY:-}
       - SERVER_DSA_PUBLIC_KEY=${SERVER_DSA_PUBLIC_KEY:-}
       - SERVER_DSA_CREATED_AT=${SERVER_DSA_CREATED_AT:-}

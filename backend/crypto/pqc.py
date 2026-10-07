@@ -8,14 +8,18 @@ liboqs test-vector validation). Byte sizes match the spec exactly:
 
 A pure-Python implementation is slower than liboqs' C/AVX2 code (~28ms keygen
 vs ~10µs), but it is byte-for-byte spec compliant and requires no compiled
-system library — ideal for a portable, auditable web deployment.
+system library — ideal for a portable, auditable web deployment. ML-DSA uses
+the native OpenSSL implementation through `cryptography` when available (see
+the ML-DSA section below).
 
 Classical leg of the hybrid handshake uses X25519 from `cryptography`
 (OpenSSL-backed). Session key = HKDF-SHA256(X25519_secret || ML-KEM_secret).
 """
 import base64
+import functools
 import hashlib
 import hmac
+import os
 import threading
 import time
 
@@ -90,34 +94,98 @@ def kem_decapsulate(sk: bytes, ciphertext: bytes):
 # --------------------------------------------------------------------------
 # ML-DSA-65 (FIPS 204)
 # --------------------------------------------------------------------------
+# Signatures and public keys are the FIPS 204 encodings whichever
+# implementation handles them, so either one verifies the other's signatures.
+# Native ML-DSA (`cryptography` >= 48 on OpenSSL >= 3.5, which its wheels
+# bundle) verifies ~65x and signs ~30x faster than dilithium-py and is used
+# whenever the installed build supports it; dilithium-py remains the fallback.
+#
+# Private keys come in two forms. A 32-byte seed (FIPS 204's xi, what
+# dsa_keygen returns) works with both implementations. The 4032-byte expanded
+# key that earlier releases generated can only be loaded by dilithium-py, so
+# keys already stored in that form keep signing through it.
+DSA_SEED_BYTES = 32
+
+try:
+    from cryptography.exceptions import InvalidSignature as _InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric import mldsa as _mldsa
+
+    # The module exists from cryptography 47, but only works on a backend
+    # with ML-DSA support: prove a sign/verify round trip before relying on it.
+    _probe_key = _mldsa.MLDSA65PrivateKey.generate()
+    _probe_key.public_key().verify(_probe_key.sign(b"probe"), b"probe")
+    NATIVE_ML_DSA = True
+    del _probe_key
+except Exception:  # ImportError, UnsupportedAlgorithm, or a backend fault
+    NATIVE_ML_DSA = False
+
 # Without the optional `xoflib` package, dilithium-py hashes through one
 # module-level SHAKE-256 object whose buffer is shared by every caller, so two
 # threads signing or verifying at once read each other's XOF stream and
-# produce invalid signatures. Serialise all ML-DSA operations; the pure-Python
-# implementation holds the GIL throughout, so this costs no parallelism.
+# produce invalid signatures. Serialise all dilithium-py operations; the
+# pure-Python implementation holds the GIL throughout, so this costs no
+# parallelism. The native implementation is thread-safe and needs no lock.
 _ml_dsa_lock = threading.Lock()
 
 
 def dsa_keygen():
+    """A new keypair: (public key, 32-byte seed private key, elapsed ms)."""
     _assert_pqc_backend()
-    with _ml_dsa_lock:
-        t0 = time.perf_counter()
-        pk, sk = ML_DSA_65.keygen()
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
+    if NATIVE_ML_DSA:
+        key = _mldsa.MLDSA65PrivateKey.generate()
+        pk, sk = key.public_key().public_bytes_raw(), key.private_bytes_raw()
+    else:
+        sk = os.urandom(DSA_SEED_BYTES)
+        with _ml_dsa_lock:
+            pk, _expanded = ML_DSA_65.key_derive(sk)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
     return pk, sk, elapsed_ms
+
+
+def dsa_public_key(sk: bytes) -> bytes:
+    """The public key belonging to a private key in either form."""
+    if len(sk) == DSA_SEED_BYTES:
+        if NATIVE_ML_DSA:
+            return _mldsa.MLDSA65PrivateKey.from_seed_bytes(sk).public_key().public_bytes_raw()
+        with _ml_dsa_lock:
+            return ML_DSA_65.key_derive(sk)[0]
+    with _ml_dsa_lock:
+        return ML_DSA_65.pk_from_sk(sk)
+
+
+@functools.lru_cache(maxsize=16)
+def _native_signing_key(seed: bytes):
+    # Expanding a seed costs ~15% of a signature; the server signs with one key.
+    return _mldsa.MLDSA65PrivateKey.from_seed_bytes(seed)
 
 
 def dsa_sign(sk: bytes, message: bytes):
     _assert_pqc_backend()
-    with _ml_dsa_lock:
-        t0 = time.perf_counter()
-        signature = ML_DSA_65.sign(sk, message)
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
+    if len(sk) == DSA_SEED_BYTES and NATIVE_ML_DSA:
+        signature = _native_signing_key(bytes(sk)).sign(message)
+    else:
+        with _ml_dsa_lock:
+            if len(sk) == DSA_SEED_BYTES:
+                sk = ML_DSA_65.key_derive(sk)[1]
+            signature = ML_DSA_65.sign(sk, message)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
     return signature, elapsed_ms
 
 
 def dsa_verify(pk: bytes, message: bytes, signature: bytes) -> bool:
+    """True when ``signature`` is valid. A malformed signature is simply
+    invalid; a public key of the wrong length raises ValueError, as
+    dilithium-py does."""
     _assert_pqc_backend()
+    if NATIVE_ML_DSA:
+        public_key = _mldsa.MLDSA65PublicKey.from_public_bytes(pk)
+        try:
+            public_key.verify(signature, message)
+        except _InvalidSignature:
+            return False
+        return True
     with _ml_dsa_lock:
         return ML_DSA_65.verify(pk, message, signature)
 

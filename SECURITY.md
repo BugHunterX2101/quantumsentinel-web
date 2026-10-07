@@ -5,12 +5,16 @@
 
 ## Cryptography
 
-- **ML-KEM-768** (FIPS 203) and **ML-DSA-65** (FIPS 204) are implemented via
-  the pure-Python reference packages `kyber-py` and `dilithium-py`. These
-  are spec-compliant but are **not constant-time / side-channel hardened**
-  like `liboqs`'s C implementation. Do not use this repo's crypto module
-  for a production deployment handling real financial assets without
-  swapping to `liboqs` (via `python-oqs`) or a hardware-backed equivalent.
+- **ML-KEM-768** (FIPS 203) is implemented via the pure-Python reference
+  package `kyber-py`. **ML-DSA-65** (FIPS 204) uses OpenSSL's
+  implementation through `cryptography` (>= 48, whose wheels bundle
+  OpenSSL >= 3.5) when the installed build supports it, and the
+  pure-Python `dilithium-py` otherwise; server keys in the expanded format
+  of earlier releases also sign through `dilithium-py`. The pure-Python
+  packages are spec-compliant but are **not constant-time / side-channel
+  hardened**. Do not use this repo's crypto module for a production
+  deployment handling real financial assets without a reviewed provider
+  such as `liboqs` (via `python-oqs`) or a hardware-backed equivalent.
 - The hybrid handshake combines a classical X25519 ECDH exchange with
   ML-KEM-768 via HKDF-SHA256, so an attacker must break **both** primitives
   to recover a session key (defense against Harvest-Now-Decrypt-Later).

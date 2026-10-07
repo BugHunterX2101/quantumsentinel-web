@@ -5,12 +5,14 @@ Each test below pins a defect that was reproduced against a live PostgreSQL
 """
 import datetime as dt
 import hashlib
+import sys
 import threading
+import time
 
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.orm import sessionmaker
@@ -306,6 +308,67 @@ class TestAuditChainTimezones:
         assert security_service.audit_chain_status(db)["reason"] == "event content does not match its link hash"
 
 
+class TestAuditChainVerificationScales:
+    """audit_chain_status timed out at 1M audit rows: its unchained-event
+    count was a NOT IN (subquery), which PostgreSQL cannot plan as an anti
+    join, and it loaded each link's event with its own query."""
+
+    @staticmethod
+    def _chain(engine, events: int, unchained: int = 0):
+        with sessionmaker(bind=engine)() as db:
+            for i in range(events):
+                security_service.write_audit_log(db, None, "EVENT", metadata={"i": i})
+            for i in range(unchained):
+                db.add(models.AuditLog(action="UNCHAINED", metadata_json={"i": i}))
+            db.commit()
+
+    @staticmethod
+    def _statements(engine, run):
+        statements = []
+
+        def capture(_conn, _cursor, statement, *_args):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            with sessionmaker(bind=engine)() as db:
+                result = run(db)
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        return result, statements
+
+    def test_unchained_events_are_counted_with_an_anti_join(self, make_engine):
+        engine = make_engine()
+        self._chain(engine, events=3, unchained=2)
+        status, statements = self._statements(engine, security_service.audit_chain_status)
+        assert (status["valid"], status["links"], status["unchained_events"]) == (True, 3, 2)
+        [count] = [s for s in statements if "count(" in s and "audit_logs" in s]
+        with engine.connect() as conn:
+            plan = "\n".join(row[0] for row in conn.exec_driver_sql("EXPLAIN " + count))
+        assert "Anti Join" in plan, plan
+
+    def test_verification_issues_the_same_queries_however_long_the_chain(self, make_engine):
+        short, long = make_engine(), make_engine()
+        self._chain(short, events=2)
+        self._chain(long, events=12)
+        short_status, short_statements = self._statements(short, security_service.audit_chain_status)
+        long_status, long_statements = self._statements(long, security_service.audit_chain_status)
+        assert (short_status["valid"], long_status["valid"]) == (True, True)
+        assert long_status["links"] == 12
+        assert len(long_statements) == len(short_statements)
+
+    def test_a_tampered_link_is_still_reported_at_its_sequence(self, make_engine):
+        engine = make_engine()
+        self._chain(engine, events=5)
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE audit_logs SET action = 'FORGED' WHERE id = "
+                              "(SELECT audit_log_id FROM audit_chain_links WHERE sequence = 4)"))
+        with sessionmaker(bind=engine)() as db:
+            status = security_service.audit_chain_status(db)
+        assert (status["valid"], status["first_invalid_sequence"], status["links"]) == (False, 4, 5)
+        assert status["reason"] == "event content does not match its link hash"
+
+
 # ── server key registration ───────────────────────────────────────────────────
 
 def test_processes_registering_the_same_server_key_at_once_all_succeed(make_engine):
@@ -339,3 +402,92 @@ def test_processes_registering_the_same_server_key_at_once_all_succeed(make_engi
     assert len(set(key_ids)) == 1
     with Session() as db:
         assert db.query(models.ServerSigningKey).count() == 1
+
+
+def test_replacing_an_expanded_server_key_with_a_seed_key_keeps_the_chain_verifiable(make_engine):
+    """The upgrade path for native signing: a deployment swaps its legacy
+    4032-byte server key for a generated seed key and restarts. Everything
+    the old key signed must still verify."""
+    from dilithium_py.ml_dsa import ML_DSA_65
+
+    Session = sessionmaker(bind=make_engine())
+
+    def restart_with(pk, sk):
+        identity = security_service.ServerIdentity()
+        identity.dsa_pk, identity.dsa_sk = pk, sk
+        identity.fingerprint = hashlib.sha256(pk).hexdigest()
+        return identity
+
+    old_pk, old_sk = ML_DSA_65.keygen()
+    new_pk, new_sk, _ = pqc.dsa_keygen()
+    entries = []
+    original = security_service.server_identity
+    try:
+        for pk, sk in ((old_pk, old_sk), (new_pk, new_sk)):
+            security_service.server_identity = restart_with(pk, sk)
+            with Session() as db:
+                for i in range(2):
+                    entries.append(security_service.write_audit_log(db, None, "EVENT", metadata={"i": i}).id)
+        with Session() as db:
+            status = security_service.audit_chain_status(db)
+            assert (status["valid"], status["links"]) == (True, 4)
+            assert all(security_service.verify_audit_log(db, entry) for entry in entries)
+            assert db.query(models.ServerSigningKey).count() == 2
+    finally:
+        security_service.server_identity = original
+
+
+def test_concurrent_first_signers_share_one_lazily_generated_key(make_engine, monkeypatch):
+    """Without configured keys, the first signer generates the server key.
+    Requests arriving together each generated their own and registered it
+    under the last one's key_id: a 500 on server_signing_keys_pkey, and
+    signatures that no registered key verifies."""
+    real_keygen = pqc.dsa_keygen
+    keygens = []
+
+    def keygen_at_reference_speed():
+        # dilithium-py's keygen takes ~25 ms; native takes ~0.1 ms, which
+        # makes the race real but rare. Hold the window open on every run,
+        # finishing concurrent keygens at different times.
+        keygens.append(None)
+        time.sleep(0.025 * len(keygens))
+        return real_keygen()
+
+    monkeypatch.setattr(pqc, "dsa_keygen", keygen_at_reference_speed)
+    Session = sessionmaker(bind=make_engine())
+    identity = security_service.ServerIdentity()
+    assert identity.dsa_sk is None
+    results, errors = [], []
+    barrier = threading.Barrier(8)
+
+    def first_order(n):
+        db = Session()
+        try:
+            barrier.wait()
+            identity.ensure_registered(db)
+            message = f"order-{n}".encode()
+            results.append((message, identity.sign(message), identity.key_id))
+        except Exception as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+        finally:
+            db.close()
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=first_order, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(previous)
+    assert errors == []
+    assert len(keygens) == 1
+    with Session() as db:
+        keys = db.query(models.ServerSigningKey).all()
+    assert len(keys) == 1
+    assert {key_id for _, _, key_id in results} == {keys[0].key_id}
+    registered_pk = pqc.unb64(keys[0].public_key)
+    assert all(pqc.dsa_verify(registered_pk, message, signature)
+               for message, signature, _ in results)

@@ -85,12 +85,17 @@ class ServerIdentity:
         # True once THIS process has confirmed the current key is persisted
         # in server_signing_keys. See ensure_registered() for why this matters.
         self._registered = False
+        # Concurrent first requests must not each generate (and register)
+        # a key of their own: one generates, the rest adopt it.
+        self._key_lock = threading.Lock()
         if pk:
             self.fingerprint = hashlib.sha256(pk).hexdigest()
 
     def sign(self, message: bytes) -> bytes:
         if self.dsa_sk is None:
-            self._ensure_keypair()
+            with self._key_lock:
+                if self.dsa_sk is None:
+                    self._ensure_keypair()
         sig, _ = pqc.dsa_sign(self.dsa_sk, message)
         return sig
 
@@ -123,10 +128,13 @@ class ServerIdentity:
         """
         if self._registered:
             return
-        if self.dsa_sk is None:
-            self._ensure_keypair()
-        self.register_in_db(db)
-        self._registered = True
+        with self._key_lock:
+            if self._registered:
+                return
+            if self.dsa_sk is None:
+                self._ensure_keypair()
+            self.register_in_db(db)
+            self._registered = True
 
     def register_in_db(self, db: Session) -> str | None:
         """Register the current key in the server_signing_keys table if not already present."""
@@ -260,9 +268,6 @@ def _server_timezone(db: Session):
         return None
 
 
-_UNSET = object()
-
-
 def _chain_hash(audit_log_id: str, created_at: str, event_payload: dict, previous_hash: str) -> str:
     return hashlib.sha256(json.dumps({
         "audit_log_id": audit_log_id, "created_at": created_at,
@@ -366,56 +371,67 @@ def audit_chain_status(db: Session) -> dict:
     and why. ``unchained_events`` counts audit events with no chain link,
     which the chain alone cannot vouch for.
     """
-    links = db.execute(select(models.AuditChainLink).order_by(models.AuditChainLink.sequence)).scalars().all()
+    link_count = int(db.execute(select(func.count()).select_from(models.AuditChainLink)).scalar() or 0)
+    # NOT EXISTS, not NOT IN: PostgreSQL plans it as an anti join, where
+    # NOT IN (subquery) degrades to a per-row subplan scan on large tables.
     unchained = int(db.execute(
         select(func.count()).select_from(models.AuditLog).where(
-            ~models.AuditLog.id.in_(select(models.AuditChainLink.audit_log_id)))
+            ~select(models.AuditChainLink.id).where(
+                models.AuditChainLink.audit_log_id == models.AuditLog.id).exists())
     ).scalar() or 0)
-    status = {"valid": True, "links": len(links), "unchained_events": unchained,
+    status = {"valid": True, "links": link_count, "unchained_events": unchained,
               "first_invalid_sequence": None, "reason": None}
 
     def fail(link, reason: str) -> dict:
         status.update(valid=False, first_invalid_sequence=link.sequence, reason=reason)
         return status
 
-    keys: dict[str, bytes | None] = {}
-    server_tz = _UNSET  # looked up only if a link needs a legacy timestamp form
-    previous_hash = "0" * 64
-    for link in links:
-        entry = db.get(models.AuditLog, link.audit_log_id)
-        if not entry:
-            return fail(link, "audit event missing")
-        if link.previous_hash != previous_hash:
-            return fail(link, "link does not point at the preceding link")
+    # Every query is made before the chain is streamed, so the stream's
+    # server-side cursor is the only statement open while links are checked.
+    keys: dict[str, bytes] = {
+        key_id: pqc.unb64(public_key) for key_id, public_key in db.execute(
+            select(models.ServerSigningKey.key_id, models.ServerSigningKey.public_key))
+    }
+    server_tz = _server_timezone(db)  # for links hashed in a legacy timestamp form
+    # Each link with its event in one streamed query, instead of one query
+    # per link and the whole chain held in memory.
+    rows = db.execute(
+        select(models.AuditChainLink, models.AuditLog)
+        .outerjoin(models.AuditLog, models.AuditLog.id == models.AuditChainLink.audit_log_id)
+        .order_by(models.AuditChainLink.sequence)
+        .execution_options(yield_per=500)
+    )
+    try:
+        previous_hash = "0" * 64
+        for link, entry in rows:
+            if not entry:
+                return fail(link, "audit event missing")
+            if link.previous_hash != previous_hash:
+                return fail(link, "link does not point at the preceding link")
 
-        # Determine verification key for this chain link
-        if link.signing_key_id not in keys:
-            key_record = db.execute(
-                select(models.ServerSigningKey).where(
-                    models.ServerSigningKey.key_id == link.signing_key_id
-                )
-            ).scalars().first() if link.signing_key_id else None
-            keys[link.signing_key_id] = pqc.unb64(key_record.public_key) if key_record else None
-        verification_pk = keys[link.signing_key_id] or server_identity.dsa_pk
-        if verification_pk is None:
-            return fail(link, "no verification key")
+            # A link signed by a key missing from history falls back to the
+            # current server key, as before.
+            verification_pk = keys.get(link.signing_key_id) or server_identity.dsa_pk
+            if verification_pk is None:
+                return fail(link, "no verification key")
 
-        event_payload = {
-            "action": entry.action, "user_id": entry.user_id,
-            "resource_type": entry.resource_type, "resource_id": entry.resource_id,
-            "metadata": entry.metadata_json or {},
-        }
-        timestamps = [_chain_timestamp(entry.created_at)]
-        if _chain_hash(entry.id, timestamps[0], event_payload, previous_hash) != link.entry_hash:
-            if server_tz is _UNSET:
-                server_tz = _server_timezone(db)
-            if not any(_chain_hash(entry.id, ts, event_payload, previous_hash) == link.entry_hash
-                       for ts in _legacy_chain_timestamps(entry.created_at, server_tz)):
-                return fail(link, "event content does not match its link hash")
-        if not pqc.dsa_verify(verification_pk, link.entry_hash.encode(),
-                              pqc.unb64(link.checkpoint_signature)):
-            return fail(link, "checkpoint signature invalid")
-        previous_hash = link.entry_hash
+            event_payload = {
+                "action": entry.action, "user_id": entry.user_id,
+                "resource_type": entry.resource_type, "resource_id": entry.resource_id,
+                "metadata": entry.metadata_json or {},
+            }
+            timestamps = [_chain_timestamp(entry.created_at)]
+            if _chain_hash(entry.id, timestamps[0], event_payload, previous_hash) != link.entry_hash:
+                if not any(_chain_hash(entry.id, ts, event_payload, previous_hash) == link.entry_hash
+                           for ts in _legacy_chain_timestamps(entry.created_at, server_tz)):
+                    return fail(link, "event content does not match its link hash")
+            if not pqc.dsa_verify(verification_pk, link.entry_hash.encode(),
+                                  pqc.unb64(link.checkpoint_signature)):
+                return fail(link, "checkpoint signature invalid")
+            previous_hash = link.entry_hash
+    finally:
+        # Close the server-side cursor now, also when a failure returns early.
+        rows.close()
     return status
 
 

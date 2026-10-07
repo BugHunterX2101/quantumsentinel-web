@@ -304,6 +304,64 @@ class TestWebSocket:
         for s in sockets:
             s.__exit__(None, None, None)
 
+    def test_an_open_socket_holds_no_database_connection(self, Session, client, quiet_signals, monkeypatch):
+        """A socket stays open for minutes. Holding a pooled connection for its
+        lifetime meant a pool's worth of open dashboards made every HTTP
+        request on the worker wait out the pool timeout and fail."""
+        pool = Session.kw["bind"].pool
+        users = [make_user(Session, f"ws{i}@example.com") for i in range(2)]
+        sockets = []
+        for user in users:
+            for _ in range(3):
+                sockets.append(self._connect(client, auth_service.create_access_token(user.id, "free")))
+        opened = [s.__enter__() for s in sockets]
+        try:
+            for ws in opened:  # every handler has pushed and now waits out the interval
+                assert ws.receive_json()["sequence"] == 0
+            assert pool.checkedout() == 0
+        finally:
+            for s in sockets:
+                s.__exit__(None, None, None)
+
+    def test_an_inactive_account_is_refused_before_the_handshake_completes(self, Session, client, quiet_signals):
+        user = make_user(Session, "ws@example.com")
+        with Session() as db:
+            db.get(models.User, user.id).is_active = False
+            db.commit()
+        connecting = self._connect(client, auth_service.create_access_token(user.id, "free"))
+        with pytest.raises(WebSocketDisconnect) as exc:
+            connecting.__enter__()  # never accepted: the handshake itself fails
+        assert exc.value.code == 4401
+
+    def test_deactivation_closes_an_open_socket_at_the_next_push(self, Session, client, quiet_signals, monkeypatch):
+        monkeypatch.setattr(main, "_WS_PUSH_INTERVAL", 0.05)
+        user = make_user(Session, "ws@example.com")
+        with self._connect(client, auth_service.create_access_token(user.id, "free")) as ws:
+            assert ws.receive_json()["sequence"] == 0
+            with Session() as db:
+                db.get(models.User, user.id).is_active = False
+                db.commit()
+            with pytest.raises(WebSocketDisconnect) as exc:
+                # Pushes sent before the commit landed are still queued; a slow
+                # runner can queue many, so bound the wait (~10 s), not the count.
+                for _ in range(200):
+                    ws.receive_json()
+            assert exc.value.code == 4401
+
+    def test_watchlist_edits_reach_the_next_push(self, Session, client, quiet_signals, monkeypatch):
+        monkeypatch.setattr(main, "_WS_PUSH_INTERVAL", 0.05)
+        user = make_user(Session, "ws@example.com")
+        with self._connect(client, auth_service.create_access_token(user.id, "free")) as ws:
+            assert ws.receive_json()["watchlist"] == sorted(main.DEFAULT_WATCHLIST)
+            with Session() as db:
+                db.get(models.User, user.id).watchlist = ["AAPL", "MSFT"]
+                db.commit()
+            for _ in range(200):  # skip pushes queued before the commit (see above)
+                if ws.receive_json()["watchlist"] == ["AAPL", "MSFT"]:
+                    break
+            else:
+                pytest.fail("the edited watchlist never reached the socket")
+
 
 class TestTransportPolicy:
     def test_cors_preflight_allows_only_listed_headers(self, client):

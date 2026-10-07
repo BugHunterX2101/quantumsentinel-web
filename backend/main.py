@@ -1119,6 +1119,18 @@ async def _ws_release(user_id: str, counted_in_redis: bool) -> None:
         _ws_connections[user_id] = max(0, _ws_connections[user_id] - 1)
 
 
+def _ws_watchlist(user_id: str) -> list[str] | None:
+    """The user's watchlist, or None when the account is gone or inactive.
+
+    A session of its own per call: a socket stays open for minutes, and a
+    session kept for its lifetime would hold a pooled connection the whole
+    time, so a pool's worth of open dashboards left no connection for any
+    HTTP request on the worker."""
+    with SessionLocal() as db:
+        user = db.get(models.User, user_id)
+        return _user_watchlist(user) if user and user.is_active else None
+
+
 @app.websocket("/api/signals/stream")
 async def signal_stream(websocket: WebSocket):
     """Authenticated signal stream.
@@ -1148,10 +1160,8 @@ async def signal_stream(websocket: WebSocket):
         await websocket.close(code=4429)  # too many connections
         return
     offered = [p.strip() for p in websocket.headers.get("sec-websocket-protocol", "").split(",") if p.strip()]
-    db = SessionLocal()
     try:
-        user = db.get(models.User, user_id)
-        if not user or not user.is_active:
+        if await asyncio.to_thread(_ws_watchlist, user_id) is None:
             await websocket.close(code=4401)
             return
         await websocket.accept(subprotocol="qs" if "qs" in offered else None)
@@ -1162,9 +1172,8 @@ async def signal_stream(websocket: WebSocket):
                 break
             # Re-read the user every cycle: deactivation and watchlist edits
             # take effect on the next push, not at the next reconnect.
-            db.expire_all()
-            user = db.get(models.User, user_id)
-            if not user or not user.is_active:
+            watchlist = await asyncio.to_thread(_ws_watchlist, user_id)
+            if watchlist is None:
                 await websocket.close(code=4401, reason="account inactive")
                 break
             if in_redis:
@@ -1176,7 +1185,7 @@ async def signal_stream(websocket: WebSocket):
                 # get_cached_signals() can block on a yfinance download; keep it
                 # off the event loop so other connections stay responsive.
                 data = await asyncio.to_thread(signal_engine.get_cached_signals)
-                wanted = set(_user_watchlist(user))
+                wanted = set(watchlist)
                 filtered = [s for s in data.get("signals", []) if s.get("asset") in wanted]
                 # Watchlisted tickers outside the preloaded set are computed on
                 # demand, as in /api/signals/latest.
@@ -1213,7 +1222,6 @@ async def signal_stream(websocket: WebSocket):
         log.exception("signal stream error")
     finally:
         await _ws_release(user_id, in_redis)
-        db.close()
 
 
 

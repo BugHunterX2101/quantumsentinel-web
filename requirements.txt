@@ -7,7 +7,7 @@ psycopg[binary]>=3.2
 redis>=5.0
 prometheus-client>=0.20
 pyjwt>=2.8
-cryptography>=42
+cryptography>=48  # native ML-DSA on its bundled OpenSSL (>= 3.5); see backend/crypto/pqc.py
 kyber-py>=1.2.0
 dilithium-py>=1.4.0
 yfinance>=0.2.40

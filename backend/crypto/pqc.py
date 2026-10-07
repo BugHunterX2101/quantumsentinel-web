@@ -174,13 +174,20 @@ def dsa_sign(sk: bytes, message: bytes):
     return signature, elapsed_ms
 
 
+@functools.lru_cache(maxsize=256)
+def _native_public_key(pk: bytes):
+    # Parsing a public key costs ~10% of a verification, and verifiers check
+    # many signatures from few keys (every audit link is signed by a server key).
+    return _mldsa.MLDSA65PublicKey.from_public_bytes(pk)
+
+
 def dsa_verify(pk: bytes, message: bytes, signature: bytes) -> bool:
     """True when ``signature`` is valid. A malformed signature is simply
     invalid; a public key of the wrong length raises ValueError, as
     dilithium-py does."""
     _assert_pqc_backend()
     if NATIVE_ML_DSA:
-        public_key = _mldsa.MLDSA65PublicKey.from_public_bytes(pk)
+        public_key = _native_public_key(bytes(pk))
         try:
             public_key.verify(signature, message)
         except _InvalidSignature:

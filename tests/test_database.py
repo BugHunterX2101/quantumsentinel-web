@@ -369,6 +369,128 @@ class TestAuditChainVerificationScales:
         assert status["reason"] == "event content does not match its link hash"
 
 
+
+class TestIncrementalChainVerification:
+    """At 1M links a full check takes minutes, most of it ML-DSA verification,
+    so the operator endpoint checks only links added since the newest link
+    the process already verified. Full checks still find what an incremental
+    one cannot: rows edited behind that link."""
+
+    _chain = staticmethod(TestAuditChainVerificationScales._chain)
+
+    @staticmethod
+    def _tamper(engine, sequence):
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE audit_logs SET action = 'FORGED' WHERE id = "
+                              "(SELECT audit_log_id FROM audit_chain_links WHERE sequence = :s)"),
+                         {"s": sequence})
+
+    @staticmethod
+    def _check(engine, full):
+        with sessionmaker(bind=engine)() as db:
+            return security_service.audit_chain_status(db, full=full)
+
+    def test_only_links_added_since_the_last_check_are_verified(self, make_engine, monkeypatch):
+        engine = make_engine()
+        self._chain(engine, events=5)
+        first = self._check(engine, full=False)  # nothing verified yet: a full check
+        assert (first["valid"], first["mode"], first["verified_from_sequence"]) == (True, "full", 1)
+        self._chain(engine, events=3)
+        verified = []
+        real_verify = pqc.dsa_verify
+        monkeypatch.setattr(pqc, "dsa_verify",
+                            lambda pk, message, sig: verified.append(message) or real_verify(pk, message, sig))
+        status = self._check(engine, full=False)
+        assert (status["valid"], status["links"], status["mode"]) == (True, 8, "incremental")
+        assert status["verified_from_sequence"] == 6 and len(verified) == 3
+        assert status["last_full_verification_at"] == first["last_full_verification_at"]
+
+    def test_tampering_with_a_new_link_is_found_and_located(self, make_engine):
+        engine = make_engine()
+        self._chain(engine, events=3)
+        self._check(engine, full=False)
+        self._chain(engine, events=3)
+        self._tamper(engine, 5)
+        status = self._check(engine, full=False)
+        assert (status["valid"], status["mode"], status["first_invalid_sequence"]) == (False, "incremental", 5)
+        assert status["reason"] == "event content does not match its link hash"
+
+    def test_a_rewritten_head_link_forces_a_full_check(self, make_engine):
+        engine = make_engine()
+        self._chain(engine, events=4)
+        self._check(engine, full=False)
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE audit_chain_links SET entry_hash = repeat('a', 64) WHERE sequence = 4"))
+        status = self._check(engine, full=False)
+        assert (status["valid"], status["mode"], status["first_invalid_sequence"]) == (False, "full", 4)
+
+    def test_old_rows_need_a_full_check_and_a_failure_ends_incremental_checks(self, make_engine):
+        engine = make_engine()
+        self._chain(engine, events=4)
+        self._check(engine, full=False)
+        self._tamper(engine, 2)
+        # The documented limit: the edit is behind the verified head.
+        assert self._check(engine, full=False)["valid"] is True
+        full = self._check(engine, full=True)
+        assert (full["valid"], full["first_invalid_sequence"]) == (False, 2)
+        # Once a check has failed, the next ones are full until it passes again.
+        after = self._check(engine, full=False)
+        assert (after["valid"], after["mode"], after["first_invalid_sequence"]) == (False, "full", 2)
+
+    def test_a_check_running_when_another_fails_does_not_restore_incremental_checks(
+            self, make_engine, monkeypatch):
+        engine = make_engine()
+        self._chain(engine, events=3)
+        self._check(engine, full=False)
+        self._chain(engine, events=2)
+        self._tamper(engine, 2)
+        real_failure, nested = security_service._link_failure, []
+
+        def failure_during_a_full_check(*args):
+            if not nested:  # while this incremental check runs, a full one fails
+                nested.append(None)
+                nested[0] = self._check(engine, full=True)
+            return real_failure(*args)
+
+        monkeypatch.setattr(security_service, "_link_failure", failure_during_a_full_check)
+        running = self._check(engine, full=False)
+        monkeypatch.undo()
+        assert (running["valid"], running["mode"]) == (True, "incremental")
+        assert (nested[0]["valid"], nested[0]["first_invalid_sequence"]) == (False, 2)
+        after = self._check(engine, full=False)
+        assert (after["valid"], after["mode"], after["first_invalid_sequence"]) == (False, "full", 2)
+
+    def test_the_endpoint_is_incremental_unless_full_is_requested(self, make_engine):
+        from backend import main
+
+        engine = make_engine()
+        with sessionmaker(bind=engine)() as db:
+            admin = models.User(email="ops@example.com", password_hash="x", role="admin")
+            db.add(admin)
+            db.commit()
+            security_service.write_audit_log(db, admin.id, "EVENT")
+            assert main.audit_chain(admin, db)["mode"] == "full"
+            security_service.write_audit_log(db, admin.id, "EVENT")
+            assert main.audit_chain(admin, db)["mode"] == "incremental"
+            assert main.audit_chain(admin, db, full=True)["mode"] == "full"
+        parameters = main.app.openapi()["paths"]["/api/security/audit-chain"]["get"]["parameters"]
+        [full] = [p for p in parameters if p["in"] == "query"]
+        assert (full["name"], full["schema"]["type"], full["schema"]["default"]) == ("full", "boolean", False)
+
+    def test_manage_command_checks_every_link_and_fails_on_tampering(self, make_engine, capsys):
+        import json
+
+        from backend import manage
+
+        engine = make_engine()
+        self._chain(engine, events=3)
+        assert manage._verify_audit_chain(sessionmaker(bind=engine)) == 0
+        assert json.loads(capsys.readouterr().out)["mode"] == "full"
+        self._tamper(engine, 1)
+        assert manage._verify_audit_chain(sessionmaker(bind=engine)) == 1
+        printed = json.loads(capsys.readouterr().out)
+        assert (printed["valid"], printed["first_invalid_sequence"]) == (False, 1)
+
 # ── server key registration ───────────────────────────────────────────────────
 
 def test_processes_registering_the_same_server_key_at_once_all_succeed(make_engine):

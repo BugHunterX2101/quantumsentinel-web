@@ -29,7 +29,7 @@ import sys
 import asyncio
 from contextlib import asynccontextmanager
 import hashlib
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect, Query, Cookie
@@ -360,28 +360,35 @@ HTTP_LATENCY = Histogram("quantumsentinel_http_request_duration_seconds", "HTTP 
 # Keys are (principal, path) pairs and paths include dynamic segments such as
 # /api/price/{ticker}, so the map has to be swept or it grows without bound for
 # the lifetime of the process.
-_request_windows: dict[str, deque[float]] = defaultdict(deque)
+#
+# Buckets are kept in least-recently-used order (each request moves its key to
+# the end), so expired buckets and eviction candidates are always at the front.
+# Housekeeping pops from the front: O(1) amortised per request. Scanning and
+# sorting the whole map instead cost ~13 ms per request once it held
+# _RATE_MAX_KEYS live keys, which any client can cause by requesting distinct
+# paths.
+_request_windows: OrderedDict[str, deque[float]] = OrderedDict()
 _RATE_WINDOW_SECONDS = 60
-_RATE_SWEEP_INTERVAL = 120.0
 _RATE_MAX_KEYS = 20_000
-_last_rate_sweep = 0.0
 
 
-def _sweep_request_windows(now: float) -> None:
-    """Drop rate-limit buckets whose window has fully expired."""
-    global _last_rate_sweep
-    if now - _last_rate_sweep < _RATE_SWEEP_INTERVAL and len(_request_windows) < _RATE_MAX_KEYS:
-        return
-    _last_rate_sweep = now
-    for key in [k for k, w in _request_windows.items()
-                if not w or now - w[-1] > _RATE_WINDOW_SECONDS]:
-        _request_windows.pop(key, None)
-    # Hard ceiling: if a burst still leaves the map oversized, evict the
-    # least-recently-seen buckets rather than letting memory grow unbounded.
-    if len(_request_windows) > _RATE_MAX_KEYS:
-        oldest = sorted(_request_windows.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0)
-        for key, _ in oldest[:len(_request_windows) - _RATE_MAX_KEYS]:
-            _request_windows.pop(key, None)
+def _rate_window(key: str, now: float) -> deque[float]:
+    """The bucket for ``key``, after dropping buckets whose window has fully expired."""
+    while _request_windows:
+        oldest = next(iter(_request_windows.values()))
+        if oldest and now - oldest[-1] <= _RATE_WINDOW_SECONDS:
+            break
+        _request_windows.popitem(last=False)
+    window = _request_windows.get(key)
+    if window is None:
+        # Hard ceiling: evict the least-recently-seen bucket rather than let
+        # memory grow without bound.
+        if len(_request_windows) >= _RATE_MAX_KEYS:
+            _request_windows.popitem(last=False)
+        window = _request_windows[key] = deque()
+    else:
+        _request_windows.move_to_end(key)
+    return window
 
 
 class SecurityHeadersAndRateLimit:
@@ -420,8 +427,7 @@ class SecurityHeadersAndRateLimit:
                     return
                 current = 0
         if not _redis_client or current == 0:
-            _sweep_request_windows(now)
-            window = _request_windows[key]
+            window = _rate_window(key, now)
             while window and now - window[0] > _RATE_WINDOW_SECONDS:
                 window.popleft()
             current = len(window) + 1

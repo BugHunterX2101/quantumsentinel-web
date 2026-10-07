@@ -10,12 +10,14 @@ Covers:
 - Item 7: HMAC-signed API requests
 - Item 8: Server signing key history
 """
+import copy
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import time
+import types
 
 import pytest
 
@@ -462,6 +464,97 @@ class TestRateLimiting:
         auth_service.clear_failed_attempts(email, ip)
         locked, _ = auth_service.check_rate_limit(email, ip)
         assert not locked
+
+
+class TestLockoutExpiry:
+    """Lockout state lives only as long as it can matter: a failure counts for
+    _FAIL_WINDOW_SECONDS and a lock lasts _LOCKOUT_SECONDS. Anything older is
+    dropped, so failed logins under ever-new emails cannot grow memory forever."""
+
+    @pytest.fixture(autouse=True)
+    def clock(self, monkeypatch):
+        for name in ("_FAIL_ATTEMPTS", "_LOCKED_UNTIL"):
+            fresh = copy.copy(getattr(auth_service, name))
+            fresh.clear()
+            monkeypatch.setattr(auth_service, name, fresh)
+        now = [1_000_000.0]
+        monkeypatch.setattr(auth_service, "time", types.SimpleNamespace(time=lambda: now[0]))
+        return now
+
+    @staticmethod
+    def fail(email, times=1, ip="10.0.0.9"):
+        for _ in range(times):
+            auth_service.check_rate_limit(email, ip)
+            auth_service.record_failed_attempt(email, ip)
+
+    @staticmethod
+    def stored():
+        return set(auth_service._FAIL_ATTEMPTS) | set(auth_service._LOCKED_UNTIL)
+
+    def test_failures_outside_the_window_do_not_count(self, clock):
+        self.fail("a@test.dev", 4)
+        clock[0] += auth_service._FAIL_WINDOW_SECONDS
+        self.fail("a@test.dev")
+        assert auth_service.check_rate_limit("a@test.dev", "10.0.0.9") == (False, 0)
+
+    def test_only_the_stale_failures_of_a_live_entry_stop_counting(self, clock):
+        self.fail("a@test.dev", 3)
+        clock[0] += 500
+        self.fail("a@test.dev")
+        clock[0] += auth_service._FAIL_WINDOW_SECONDS - 500
+        self.fail("a@test.dev")
+        assert auth_service.check_rate_limit("a@test.dev", "10.0.0.9") == (False, 0)
+        assert len(auth_service._FAIL_ATTEMPTS["a@test.dev:10.0.0.9"]) == 2
+
+    def test_failures_without_a_check_first_still_expire(self, clock):
+        for _ in range(3):
+            auth_service.record_failed_attempt("b@test.dev", "10.0.0.9")
+        clock[0] += 500
+        auth_service.record_failed_attempt("b@test.dev", "10.0.0.9")
+        clock[0] += auth_service._FAIL_WINDOW_SECONDS - 500
+        assert auth_service.record_failed_attempt("b@test.dev", "10.0.0.9") is None
+
+    def test_recording_alone_drops_expired_entries(self, clock):
+        auth_service.record_failed_attempt("old@test.dev", "10.0.0.9")
+        clock[0] += auth_service._FAIL_WINDOW_SECONDS
+        auth_service.record_failed_attempt("new@test.dev", "10.0.0.9")
+        assert self.stored() == {"new@test.dev:10.0.0.9"}
+
+    def test_a_lock_lasts_exactly_the_lockout(self, clock):
+        self.fail("c@test.dev", 5)
+        assert self.stored() == {"c@test.dev:10.0.0.9"}
+        assert "c@test.dev:10.0.0.9" not in auth_service._FAIL_ATTEMPTS
+        clock[0] += auth_service._LOCKOUT_SECONDS - 1
+        assert auth_service.check_rate_limit("c@test.dev", "10.0.0.9") == (True, 1)
+        clock[0] += 1
+        assert auth_service.check_rate_limit("c@test.dev", "10.0.0.9") == (False, 0)
+
+    def test_checking_alone_stores_nothing(self):
+        for i in range(100):
+            assert auth_service.check_rate_limit(f"new{i}@test.dev", "10.0.0.9") == (False, 0)
+        assert self.stored() == set()
+
+    def test_expired_failures_and_locks_are_dropped(self, clock):
+        for i in range(50):
+            self.fail(f"gone{i}@test.dev", 1 + i % 5)
+        assert len(self.stored()) == 50
+        clock[0] += max(auth_service._FAIL_WINDOW_SECONDS, auth_service._LOCKOUT_SECONDS)
+        auth_service.check_rate_limit("someone@test.dev", "10.0.0.9")
+        assert self.stored() == set()
+
+    def test_recent_entries_survive_while_older_ones_go(self, clock):
+        self.fail("busy@test.dev")
+        clock[0] += 100
+        self.fail("idle@test.dev")
+        clock[0] += 700
+        self.fail("busy@test.dev")
+        clock[0] += 201
+        auth_service.check_rate_limit("someone@test.dev", "10.0.0.9")
+        assert self.stored() == {"busy@test.dev:10.0.0.9"}
+        self.fail("busy@test.dev", 3)
+        assert auth_service.check_rate_limit("busy@test.dev", "10.0.0.9")[0] is False
+        self.fail("busy@test.dev")
+        assert auth_service.check_rate_limit("busy@test.dev", "10.0.0.9")[0] is True
 
 
 # ===========================================================================

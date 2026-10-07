@@ -35,7 +35,7 @@ import secrets
 import time
 import urllib.request
 import urllib.error
-from collections import defaultdict
+from collections import OrderedDict
 from threading import Lock
 
 import jwt
@@ -106,12 +106,39 @@ _FAIL_WINDOW_SECONDS = 900
 _MAX_ATTEMPTS = 5
 _LOCKOUT_SECONDS = 900
 
-_FAIL_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
-_LOCKED_UNTIL: dict[str, float] = {}
+# Both maps are kept oldest-first (failures by their latest attempt, locks by
+# expiry), so entries whose window or lockout has passed are popped from the
+# front in O(1) amortised time. Without that, every failed login under a new
+# email stayed in memory for the life of the process (~225 B each).
+_FAIL_ATTEMPTS: OrderedDict[str, list[float]] = OrderedDict()
+_LOCKED_UNTIL: OrderedDict[str, float] = OrderedDict()
 
 
 def _rate_key(email: str, ip: str | None) -> str:
     return f"{email.lower()}:{ip or 'unknown'}"
+
+
+def _expire_lockout_state(now: float) -> None:
+    """Drop failures and locks that no longer matter. Caller holds _RATE_LOCK."""
+    while _FAIL_ATTEMPTS:
+        key, times = next(iter(_FAIL_ATTEMPTS.items()))
+        if times and now - times[-1] < _FAIL_WINDOW_SECONDS:
+            break
+        del _FAIL_ATTEMPTS[key]
+    while _LOCKED_UNTIL:
+        key, until = next(iter(_LOCKED_UNTIL.items()))
+        if now < until:
+            break
+        del _LOCKED_UNTIL[key]
+
+
+def _recent_failures(key: str, now: float) -> list[float]:
+    times = [t for t in _FAIL_ATTEMPTS.get(key, ()) if now - t < _FAIL_WINDOW_SECONDS]
+    if times:
+        _FAIL_ATTEMPTS[key] = times
+    else:
+        _FAIL_ATTEMPTS.pop(key, None)
+    return times
 
 
 def check_rate_limit(email: str, ip: str | None) -> tuple[bool, int]:
@@ -119,10 +146,11 @@ def check_rate_limit(email: str, ip: str | None) -> tuple[bool, int]:
     key = _rate_key(email, ip)
     now = time.time()
     with _RATE_LOCK:
+        _expire_lockout_state(now)
         locked_until = _LOCKED_UNTIL.get(key, 0)
         if now < locked_until:
             return True, int(locked_until - now)
-        _FAIL_ATTEMPTS[key] = [t for t in _FAIL_ATTEMPTS[key] if now - t < _FAIL_WINDOW_SECONDS]
+        _recent_failures(key, now)
     return False, 0
 
 
@@ -131,11 +159,16 @@ def record_failed_attempt(email: str, ip: str | None) -> int | None:
     key = _rate_key(email, ip)
     now = time.time()
     with _RATE_LOCK:
-        _FAIL_ATTEMPTS[key].append(now)
-        count = len(_FAIL_ATTEMPTS[key])
+        _expire_lockout_state(now)
+        times = _recent_failures(key, now)
+        times.append(now)
+        _FAIL_ATTEMPTS[key] = times
+        _FAIL_ATTEMPTS.move_to_end(key)
+        count = len(times)
         if count >= _MAX_ATTEMPTS:
             _LOCKED_UNTIL[key] = now + _LOCKOUT_SECONDS
-            _FAIL_ATTEMPTS[key].clear()
+            _LOCKED_UNTIL.move_to_end(key)
+            del _FAIL_ATTEMPTS[key]
             log.warning("Account locked for %s after %d failed attempts", email, count)
             return _LOCKOUT_SECONDS
     return None

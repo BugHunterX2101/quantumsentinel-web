@@ -491,3 +491,43 @@ def test_concurrent_first_signers_share_one_lazily_generated_key(make_engine, mo
     registered_pk = pqc.unb64(keys[0].public_key)
     assert all(pqc.dsa_verify(registered_pk, message, signature)
                for message, signature, _ in results)
+
+
+def test_writers_in_separate_processes_extend_one_unbroken_chain(make_engine, monkeypatch):
+    """Writers in different processes share no Python lock: only the advisory
+    lock orders them. Each must read the chain head after that lock is
+    granted, or two links claim the same predecessor (a unique violation on
+    sequence, or a fork that verification rejects)."""
+    import contextlib
+
+    monkeypatch.setattr(security_service, "_audit_chain_lock", contextlib.nullcontext())
+    Session = sessionmaker(bind=make_engine())
+    with Session() as db:
+        security_service.server_identity.ensure_registered(db)
+    writers, per_writer = 8, 12
+    errors, written = [], []
+    barrier = threading.Barrier(writers)
+
+    def write(n):
+        with Session() as db:
+            barrier.wait()
+            for i in range(per_writer):
+                try:
+                    entry = security_service.write_audit_log(db, None, "EVENT", metadata={"n": n, "i": i})
+                    written.append(entry.id)
+                except Exception as exc:  # pragma: no cover - reported below
+                    errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(n,)) for n in range(writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    with Session() as db:
+        sequences = db.execute(select(models.AuditChainLink.sequence)
+                               .order_by(models.AuditChainLink.sequence)).scalars().all()
+        assert sequences == list(range(1, writers * per_writer + 1))
+        status = security_service.audit_chain_status(db)
+        assert status["valid"] and status["unchained_events"] == 0, status
+        assert {e.id for e in db.execute(select(models.AuditLog)).scalars()} == set(written)

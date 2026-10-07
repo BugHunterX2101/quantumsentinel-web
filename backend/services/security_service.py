@@ -14,7 +14,7 @@ import threading
 import datetime as dt
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
-from sqlalchemy import func, select, text
+from sqlalchemy import func, insert, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .. import models
@@ -297,40 +297,54 @@ def write_audit_log(db: Session, user_id: str | None, action: str,
     # it, so choosing the sequence number, reading the chain head and
     # inserting the new link form one critical section: the lock is taken
     # before any of them, and the event and its link commit together.
+    #
+    # Every process waits on this section, so it caps audited writes per
+    # second across the deployment: it makes as few round trips as it can
+    # and does no ORM work.
     with _audit_chain_lock:
         try:
-            # Transaction-scoped: released by the commit below.
-            db.execute(text("SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'))"))
-            previous = db.execute(
-                select(models.AuditChainLink).order_by(models.AuditChainLink.sequence.desc()).limit(1)
-            ).scalars().first()
-            sequence = (previous.sequence + 1) if previous else 1
-            previous_hash = previous.entry_hash if previous else "0" * 64
-            entry = models.AuditLog(
-                user_id=user_id, action=action, resource_type=resource_type,
-                resource_id=resource_id, metadata_json=metadata,
-                pqc_signature=pqc.b64(signature),
-                signing_key_id=signing_key_id,
-            )
-            db.add(entry)
-            db.flush()
-            # Hash created_at as the database stored it (read back, so it is
-            # exactly what audit_chain_status will see), in canonical UTC form.
-            db.refresh(entry)
-            entry_hash = _chain_hash(entry.id, _chain_timestamp(entry.created_at),
+            # Lock, then read the head, in one round trip. The statements of a
+            # multi-statement query run in order, each with its own snapshot,
+            # so the head is read only once the lock is held and sees every
+            # link committed before it. The lock is transaction-scoped:
+            # released by the commit below.
+            cursor = db.connection().connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'));"
+                    " SELECT sequence, entry_hash FROM audit_chain_links ORDER BY sequence DESC LIMIT 1"
+                )
+                cursor.nextset()
+                previous = cursor.fetchone()
+            finally:
+                cursor.close()
+            sequence = previous[0] + 1 if previous else 1
+            previous_hash = previous[1] if previous else "0" * 64
+            # The hash covers created_at as stored: timestamptz keeps every
+            # microsecond of a Python datetime, so audit_chain_status reads
+            # back this same instant.
+            log_id, created_at = models.gen_uuid(), models.utcnow()
+            entry_hash = _chain_hash(log_id, _chain_timestamp(created_at),
                                      json.loads(payload.decode()), previous_hash)
             checkpoint = pqc.b64(server_identity.sign(entry_hash.encode()))
-            db.add(models.AuditChainLink(
-                sequence=sequence, audit_log_id=entry.id, previous_hash=previous_hash,
-                entry_hash=entry_hash, checkpoint_signature=checkpoint,
-                signing_key_id=signing_key_id,
-            ))
+            # The event and its link in one statement (a data-modifying CTE);
+            # the link's foreign key to the event is still enforced.
+            event = insert(models.AuditLog.__table__).values(
+                id=log_id, user_id=user_id, action=action, resource_type=resource_type,
+                resource_id=resource_id, metadata_json=metadata, pqc_signature=pqc.b64(signature),
+                signing_key_id=signing_key_id, created_at=created_at,
+            ).cte("audit_event")
+            db.execute(insert(models.AuditChainLink.__table__).values(
+                id=models.gen_uuid(), sequence=sequence, audit_log_id=log_id,
+                previous_hash=previous_hash, entry_hash=entry_hash,
+                checkpoint_signature=checkpoint, signing_key_id=signing_key_id,
+                created_at=models.utcnow(),
+            ).add_cte(event))
             db.commit()
         except Exception:
             db.rollback()
             raise
-    db.refresh(entry)
-    return entry
+    return db.get(models.AuditLog, log_id)
 
 
 def verify_audit_log(db: Session, log_id: str) -> bool:

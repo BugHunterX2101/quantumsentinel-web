@@ -708,11 +708,13 @@ class TestAuditGroupCommit:
         assert not any(t.is_alive() for t in threads), "an append never returned"
         return results
 
-    def _assert_chain(self, Session, links):
+    def _assert_chain(self, Session, actions):
+        """The chain holds `actions` in this order, every link signed and valid."""
         with Session() as db:
-            sequences = db.execute(select(models.AuditChainLink.sequence)
-                                   .order_by(models.AuditChainLink.sequence)).scalars().all()
-            assert sequences == list(range(1, links + 1))
+            rows = db.execute(select(models.AuditChainLink.sequence, models.AuditLog.action)
+                              .join(models.AuditLog, models.AuditLog.id == models.AuditChainLink.audit_log_id)
+                              .order_by(models.AuditChainLink.sequence)).all()
+            assert [tuple(r) for r in rows] == list(enumerate(actions, start=1))
             assert db.execute(select(func.count()).select_from(models.AuditChainLink)
                               .where(models.AuditChainLink.checkpoint_signature.is_(None))).scalar() == 0
             status = security_service.audit_chain_status(db)
@@ -721,11 +723,13 @@ class TestAuditGroupCommit:
     def test_queued_appends_share_one_transaction(self, chain):
         Session, _, batches, _ = chain
         results = self._run(chain, writers=8)
-        assert batches == [["E0"], [f"E{n}" for n in range(1, 8)]]
+        # Writers queue in whatever order their threads run; all seven share one batch.
+        assert batches[0] == ["E0"] and sorted(batches[1]) == [f"E{n}" for n in range(1, 8)]
+        assert len(batches) == 2
         for n in range(8):
             assert not isinstance(results[n], Exception), results[n]
             assert results[n][1:] == (f"E{n}", {"n": n})  # each caller gets its own event
-        self._assert_chain(Session, 8)
+        self._assert_chain(Session, batches[0] + batches[1])  # chained in queue order
 
     def test_a_batch_never_exceeds_the_cap(self, chain, monkeypatch):
         Session, _, batches, _ = chain
@@ -733,7 +737,7 @@ class TestAuditGroupCommit:
         results = self._run(chain, writers=10)
         assert [len(b) for b in batches] == [1, 3, 3, 3]
         assert all(not isinstance(r, Exception) for r in results.values())
-        self._assert_chain(Session, 10)
+        self._assert_chain(Session, [action for batch in batches for action in batch])
 
     def test_a_leader_keeps_writing_until_its_own_append_is_written(self, monkeypatch):
         """Waiting threads wake in no fixed order: one whose append is past
@@ -760,6 +764,7 @@ class TestAuditGroupCommit:
         results = self._run(chain, writers=5, user_ids={3: "no-such-user"})
         assert isinstance(results[3], IntegrityError)
         assert all(not isinstance(results[n], Exception) for n in (0, 1, 2, 4))
-        # the batch failed as a whole, then each append went alone
-        assert batches == [["E0"], ["E1", "E2", "E3", "E4"], ["E1"], ["E2"], ["E3"], ["E4"]]
-        self._assert_chain(Session, 4)
+        # the batch failed as a whole, then each append went alone, in batch order
+        assert batches[0] == ["E0"] and sorted(batches[1]) == ["E1", "E2", "E3", "E4"]
+        assert batches[2:] == [[action] for action in batches[1]]
+        self._assert_chain(Session, ["E0"] + [action for action in batches[1] if action != "E3"])

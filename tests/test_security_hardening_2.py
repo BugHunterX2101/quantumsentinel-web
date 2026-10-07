@@ -73,6 +73,93 @@ class TestJwtClaims:
         assert auth_service.decode_access_token(token) is None
 
 
+class TestVerifiedTokenCache:
+    @pytest.fixture(autouse=True)
+    def clock(self, monkeypatch):
+        """Empty cache, a settable clock, and a count of real RSA verifications."""
+        import types
+        monkeypatch.setattr(auth_service, "_VERIFIED_TOKENS", type(auth_service._VERIFIED_TOKENS)())
+        now = [time.time()]
+        monkeypatch.setattr(auth_service, "time", types.SimpleNamespace(time=lambda: now[0]))
+        calls = []
+        real_decode = jwt.decode
+        monkeypatch.setattr(auth_service.jwt, "decode", lambda *a, **k: calls.append(1) or real_decode(*a, **k))
+        self.calls = calls
+        return now
+
+    @staticmethod
+    def _token(sub="u1", exp_in=60, now=None):
+        from backend.config import JWT_ALGORITHM, JWT_SIGNING_KEY
+        now = int(now if now is not None else time.time())
+        claims = {"iss": "quantumsentinel", "aud": "quantumsentinel-api", "sub": sub, "jti": "b" * 32,
+                  "tier": "free", "iat": now, "exp": now + exp_in}
+        return jwt.encode(claims, JWT_SIGNING_KEY, algorithm=JWT_ALGORITHM)
+
+    def test_a_token_is_verified_once_then_served_from_the_cache(self):
+        token = self._token()
+        first = auth_service.decode_access_token(token)
+        assert auth_service.decode_access_token(token) == first
+        assert auth_service.decode_access_token(token)["sub"] == "u1"
+        assert len(self.calls) == 1
+
+    def test_a_cached_token_is_rejected_from_the_second_it_expires(self, clock):
+        token = self._token(exp_in=60, now=clock[0])
+        exp = jwt.decode(token, options={"verify_signature": False})["exp"]
+        self.calls.clear()
+        assert auth_service.decode_access_token(token) is not None
+        clock[0] = exp - 0.001
+        assert auth_service.decode_access_token(token) is not None
+        clock[0] = exp  # PyJWT's rule: expired once exp <= now
+        assert auth_service.decode_access_token(token) is None
+        assert token not in auth_service._VERIFIED_TOKENS
+        assert len(self.calls) == 1
+
+    def test_callers_cannot_change_the_cached_claims(self):
+        token = self._token()
+        auth_service.decode_access_token(token)["sub"] = "someone-else"  # a miss
+        auth_service.decode_access_token(token)["sub"] = "someone-else"  # a hit
+        assert auth_service.decode_access_token(token)["sub"] == "u1"
+
+    def test_rejected_tokens_are_never_cached(self):
+        good = self._token()
+        forged = good[:-4] + ("AAAA" if not good.endswith("AAAA") else "BBBB")
+        for _ in range(3):
+            assert auth_service.decode_access_token(forged) is None
+            assert auth_service.decode_access_token("garbage.token.here") is None
+        assert len(auth_service._VERIFIED_TOKENS) == 0
+        assert len(self.calls) == 6
+
+    def test_expired_entries_are_dropped_when_new_tokens_arrive(self, clock):
+        for i in range(5):
+            auth_service.decode_access_token(self._token(sub=f"old{i}", exp_in=10, now=clock[0]))
+        assert len(auth_service._VERIFIED_TOKENS) == 5
+        clock[0] += 11
+        new = self._token(sub="new", exp_in=60)  # issued now (PyJWT rejects a future iat)
+        assert auth_service.decode_access_token(new)["sub"] == "new"
+        assert list(auth_service._VERIFIED_TOKENS) == [new]
+
+    def test_the_cache_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(auth_service, "_VERIFIED_TOKENS_MAX", 3)
+        tokens = [self._token(sub=f"u{i}") for i in range(5)]
+        for t in tokens:
+            auth_service.decode_access_token(t)
+        assert list(auth_service._VERIFIED_TOKENS) == tokens[2:]
+        assert auth_service.decode_access_token(tokens[0])["sub"] == "u0"  # evicted: verified again
+        assert len(self.calls) == 6
+
+    def test_concurrent_lookups_are_safe(self, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+        monkeypatch.setattr(auth_service, "_VERIFIED_TOKENS_MAX", 8)
+        tokens = [self._token(sub=f"u{i}") for i in range(16)]
+
+        def work(i):
+            return auth_service.decode_access_token(tokens[i % 16])["sub"] == f"u{i % 16}"
+
+        with ThreadPoolExecutor(8) as pool:
+            assert all(pool.map(work, range(2000)))
+        assert len(auth_service._VERIFIED_TOKENS) <= 8
+
+
 class TestApiKeys:
     def test_users_cannot_mint_admin_scoped_keys(self):
         with pytest.raises(ValueError):

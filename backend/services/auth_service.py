@@ -219,14 +219,40 @@ def create_access_token(user_id: str, tier: str) -> str:
     return jwt.encode(payload, JWT_SIGNING_KEY, algorithm=JWT_ALGORITHM)
 
 
+# Tokens this process has already verified, so each one is RSA-verified once
+# rather than on every request (~120 us). Only the expiry can change the
+# answer for a token already verified, so a hit re-checks it, exactly as
+# PyJWT does (expired once exp <= now). Kept in first-seen order, which for
+# tokens of one lifetime is roughly expiry order: expired entries are dropped
+# from the front, and the oldest goes when the cache is full.
+_VERIFIED_TOKENS: OrderedDict[str, dict] = OrderedDict()
+_VERIFIED_TOKENS_MAX = 10_000
+_VERIFIED_TOKENS_LOCK = Lock()
+
+
 def decode_access_token(token: str) -> dict | None:
     """Verify signature, expiry, issuer and audience; every claim is required."""
+    with _VERIFIED_TOKENS_LOCK:
+        payload = _VERIFIED_TOKENS.get(token)
+        if payload is not None:
+            if payload["exp"] > time.time():
+                return dict(payload)
+            del _VERIFIED_TOKENS[token]
+            return None
     try:
-        return jwt.decode(token, JWT_VERIFY_KEY, algorithms=[JWT_ALGORITHM],
-                          audience=JWT_AUDIENCE, issuer=JWT_ISSUER,
-                          options={"require": ["exp", "iat", "sub", "iss", "aud", "jti"]})
+        payload = jwt.decode(token, JWT_VERIFY_KEY, algorithms=[JWT_ALGORITHM],
+                             audience=JWT_AUDIENCE, issuer=JWT_ISSUER,
+                             options={"require": ["exp", "iat", "sub", "iss", "aud", "jti"]})
     except jwt.PyJWTError:
         return None
+    with _VERIFIED_TOKENS_LOCK:
+        now = time.time()
+        while _VERIFIED_TOKENS and next(iter(_VERIFIED_TOKENS.values()))["exp"] <= now:
+            _VERIFIED_TOKENS.popitem(last=False)
+        _VERIFIED_TOKENS[token] = payload
+        if len(_VERIFIED_TOKENS) > _VERIFIED_TOKENS_MAX:
+            _VERIFIED_TOKENS.popitem(last=False)
+    return dict(payload)
 
 
 # ---------------------------------------------------------------------------

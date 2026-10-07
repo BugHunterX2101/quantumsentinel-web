@@ -11,6 +11,7 @@ import json
 import hashlib
 import hmac
 import threading
+import weakref
 import datetime as dt
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
@@ -225,10 +226,152 @@ def enforce_identity_pin(pinned: str | None) -> None:
         raise RuntimeError("server ML-DSA key does not match TRUSTED_SERVER_DSA_FINGERPRINT")
 
 
-# Orders chain appends between threads of this process before they contend
-# for the database-wide advisory lock below (which orders them across
-# processes), so at most one connection per process waits on that lock.
-_audit_chain_lock = threading.Lock()
+# Chain appends are group-committed: while one thread of this process holds
+# the database-wide advisory lock, the appends other threads queue up are
+# written after it in one transaction, one lock acquisition and one commit,
+# so at most one connection per process waits on that lock. Every link is
+# still signed. A batch is capped because the lock is held while it is signed.
+_AUDIT_BATCH_MAX = 8
+
+
+class _PendingAudit:
+    __slots__ = ("log_id", "user_id", "action", "resource_type", "resource_id", "metadata",
+                 "payload", "signature", "signing_key_id", "done", "error")
+
+    def __init__(self, **fields):
+        for name, value in fields.items():
+            setattr(self, name, value)
+        self.done, self.error = False, None
+
+
+class _AuditAppender:
+    """Leader/follower group commit of audit-chain appends for one database.
+
+    A thread that finds no batch being written writes the queued appends,
+    its own among them, and wakes the threads whose appends it wrote."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._queue: list[_PendingAudit] = []
+        self._writing = False
+
+    def append(self, db: Session, entry: _PendingAudit) -> None:
+        with self._cv:
+            self._queue.append(entry)
+        while True:
+            with self._cv:
+                while self._writing and not entry.done:
+                    self._cv.wait()
+                if entry.done:
+                    break
+                self._writing = True
+                batch = self._queue[:_AUDIT_BATCH_MAX]
+                del self._queue[:_AUDIT_BATCH_MAX]
+            try:
+                _write_chain_batch(db, batch)
+            finally:
+                with self._cv:
+                    for pending in batch:
+                        if not pending.done:  # interrupted (BaseException)
+                            pending.done, pending.error = True, RuntimeError("audit write interrupted")
+                    self._writing = False
+                    self._cv.notify_all()
+        if entry.error is not None:
+            raise entry.error
+
+
+# One per engine (the API has one; tests make many), dropped with the engine.
+_audit_appenders: "weakref.WeakKeyDictionary[object, _AuditAppender]" = weakref.WeakKeyDictionary()
+_audit_appenders_lock = threading.Lock()
+
+
+def _appender_for(db: Session) -> _AuditAppender:
+    bind = db.get_bind()
+    engine = getattr(bind, "engine", bind)
+    with _audit_appenders_lock:
+        appender = _audit_appenders.get(engine)
+        if appender is None:
+            appender = _audit_appenders[engine] = _AuditAppender()
+        return appender
+
+
+def _write_chain_batch(db: Session, batch: list[_PendingAudit]) -> None:
+    """Write a batch in one transaction; if that fails, each append alone,
+    so one bad append (say, an unknown user id) fails only its own caller."""
+    try:
+        _insert_chain_links(db, batch)
+    except Exception as exc:
+        if len(batch) == 1:
+            batch[0].error = exc
+        else:
+            for pending in batch:
+                try:
+                    _insert_chain_links(db, [pending])
+                except Exception as single_exc:
+                    pending.error = single_exc
+    for pending in batch:
+        pending.done = True
+
+
+def _insert_chain_links(db: Session, batch: list[_PendingAudit]) -> None:
+    # Each link must point at the link sequenced immediately before it, so
+    # choosing sequence numbers, reading the chain head and inserting the new
+    # links form one critical section: the lock is taken before any of them,
+    # and the events and their links commit together.
+    #
+    # Every process waits on this section, so it caps audited writes per
+    # second across the deployment: it makes three round trips (lock and
+    # head, insert, commit) however many appends it carries, and does no ORM
+    # work.
+    try:
+        # Lock, then read the head, in one round trip. The statements of a
+        # multi-statement query run in order, each with its own snapshot, so
+        # the head is read only once the lock is held and sees every link
+        # committed before it. The lock is transaction-scoped: released by
+        # the commit below.
+        cursor = db.connection().connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'));"
+                " SELECT sequence, entry_hash FROM audit_chain_links ORDER BY sequence DESC LIMIT 1"
+            )
+            cursor.nextset()
+            previous = cursor.fetchone()
+        finally:
+            cursor.close()
+        sequence = previous[0] if previous else 0
+        previous_hash = previous[1] if previous else "0" * 64
+        events, links = [], []
+        for pending in batch:
+            sequence += 1
+            # The hash covers created_at as stored: timestamptz keeps every
+            # microsecond of a Python datetime, so audit_chain_status reads
+            # back this same instant.
+            created_at = models.utcnow()
+            entry_hash = _chain_hash(pending.log_id, _chain_timestamp(created_at),
+                                     json.loads(pending.payload.decode()), previous_hash)
+            checkpoint = pqc.b64(server_identity.sign(entry_hash.encode()))
+            events.append(dict(
+                id=pending.log_id, user_id=pending.user_id, action=pending.action,
+                resource_type=pending.resource_type, resource_id=pending.resource_id,
+                metadata_json=pending.metadata, pqc_signature=pending.signature,
+                signing_key_id=pending.signing_key_id, created_at=created_at,
+            ))
+            links.append(dict(
+                id=models.gen_uuid(), sequence=sequence, audit_log_id=pending.log_id,
+                previous_hash=previous_hash, entry_hash=entry_hash,
+                checkpoint_signature=checkpoint, signing_key_id=pending.signing_key_id,
+                created_at=models.utcnow(),
+            ))
+            previous_hash = entry_hash
+        # The events and their links in one statement (a data-modifying CTE);
+        # the links' foreign keys to the events are still enforced.
+        event_cte = insert(models.AuditLog.__table__).values(events).cte("audit_event")
+        db.execute(insert(models.AuditChainLink.__table__).values(links).add_cte(event_cte))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 def _chain_timestamp(created_at: dt.datetime | None) -> str:
@@ -293,58 +436,14 @@ def write_audit_log(db: Session, user_id: str | None, action: str,
 
     # The ML-DSA signature protects an individual event; the hash chain makes
     # deletion, modification and reordering observable when the history is
-    # verified. Each link must point at the link sequenced immediately before
-    # it, so choosing the sequence number, reading the chain head and
-    # inserting the new link form one critical section: the lock is taken
-    # before any of them, and the event and its link commit together.
-    #
-    # Every process waits on this section, so it caps audited writes per
-    # second across the deployment: it makes as few round trips as it can
-    # and does no ORM work.
-    with _audit_chain_lock:
-        try:
-            # Lock, then read the head, in one round trip. The statements of a
-            # multi-statement query run in order, each with its own snapshot,
-            # so the head is read only once the lock is held and sees every
-            # link committed before it. The lock is transaction-scoped:
-            # released by the commit below.
-            cursor = db.connection().connection.cursor()
-            try:
-                cursor.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'));"
-                    " SELECT sequence, entry_hash FROM audit_chain_links ORDER BY sequence DESC LIMIT 1"
-                )
-                cursor.nextset()
-                previous = cursor.fetchone()
-            finally:
-                cursor.close()
-            sequence = previous[0] + 1 if previous else 1
-            previous_hash = previous[1] if previous else "0" * 64
-            # The hash covers created_at as stored: timestamptz keeps every
-            # microsecond of a Python datetime, so audit_chain_status reads
-            # back this same instant.
-            log_id, created_at = models.gen_uuid(), models.utcnow()
-            entry_hash = _chain_hash(log_id, _chain_timestamp(created_at),
-                                     json.loads(payload.decode()), previous_hash)
-            checkpoint = pqc.b64(server_identity.sign(entry_hash.encode()))
-            # The event and its link in one statement (a data-modifying CTE);
-            # the link's foreign key to the event is still enforced.
-            event = insert(models.AuditLog.__table__).values(
-                id=log_id, user_id=user_id, action=action, resource_type=resource_type,
-                resource_id=resource_id, metadata_json=metadata, pqc_signature=pqc.b64(signature),
-                signing_key_id=signing_key_id, created_at=created_at,
-            ).cte("audit_event")
-            db.execute(insert(models.AuditChainLink.__table__).values(
-                id=models.gen_uuid(), sequence=sequence, audit_log_id=log_id,
-                previous_hash=previous_hash, entry_hash=entry_hash,
-                checkpoint_signature=checkpoint, signing_key_id=signing_key_id,
-                created_at=models.utcnow(),
-            ).add_cte(event))
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-    return db.get(models.AuditLog, log_id)
+    # verified (see _insert_chain_links).
+    pending = _PendingAudit(
+        log_id=models.gen_uuid(), user_id=user_id, action=action, resource_type=resource_type,
+        resource_id=resource_id, metadata=metadata, payload=payload,
+        signature=pqc.b64(signature), signing_key_id=signing_key_id,
+    )
+    _appender_for(db).append(db, pending)
+    return db.get(models.AuditLog, pending.log_id)
 
 
 def verify_audit_log(db: Session, log_id: str) -> bool:

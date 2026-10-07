@@ -12,8 +12,8 @@ import time
 import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import event, select, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import event, func, select, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.orm import sessionmaker
 
@@ -620,9 +620,8 @@ def test_writers_in_separate_processes_extend_one_unbroken_chain(make_engine, mo
     lock orders them. Each must read the chain head after that lock is
     granted, or two links claim the same predecessor (a unique violation on
     sequence, or a fork that verification rejects)."""
-    import contextlib
-
-    monkeypatch.setattr(security_service, "_audit_chain_lock", contextlib.nullcontext())
+    # A process of its own per append: no shared queue, no group commit.
+    monkeypatch.setattr(security_service, "_appender_for", lambda db: security_service._AuditAppender())
     Session = sessionmaker(bind=make_engine())
     with Session() as db:
         security_service.server_identity.ensure_registered(db)
@@ -653,3 +652,114 @@ def test_writers_in_separate_processes_extend_one_unbroken_chain(make_engine, mo
         status = security_service.audit_chain_status(db)
         assert status["valid"] and status["unchained_events"] == 0, status
         assert {e.id for e in db.execute(select(models.AuditLog)).scalars()} == set(written)
+
+
+class TestAuditGroupCommit:
+    """Appends queued while one thread of a process writes the chain are
+    written after it in one transaction, every link still signed."""
+
+    @pytest.fixture
+    def chain(self, make_engine, monkeypatch):
+        Session = sessionmaker(bind=make_engine())
+        with Session() as db:
+            security_service.server_identity.ensure_registered(db)
+            appender = security_service._appender_for(db)
+        batches, release = [], threading.Event()
+        real = security_service._insert_chain_links
+
+        def first_batch_waits(db, batch):
+            if not batches:
+                assert release.wait(30), "test never released the first batch"
+            batches.append([p.action for p in batch])
+            return real(db, batch)
+
+        monkeypatch.setattr(security_service, "_insert_chain_links", first_batch_waits)
+        return Session, appender, batches, release
+
+    @staticmethod
+    def _write(Session, results, user_id, action, n):
+        try:
+            with Session() as db:
+                entry = security_service.write_audit_log(db, user_id, action, metadata={"n": n})
+                results[n] = (entry.id, entry.action, entry.metadata_json)
+        except Exception as exc:
+            results[n] = exc
+
+    def _run(self, chain, writers, user_ids=None):
+        """Writer 0 leads a batch held until every other writer has queued."""
+        Session, appender, batches, release = chain
+        user_ids = user_ids or {}
+        results = {}
+        threads = [threading.Thread(target=self._write, args=(Session, results, user_ids.get(n), f"E{n}", n),
+                                    daemon=True)
+                   for n in range(writers)]
+        threads[0].start()
+        deadline = time.monotonic() + 10
+        while not appender._writing and time.monotonic() < deadline:
+            time.sleep(0.002)
+        for t in threads[1:]:
+            t.start()
+        while len(appender._queue) < writers - 1 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        assert len(appender._queue) == writers - 1
+        release.set()
+        for t in threads:
+            t.join(30)
+        assert not any(t.is_alive() for t in threads), "an append never returned"
+        return results
+
+    def _assert_chain(self, Session, links):
+        with Session() as db:
+            sequences = db.execute(select(models.AuditChainLink.sequence)
+                                   .order_by(models.AuditChainLink.sequence)).scalars().all()
+            assert sequences == list(range(1, links + 1))
+            assert db.execute(select(func.count()).select_from(models.AuditChainLink)
+                              .where(models.AuditChainLink.checkpoint_signature.is_(None))).scalar() == 0
+            status = security_service.audit_chain_status(db)
+            assert status["valid"] and status["unchained_events"] == 0, status
+
+    def test_queued_appends_share_one_transaction(self, chain):
+        Session, _, batches, _ = chain
+        results = self._run(chain, writers=8)
+        assert batches == [["E0"], [f"E{n}" for n in range(1, 8)]]
+        for n in range(8):
+            assert not isinstance(results[n], Exception), results[n]
+            assert results[n][1:] == (f"E{n}", {"n": n})  # each caller gets its own event
+        self._assert_chain(Session, 8)
+
+    def test_a_batch_never_exceeds_the_cap(self, chain, monkeypatch):
+        Session, _, batches, _ = chain
+        monkeypatch.setattr(security_service, "_AUDIT_BATCH_MAX", 3)
+        results = self._run(chain, writers=10)
+        assert [len(b) for b in batches] == [1, 3, 3, 3]
+        assert all(not isinstance(r, Exception) for r in results.values())
+        self._assert_chain(Session, 10)
+
+    def test_a_leader_keeps_writing_until_its_own_append_is_written(self, monkeypatch):
+        """Waiting threads wake in no fixed order: one whose append is past
+        the cap can lead, and must not return before its own is written."""
+        monkeypatch.setattr(security_service, "_AUDIT_BATCH_MAX", 2)
+        written = []
+
+        def write(db, batch):
+            written.append([p.action for p in batch])
+            for p in batch:
+                p.done = True
+
+        monkeypatch.setattr(security_service, "_write_chain_batch", write)
+        appender = security_service._AuditAppender()
+        make = lambda action: security_service._PendingAudit(action=action)
+        appender._queue.extend(make(f"Q{n}") for n in range(5))  # queued by threads still waiting
+        own = make("OWN")
+        appender.append(None, own)
+        assert own.done
+        assert written == [["Q0", "Q1"], ["Q2", "Q3"], ["Q4", "OWN"]]
+
+    def test_one_bad_append_fails_only_its_own_caller(self, chain):
+        Session, _, batches, _ = chain
+        results = self._run(chain, writers=5, user_ids={3: "no-such-user"})
+        assert isinstance(results[3], IntegrityError)
+        assert all(not isinstance(results[n], Exception) for n in (0, 1, 2, 4))
+        # the batch failed as a whole, then each append went alone
+        assert batches == [["E0"], ["E1", "E2", "E3", "E4"], ["E1"], ["E2"], ["E3"], ["E4"]]
+        self._assert_chain(Session, 4)

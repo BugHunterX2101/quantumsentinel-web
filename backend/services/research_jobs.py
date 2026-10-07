@@ -32,7 +32,7 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
-from ..config import (DATABASE_URL, RESEARCH_JOB_MAX_ATTEMPTS, RESEARCH_JOB_RETENTION_DAYS,
+from ..config import (RESEARCH_JOB_MAX_ATTEMPTS, RESEARCH_JOB_RETENTION_DAYS,
                       RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
 from . import research_trials, security_service
 
@@ -43,13 +43,9 @@ TERMINAL = (SUCCEEDED, FAILED, CANCELLED)
 # A worker that has not heartbeated for this long is not counted as online.
 WORKER_ONLINE_SECONDS = 30
 
-_is_postgres = DATABASE_URL.startswith(("postgresql://", "postgresql+"))
-
-# Conditional UPDATE/DELETE statements here compare stored datetimes. By
-# default SQLAlchemy re-evaluates such criteria in Python against objects
-# already loaded in the session, and SQLite returns those datetimes naive, so
-# the comparison raises. Every caller commits right after, which expires the
-# loaded objects anyway, so skip that in-memory synchronisation.
+# Conditional UPDATE/DELETE statements here are decided by the database. Every
+# caller commits right after, which expires the loaded objects anyway, so
+# skip SQLAlchemy's in-memory re-evaluation of their criteria.
 _UNSYNCED = {"synchronize_session": False}
 
 
@@ -131,7 +127,7 @@ def _finite(value):
 # --------------------------------------------------------------------------
 
 # Orders the active-job count and insert between threads of one process;
-# on PostgreSQL the user-row lock below extends that across processes.
+# the user-row lock below extends that across processes.
 _enqueue_lock = threading.Lock()
 
 
@@ -141,8 +137,7 @@ def enqueue(db: Session, user_id: str, kind: str, params: dict) -> models.Resear
         raise ValueError(f"unknown research job kind {kind!r}")
     with _enqueue_lock:
         try:
-            if _is_postgres:
-                db.execute(text("SELECT id FROM users WHERE id = :uid FOR UPDATE"), {"uid": user_id})
+            db.execute(text("SELECT id FROM users WHERE id = :uid FOR UPDATE"), {"uid": user_id})
             active = int(db.execute(
                 select(func.count()).select_from(models.ResearchJob).where(
                     models.ResearchJob.user_id == user_id,
@@ -261,10 +256,10 @@ def queue_stats(db: Session) -> dict:
 def claim_next(db: Session, worker_id: str, lease_seconds: float) -> models.ResearchJob | None:
     """Atomically take the oldest queued job, or return None."""
     for _ in range(5):
+        # SKIP LOCKED: workers polling together each take a different job
+        # instead of queueing on the same row.
         query = (select(models.ResearchJob.id).where(models.ResearchJob.status == QUEUED)
-                 .order_by(models.ResearchJob.created_at).limit(1))
-        if _is_postgres:
-            query = query.with_for_update(skip_locked=True)
+                 .order_by(models.ResearchJob.created_at).limit(1).with_for_update(skip_locked=True))
         job_id = db.execute(query).scalar()
         if job_id is None:
             db.rollback()

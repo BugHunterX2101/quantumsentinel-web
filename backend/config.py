@@ -101,7 +101,48 @@ RESEARCH_WORKER_POLL_SECONDS = float(os.getenv("RESEARCH_WORKER_POLL_SECONDS", "
 if RESEARCH_WORKER_MODE not in ("embedded", "external", "off"):
     raise RuntimeError("RESEARCH_WORKER_MODE must be one of: embedded, external, off")
 
-DATABASE_URL = _setting("DATABASE_URL", "sqlite:///./quantumsentinel.db")
+def _postgres_url(url: str) -> str:
+    """PostgreSQL is the only supported database. Bare postgresql:// and
+    postgres:// URLs (as managed providers issue them) are pinned to the
+    psycopg 3 driver; SQLAlchemy would otherwise pick psycopg2, which is not
+    installed, or reject postgres:// outright."""
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix):]
+    if not url.startswith("postgresql+psycopg://"):
+        raise RuntimeError("DATABASE_URL must be a PostgreSQL URL "
+                           "(postgresql+psycopg://user:password@host:5432/dbname)")
+    return url
+
+
+DATABASE_URL = _postgres_url(_setting(
+    "DATABASE_URL", "postgresql+psycopg://quantumsentinel:quantumsentinel@localhost:5432/quantumsentinel"))
+# Connections each process may hold: DB_POOL_SIZE kept open plus up to
+# DB_MAX_OVERFLOW more. Every API process and research worker has its own
+# pool, so the sum across all of them must stay below the server's
+# max_connections (PostgreSQL's default is 100). Overflow connections are
+# closed as soon as they are returned, so steady load above DB_POOL_SIZE
+# reconnects constantly (measured: 709 new sessions per 20k requests at
+# 10+10 vs 1 at 20+0, +21% throughput, p99 108 -> 63 ms): size the pool for
+# the load and keep overflow for bursts only.
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "20"))
+DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "0"))
+# A request that cannot get a connection within this long fails (503) instead
+# of queueing indefinitely behind a saturated pool.
+DB_POOL_TIMEOUT_SECONDS = float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "10"))
+# Server-side limits on every session: no statement runs longer than this, no
+# lock is waited on longer than this, and a session left idle inside an open
+# transaction is terminated (its locks would otherwise block everyone).
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
+DB_LOCK_TIMEOUT_MS = int(os.getenv("DB_LOCK_TIMEOUT_MS", "10000"))
+DB_IDLE_IN_TRANSACTION_TIMEOUT_MS = int(os.getenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "60000"))
+# Apply pending schema migrations when an API process starts. Concurrent
+# starts are serialised by a database lock, so this is safe with many
+# workers; disable it to run `python -m backend.manage migrate` as a separate
+# release step instead.
+DB_MIGRATE_ON_STARTUP = os.getenv("DB_MIGRATE_ON_STARTUP", "true").lower() == "true"
+if DB_POOL_SIZE < 1 or DB_MAX_OVERFLOW < 0:
+    raise RuntimeError("DB_POOL_SIZE must be >= 1 and DB_MAX_OVERFLOW >= 0")
 REDIS_URL = _setting("REDIS_URL")
 PQC_PROVIDER = _setting("PQC_PROVIDER", "reference")
 PQC_PROVIDER_URL = _setting("PQC_PROVIDER_URL")
@@ -126,8 +167,8 @@ if ENVIRONMENT == "production":
         raise RuntimeError("PRIVATE_KEY_ENCRYPTION_KEY is required in production")
     if not SERVER_DSA_PRIVATE_KEY or not SERVER_DSA_PUBLIC_KEY:
         raise RuntimeError("SERVER_DSA_PRIVATE_KEY and SERVER_DSA_PUBLIC_KEY are required in production")
-    if not DATABASE_URL or not DATABASE_URL.startswith(("postgresql://", "postgresql+")):
-        raise RuntimeError("DATABASE_URL must use PostgreSQL in production")
+    if not _setting("DATABASE_URL"):
+        raise RuntimeError("DATABASE_URL is required in production")
     if not REDIS_URL:
         raise RuntimeError("REDIS_URL is required in production")
     if PQC_PROVIDER == "reference" or not PQC_PROVIDER_URL:

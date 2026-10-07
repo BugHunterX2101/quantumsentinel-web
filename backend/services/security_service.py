@@ -5,7 +5,7 @@ Item 8 enhancements:
 - Each audit entry records signing_key_id for historical verification
 - Key rotation stores the old key before generating a new one
 - verify_audit_log uses the historical key, not the current server identity
-- Audit chain sequence uses nextval() on PostgreSQL for atomic ordering
+- Audit chain appends are serialised by a PostgreSQL advisory lock
 """
 import json
 import hashlib
@@ -15,18 +15,18 @@ import datetime as dt
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
 from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .. import models
 from ..crypto import pqc
 from ..config import (PRIVATE_KEY_ENCRYPTION_KEY, SERVER_DSA_PRIVATE_KEY,
-                      SERVER_DSA_PUBLIC_KEY, SERVER_DSA_CREATED_AT, DATABASE_URL)
+                      SERVER_DSA_PUBLIC_KEY, SERVER_DSA_CREATED_AT)
 
 import logging as _logging
 
 _log = _logging.getLogger(__name__)
 
 SERVER_KEY_ROTATION_DAYS = 90
-_is_postgres = DATABASE_URL.startswith(("postgresql://", "postgresql+"))
 
 if PRIVATE_KEY_ENCRYPTION_KEY:
     _PRIVATE_KEY_FERNET = Fernet(PRIVATE_KEY_ENCRYPTION_KEY.encode())
@@ -134,29 +134,26 @@ class ServerIdentity:
             return None
         if not self.fingerprint:
             self.fingerprint = hashlib.sha256(self.dsa_pk).hexdigest()
-        # Check if already registered
-        existing = db.execute(
-            select(models.ServerSigningKey).where(
-                models.ServerSigningKey.fingerprint == self.fingerprint
-            )
-        ).scalars().first()
-        if existing:
-            self.key_id = existing.key_id
-            self._registered = True
-            return existing.key_id
-        # Register new
-        key_id = self.key_id or models.gen_uuid()
-        self.key_id = key_id
-        record = models.ServerSigningKey(
-            key_id=key_id,
-            algorithm="ML-DSA-65",
-            public_key=pqc.b64(self.dsa_pk),
-            fingerprint=self.fingerprint,
-            status="active",
-            activated_at=self.created_at,
+        # Every process sharing this key (each API and research worker)
+        # registers it at startup, often at the same instant: insert-if-absent
+        # is one atomic statement, and all of them then adopt whichever row won.
+        db.execute(
+            pg_insert(models.ServerSigningKey).values(
+                key_id=self.key_id or models.gen_uuid(),
+                algorithm="ML-DSA-65",
+                public_key=pqc.b64(self.dsa_pk),
+                fingerprint=self.fingerprint,
+                status="active",
+                created_at=dt.datetime.now(dt.timezone.utc),
+                activated_at=self.created_at,
+            ).on_conflict_do_nothing(index_elements=["fingerprint"])
         )
-        db.add(record)
+        key_id = db.execute(
+            select(models.ServerSigningKey.key_id).where(
+                models.ServerSigningKey.fingerprint == self.fingerprint)
+        ).scalar_one()
         db.commit()
+        self.key_id = key_id
         self._registered = True
         return key_id
 
@@ -220,10 +217,57 @@ def enforce_identity_pin(pinned: str | None) -> None:
         raise RuntimeError("server ML-DSA key does not match TRUSTED_SERVER_DSA_FINGERPRINT")
 
 
-# Orders chain appends between threads of this process. SQLite has no
-# advisory locks and is a single-process deployment, so this alone suffices
-# there; on PostgreSQL the advisory lock below extends it across processes.
+# Orders chain appends between threads of this process before they contend
+# for the database-wide advisory lock below (which orders them across
+# processes), so at most one connection per process waits on that lock.
 _audit_chain_lock = threading.Lock()
+
+
+def _chain_timestamp(created_at: dt.datetime | None) -> str:
+    """An event's created_at as the chain hashes it: the instant, in UTC."""
+    if created_at is None:
+        return ""
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=dt.timezone.utc)
+    return created_at.astimezone(dt.timezone.utc).isoformat()
+
+
+def _legacy_chain_timestamps(created_at: dt.datetime | None, server_tz) -> list[str]:
+    """Other renderings of the same instant that earlier releases hashed.
+
+    Releases running on SQLite hashed the naive UTC value; releases on
+    PostgreSQL before sessions were pinned to UTC hashed it in the server's
+    own TimeZone. Each names exactly the same instant, so accepting them adds
+    no way to alter an event: its content and the signed hash still must match.
+    """
+    if created_at is None:
+        return []
+    utc = created_at.astimezone(dt.timezone.utc) if created_at.tzinfo else created_at
+    forms = [utc.replace(tzinfo=None).isoformat()]
+    if server_tz is not None:
+        forms.append(utc.replace(tzinfo=dt.timezone.utc).astimezone(server_tz).isoformat())
+    return forms
+
+
+def _server_timezone(db: Session):
+    """The server's configured TimeZone (what sessions used before UTC pinning)."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    name = db.execute(text("SELECT reset_val FROM pg_settings WHERE name = 'TimeZone'")).scalar()
+    try:
+        return ZoneInfo(name) if name else None
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+_UNSET = object()
+
+
+def _chain_hash(audit_log_id: str, created_at: str, event_payload: dict, previous_hash: str) -> str:
+    return hashlib.sha256(json.dumps({
+        "audit_log_id": audit_log_id, "created_at": created_at,
+        "payload": event_payload, "previous_hash": previous_hash,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def write_audit_log(db: Session, user_id: str | None, action: str,
@@ -250,9 +294,8 @@ def write_audit_log(db: Session, user_id: str | None, action: str,
     # before any of them, and the event and its link commit together.
     with _audit_chain_lock:
         try:
-            if _is_postgres:
-                # Transaction-scoped: released by the commit below.
-                db.execute(text("SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'))"))
+            # Transaction-scoped: released by the commit below.
+            db.execute(text("SELECT pg_advisory_xact_lock(hashtext('quantumsentinel_audit_chain'))"))
             previous = db.execute(
                 select(models.AuditChainLink).order_by(models.AuditChainLink.sequence.desc()).limit(1)
             ).scalars().first()
@@ -266,16 +309,11 @@ def write_audit_log(db: Session, user_id: str | None, action: str,
             )
             db.add(entry)
             db.flush()
-            # Hash created_at exactly as the database returns it, which is
-            # what verify_audit_chain will read back.
+            # Hash created_at as the database stored it (read back, so it is
+            # exactly what audit_chain_status will see), in canonical UTC form.
             db.refresh(entry)
-            chain_payload = json.dumps({
-                "audit_log_id": entry.id,
-                "created_at": entry.created_at.isoformat() if entry.created_at else "",
-                "payload": json.loads(payload.decode()),
-                "previous_hash": previous_hash,
-            }, sort_keys=True, separators=(",", ":")).encode()
-            entry_hash = hashlib.sha256(chain_payload).hexdigest()
+            entry_hash = _chain_hash(entry.id, _chain_timestamp(entry.created_at),
+                                     json.loads(payload.decode()), previous_hash)
             checkpoint = pqc.b64(server_identity.sign(entry_hash.encode()))
             db.add(models.AuditChainLink(
                 sequence=sequence, audit_log_id=entry.id, previous_hash=previous_hash,
@@ -341,6 +379,7 @@ def audit_chain_status(db: Session) -> dict:
         return status
 
     keys: dict[str, bytes | None] = {}
+    server_tz = _UNSET  # looked up only if a link needs a legacy timestamp form
     previous_hash = "0" * 64
     for link in links:
         entry = db.get(models.AuditLog, link.audit_log_id)
@@ -366,13 +405,13 @@ def audit_chain_status(db: Session) -> dict:
             "resource_type": entry.resource_type, "resource_id": entry.resource_id,
             "metadata": entry.metadata_json or {},
         }
-        chain_payload = json.dumps({
-            "audit_log_id": entry.id,
-            "created_at": entry.created_at.isoformat() if entry.created_at else "",
-            "payload": event_payload, "previous_hash": previous_hash,
-        }, sort_keys=True, separators=(",", ":")).encode()
-        if hashlib.sha256(chain_payload).hexdigest() != link.entry_hash:
-            return fail(link, "event content does not match its link hash")
+        timestamps = [_chain_timestamp(entry.created_at)]
+        if _chain_hash(entry.id, timestamps[0], event_payload, previous_hash) != link.entry_hash:
+            if server_tz is _UNSET:
+                server_tz = _server_timezone(db)
+            if not any(_chain_hash(entry.id, ts, event_payload, previous_hash) == link.entry_hash
+                       for ts in _legacy_chain_timestamps(entry.created_at, server_tz)):
+                return fail(link, "event content does not match its link hash")
         if not pqc.dsa_verify(verification_pk, link.entry_hash.encode(),
                               pqc.unb64(link.checkpoint_signature)):
             return fail(link, "checkpoint signature invalid")

@@ -5,21 +5,17 @@ import inspect
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend import main, models
-from backend.database import Base
 from backend.services import experiment_registry as er
 from backend.services import security_service
 from backend.services.l2_event_replay import obi_momentum_strategy
 
 
 @pytest.fixture
-def db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+def db(make_engine):
+    session = sessionmaker(bind=make_engine())()
     yield session
     session.close()
 

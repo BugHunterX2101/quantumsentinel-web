@@ -26,8 +26,29 @@ jobs:
         run: python -m pip install ./cpp --no-build-isolation
       - name: Compile Python sources
         run: python -m compileall -q backend tests
+      # The suite runs against real PostgreSQL, the only supported database.
+      # Linux/macOS use 16 (the production image's major version); Windows
+      # runners ship one preinstalled version, which the action starts.
+      # Pinned to the commit of the action's v1 branch.
+      - name: Start PostgreSQL 16
+        if: runner.os != 'Windows'
+        uses: ankane/setup-postgres@b1a598d92f86cb2ed364411898d150d4eac6d5ca  # v1
+        with:
+          postgres-version: 16
+          database: quantumsentinel_test
+      - name: Start PostgreSQL (runner's preinstalled version)
+        if: runner.os == 'Windows'
+        uses: ankane/setup-postgres@b1a598d92f86cb2ed364411898d150d4eac6d5ca  # v1
+        with:
+          database: quantumsentinel_test
       - name: Run test suite
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          # The action's superuser is the OS user on Linux/macOS, "postgres" on Windows.
+          PGUSER=$([ "$RUNNER_OS" = "Windows" ] && echo postgres || whoami)
+          export TEST_DATABASE_URL="postgresql+psycopg://${PGUSER}@localhost:5432/quantumsentinel_test"
+          python -c "import psycopg, os; c = psycopg.connect(os.environ['TEST_DATABASE_URL'].replace('+psycopg', '')); print(c.execute('select version()').fetchone()[0]); c.close()"
+          python -m pytest -q
       - name: Verify compiled extension imports (optional)
         continue-on-error: true
         run: python -c "import _qs_fast; print(_qs_fast.__file__)"

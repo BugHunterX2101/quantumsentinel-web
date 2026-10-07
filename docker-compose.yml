@@ -1,5 +1,25 @@
 version: "3.9"
+# Local development stack: the app plus the same PostgreSQL major version as
+# docker-compose.production.yml. Credentials here are for local use only.
+#
+#   docker compose up -d postgres     # database only (run the app / tests on the host)
+#   docker compose up --build         # database + app on http://localhost:8000
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: quantumsentinel
+      POSTGRES_USER: quantumsentinel
+      POSTGRES_PASSWORD: quantumsentinel
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - qs_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantumsentinel -d quantumsentinel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   quantumsentinel:
     build: .
     ports: ["8000:8000"]
@@ -8,7 +28,7 @@ services:
       # Generate once with: python -c "from cryptography.hazmat.primitives.asymmetric import rsa; from cryptography.hazmat.primitives import serialization; k=rsa.generate_private_key(65537,2048); print(k.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.TraditionalOpenSSL,serialization.NoEncryption()).decode())"
       - JWT_PRIVATE_KEY=${JWT_PRIVATE_KEY:-}
       - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY:-}
-      - DATABASE_URL=sqlite:////data/quantumsentinel.db
+      - DATABASE_URL=postgresql+psycopg://quantumsentinel:quantumsentinel@postgres:5432/quantumsentinel
       - WEBHOOK_ENCRYPTION_KEY=${WEBHOOK_ENCRYPTION_KEY:-}
       - PRIVATE_KEY_ENCRYPTION_KEY=${PRIVATE_KEY_ENCRYPTION_KEY:-}
       # Persist server DSA identity so audit logs remain verifiable across restarts.
@@ -17,8 +37,9 @@ services:
       - SERVER_DSA_PUBLIC_KEY=${SERVER_DSA_PUBLIC_KEY:-}
       - SERVER_DSA_CREATED_AT=${SERVER_DSA_CREATED_AT:-}
       - ENVIRONMENT=${ENVIRONMENT:-development}
-    volumes:
-      - qs_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       # Use /health/ready which checks DB + Redis connectivity, not just metadata
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
@@ -27,4 +48,4 @@ services:
       retries: 3
 
 volumes:
-  qs_data:
+  qs_pgdata:

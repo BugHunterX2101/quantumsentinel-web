@@ -1,39 +1,63 @@
-"""QuantumSentinel — Database layer (SQLite via SQLAlchemy).
+"""QuantumSentinel — database layer: PostgreSQL via SQLAlchemy 2 and psycopg 3.
 
-Simplified from the PRD's PostgreSQL 16 + Redis stack for a single-process
-web deployment. Swap DATABASE_URL for a Postgres DSN in production.
+Every process (API worker, research worker) owns one connection pool, sized
+by DB_POOL_SIZE + DB_MAX_OVERFLOW. Each new connection is pinned to UTC and
+given server-side statement, lock and idle-transaction limits, so a stuck
+query or forgotten transaction cannot hold locks indefinitely.
 
-Pool settings target 100k concurrent users behind a load-balancer
-(pool_size=20, max_overflow=40 gives 60 live connections per process).
+The schema is versioned with Alembic (backend/migrations). ``init_db`` brings
+the database to the latest revision; concurrent callers (several gunicorn
+workers starting at once) are serialised by a transaction-scoped advisory
+lock, and PostgreSQL's transactional DDL makes each upgrade all-or-nothing.
 """
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.orm import sessionmaker, declarative_base
-from .config import DATABASE_URL
+import logging
+import time
+from pathlib import Path
+
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+from .config import (DATABASE_URL, DB_IDLE_IN_TRANSACTION_TIMEOUT_MS, DB_LOCK_TIMEOUT_MS,
+                     DB_MAX_OVERFLOW, DB_MIGRATE_ON_STARTUP, DB_POOL_SIZE, DB_POOL_TIMEOUT_SECONDS,
+                     DB_STATEMENT_TIMEOUT_MS)
+
+log = logging.getLogger(__name__)
+
+MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+# Arbitrary constant naming the "schema migration" advisory lock.
+_MIGRATION_LOCK_KEY = 7_316_405_312_118
+_MIGRATION_LOCK_WAIT_SECONDS = 600
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=DB_POOL_SIZE,
+    max_overflow=DB_MAX_OVERFLOW,
+    pool_timeout=DB_POOL_TIMEOUT_SECONDS,
+    # Validate a pooled connection before handing it out, so a database
+    # restart or failover costs one reconnect instead of a failed request.
+    pool_pre_ping=True,
+    # Recycle connections before typical server/proxy idle cut-offs.
+    pool_recycle=1800,
+    connect_args={"connect_timeout": 10, "application_name": "quantumsentinel"},
+)
 
 
-_is_sqlite = DATABASE_URL.startswith("sqlite")
+@event.listens_for(engine, "connect")
+def _configure_session(dbapi_connection, _record) -> None:
+    # Timestamps come back in UTC whatever the server's own TimeZone is, so
+    # nothing derived from them (such as the audit chain's hashes) depends on
+    # how the server happens to be configured.
+    with dbapi_connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT set_config('TimeZone', 'UTC', false),"
+            " set_config('statement_timeout', %s, false),"
+            " set_config('lock_timeout', %s, false),"
+            " set_config('idle_in_transaction_session_timeout', %s, false)",
+            (str(DB_STATEMENT_TIMEOUT_MS), str(DB_LOCK_TIMEOUT_MS),
+             str(DB_IDLE_IN_TRANSACTION_TIMEOUT_MS)),
+        )
+    dbapi_connection.commit()
 
-if _is_sqlite:
-    # SQLite: single writer, disable pool (StaticPool handles thread safety).
-    # The API and the research worker are separate processes writing this
-    # file, so a writer waits up to 30 s for the lock instead of pysqlite's 5 s.
-    connect_args = {"check_same_thread": False, "timeout": 30}
-    engine = create_engine(
-        DATABASE_URL,
-        connect_args=connect_args,
-        pool_pre_ping=True,
-    )
-else:
-    # PostgreSQL / production: tuned pool for high concurrency
-    connect_args = {}
-    engine = create_engine(
-        DATABASE_URL,
-        connect_args=connect_args,
-        pool_size=20,
-        max_overflow=40,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-    )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -47,57 +71,59 @@ def get_db():
         db.close()
 
 
-def init_db():
-    from . import models  # noqa: F401  (ensure models are registered)
-    Base.metadata.create_all(bind=engine)
-    # Dialect-agnostic additive migrations (SQLite and PostgreSQL).
-    user_columns = {c["name"] for c in inspect(engine).get_columns("users")}
-    if "role" not in user_columns:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(32) NOT NULL DEFAULT 'user'"))
-    experiment_columns = {c["name"] for c in inspect(engine).get_columns("research_experiments")}
-    for name, ddl in (("strategy_hash", "VARCHAR(64)"), ("dependency_lock_hash", "VARCHAR(64)"),
-                      ("engine_version", "VARCHAR(32)"), ("signing_key_id", "VARCHAR"),
-                      ("manifest_json", "JSON"), ("approved_by", "VARCHAR"),
-                      ("approved_at", "TIMESTAMP WITH TIME ZONE" if not _is_sqlite else "DATETIME")):
-        if name not in experiment_columns:
-            with engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE research_experiments ADD COLUMN {name} {ddl}"))
-    # Lightweight compatibility migration for the portable SQLite demo.
-    # A production deployment must use versioned migrations (Alembic).
-    if _is_sqlite:
-        columns = {c["name"] for c in inspect(engine).get_columns("trades")}
-        if "stop_price" not in columns:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN stop_price NUMERIC"))
-        if "time_in_force" not in columns:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE trades ADD COLUMN time_in_force VARCHAR DEFAULT 'day'"))
-        # Watchlist migration — added in v1.1
-        user_cols = {c["name"] for c in inspect(engine).get_columns("users")}
-        if "watchlist" not in user_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE users ADD COLUMN watchlist JSON"))
-        if "preferred_exchanges" not in user_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE users ADD COLUMN preferred_exchanges JSON"))
-        if "user_timezone" not in user_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE users ADD COLUMN user_timezone VARCHAR(64)"))
-        # Security hardening v2 migrations
-        _tables = inspect(engine).get_table_names()
-        if "audit_logs" in _tables:
-            audit_cols = {c["name"] for c in inspect(engine).get_columns("audit_logs")}
-            if "signing_key_id" not in audit_cols:
-                with engine.begin() as conn:
-                    conn.execute(text("ALTER TABLE audit_logs ADD COLUMN signing_key_id VARCHAR"))
-        if "audit_chain_links" in _tables:
-            chain_cols = {c["name"] for c in inspect(engine).get_columns("audit_chain_links")}
-            if "signing_key_id" not in chain_cols:
-                with engine.begin() as conn:
-                    conn.execute(text("ALTER TABLE audit_chain_links ADD COLUMN signing_key_id VARCHAR"))
-        if "api_keys" in _tables:
-            api_cols = {c["name"] for c in inspect(engine).get_columns("api_keys")}
-            if "hmac_secret_encrypted" not in api_cols:
-                with engine.begin() as conn:
-                    conn.execute(text("ALTER TABLE api_keys ADD COLUMN hmac_secret_encrypted TEXT"))
+def _alembic_config(connection):
+    from alembic.config import Config
+
+    config = Config()
+    config.set_main_option("script_location", str(MIGRATIONS_DIR))
+    config.attributes["connection"] = connection
+    return config
+
+
+def head_revision() -> str:
+    from alembic.script import ScriptDirectory
+
+    return ScriptDirectory.from_config(_alembic_config(None)).get_current_head()
+
+
+def current_revision(bind=None) -> str | None:
+    from alembic.migration import MigrationContext
+
+    if bind is not None:
+        return MigrationContext.configure(bind).get_current_revision()
+    with engine.connect() as connection:
+        return MigrationContext.configure(connection).get_current_revision()
+
+
+def schema_is_current() -> bool:
+    return current_revision() == head_revision()
+
+
+def migrate(target_engine=None) -> str:
+    """Upgrade the schema to the latest revision; returns that revision."""
+    from alembic import command
+
+    with (target_engine or engine).begin() as connection:
+        # A migration may build indexes on large tables: no statement limit.
+        connection.execute(text("SET LOCAL statement_timeout = 0"))
+        deadline = time.monotonic() + _MIGRATION_LOCK_WAIT_SECONDS
+        while not connection.execute(text("SELECT pg_try_advisory_xact_lock(:key)"),
+                                     {"key": _MIGRATION_LOCK_KEY}).scalar():
+            if time.monotonic() > deadline:
+                raise RuntimeError("timed out waiting for another process's schema migration")
+            time.sleep(0.5)
+        before = current_revision(connection)
+        command.upgrade(_alembic_config(connection), "head")
+        after = current_revision(connection)
+    if before != after:
+        log.info("database schema migrated from %s to %s", before or "empty", after)
+    return after
+
+
+def init_db() -> None:
+    """Bring the schema to the latest revision, or refuse to run on a stale one."""
+    if DB_MIGRATE_ON_STARTUP:
+        migrate()
+    elif not schema_is_current():
+        raise RuntimeError(f"database schema is at revision {current_revision()}, expected "
+                           f"{head_revision()}: run `python -m backend.manage migrate`")

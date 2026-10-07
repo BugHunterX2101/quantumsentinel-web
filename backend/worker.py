@@ -23,15 +23,18 @@ import threading
 import time
 import traceback
 
-from sqlalchemy import inspect
-
 from .config import (RESEARCH_JOB_LEASE_SECONDS, RESEARCH_JOB_TIMEOUT_SECONDS,
                      RESEARCH_WORKER_POLL_SECONDS)
-from .database import SessionLocal, engine
+from .database import SessionLocal, head_revision, schema_is_current
 
 log = logging.getLogger("backend.worker")
 
 RECYCLE_AFTER_JOBS = 50
+# A new job process must import the research code within this long; its
+# job's own time limit only starts once it has (see _child_main).
+CHILD_BOOT_SECONDS = 120
+_TASKS_MODULE = "backend.services.research_tasks"
+_READY = "ready"
 PURGE_INTERVAL_SECONDS = 3600
 WORKER_HEARTBEAT_SECONDS = 5
 GENERIC_FAILURE = "Research job failed"
@@ -69,6 +72,10 @@ def _child_main(conn) -> None:
     # Interrupts go to the worker, which decides whether to stop the child.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s job-process %(message)s")
+    # Import the research code (numpy, scipy, sklearn: seconds) before saying
+    # ready, so a job's time limit measures the job, not this process booting.
+    importlib.import_module(_TASKS_MODULE)
+    conn.send(_READY)
     while True:
         try:
             message = conn.recv()
@@ -126,9 +133,12 @@ class JobProcess:
         ("ok", ...) / ("error", status, detail) tuple, ("timeout",) or
         ("crashed", exitcode).
         """
+        deadline = None  # starts when the child is ready to run the job
         if self._proc is None or not self._proc.is_alive():
             self._start()
-        deadline = time.monotonic() + timeout
+            boot_deadline = time.monotonic() + CHILD_BOOT_SECONDS
+        else:
+            deadline = time.monotonic() + timeout
         self._conn.send((target, params))
         while True:
             if self._conn.poll(tick_seconds):
@@ -136,13 +146,19 @@ class JobProcess:
                     outcome = self._conn.recv()
                 except (EOFError, OSError):
                     return self._crashed()
+                if outcome == _READY:
+                    deadline = time.monotonic() + timeout
+                    continue
                 self._jobs += 1
                 if self._jobs >= self._recycle_after:
                     self.stop()
                 return outcome
             if not self._proc.is_alive():
                 return self._crashed()
-            if time.monotonic() >= deadline:
+            if deadline is None and time.monotonic() >= boot_deadline:
+                log.error("job process did not start within %ss", CHILD_BOOT_SECONDS)
+                return self._crashed()
+            if deadline is not None and time.monotonic() >= deadline:
                 self.kill()
                 return ("timeout",)
             stop = on_tick()
@@ -168,7 +184,8 @@ class Worker:
                  session_factory=SessionLocal):
         self.hostname = socket.gethostname()
         self.pid = os.getpid()
-        self.id = f"{self.hostname}:{self.pid}:{secrets.token_hex(3)}"
+        # Fits research_workers.id (128) whatever the hostname's length.
+        self.id = f"{self.hostname[:100]}:{self.pid}:{secrets.token_hex(3)}"
         self.job_process = job_process or JobProcess()
         self.lease_seconds = lease_seconds
         self.timeout_seconds = timeout_seconds
@@ -297,16 +314,16 @@ class Worker:
 
 
 def _wait_for_schema(stop_event: threading.Event) -> bool:
-    """The API process creates and migrates the schema; wait until it has."""
+    """The API process migrates the schema; wait until it is at this code's revision."""
     waited = 0.0
     while not stop_event.is_set():
         try:
-            if inspect(engine).has_table("research_jobs"):
+            if schema_is_current():
                 return True
         except Exception as exc:
             log.warning("database not reachable yet: %s", exc)
         if waited % 30 == 0:
-            log.info("waiting for the API to create the research_jobs table")
+            log.info("waiting for the database schema to reach revision %s", head_revision())
         stop_event.wait(2)
         waited += 2
     return False

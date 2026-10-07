@@ -3,8 +3,9 @@
 This module is the single authority over paper-account money. Every write
 preserves the invariant ``0 <= reserved_micros <= cash_micros`` and is a
 single conditional UPDATE, so concurrent requests (threads or separate
-gunicorn workers) can never spend the same dollars twice — on SQLite and
-PostgreSQL alike, without relying on SELECT ... FOR UPDATE.
+gunicorn workers) can never spend the same dollars twice. A sell fill also
+locks the account row while it checks the holding, so concurrent sells can
+never be credited for the same shares.
 
 Order lifecycle (all transitions are compare-and-set on ``trades.status``)::
 
@@ -18,7 +19,7 @@ import datetime as dt
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import case, select, update
+from sqlalchemy import Float, and_, case, literal, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -215,11 +216,14 @@ def fill_order(db: Session, trade: models.Trade, fill_price: float,
             close_order(db, trade, "REJECTED", reserved)
             return FillOutcome("REJECTED", "insufficient available cash at fill")
     else:
-        held = db.execute(
-            select(models.Position.quantity).where(models.Position.user_id == trade.user_id,
-                                                   models.Position.asset == trade.asset)
-        ).scalar() or 0
-        if Decimal(str(trade.quantity)) > Decimal(str(held)):
+        # Concurrent sells of one holding must not each be credited. Locking
+        # the ledger row serialises this user's fills across every process,
+        # and the holding is then read from the filled trades themselves
+        # (committed fills included), not from the positions projection,
+        # which is only rebuilt after a fill commits.
+        db.execute(select(_Account.user_id).where(_Account.user_id == trade.user_id).with_for_update())
+        held = held_quantity(db, trade.user_id, trade.asset, exclude_trade_id=trade.id)
+        if Decimal(str(trade.quantity)) > held:
             db.rollback()
             close_order(db, trade, "REJECTED", reserved)
             return FillOutcome("REJECTED", "sell quantity exceeds the current position")
@@ -233,6 +237,21 @@ def fill_order(db: Session, trade: models.Trade, fill_price: float,
     # Positions must reflect this fill before any later fill checks holdings.
     portfolio_service.recompute_positions(db, trade.user_id)
     return FillOutcome("FILLED")
+
+
+def held_quantity(db: Session, user_id: str, asset: str, exclude_trade_id: str | None = None) -> Decimal:
+    """Quantity held, exactly as the positions rebuild counts it
+    (portfolio_service.recompute_positions): filled buys and sells in fill
+    order, a sell never taking the holding below zero."""
+    query = select(_Trade.side, _Trade.quantity).where(
+        _Trade.user_id == user_id, _Trade.asset == asset, _Trade.status == "FILLED"
+    ).order_by(_Trade.filled_at)
+    if exclude_trade_id is not None:
+        query = query.where(_Trade.id != exclude_trade_id)
+    held = Decimal(0)
+    for side, quantity in db.execute(query):
+        held = held + quantity if side == "buy" else max(Decimal(0), held - quantity)
+    return held
 
 
 # ---------------------------------------------------------------------------
@@ -294,20 +313,25 @@ def process_open_orders(db: Session) -> list[tuple[models.Trade, FillOutcome]]:
     fetch per asset; an asset without a current price is skipped (its orders
     stay open) rather than filled at a guessed price. Safe to run from
     several workers at once: each fill is a compare-and-set.
+
+    Only the orders the current price can act on are loaded (see
+    _actionable): a book of resting orders far from the market costs one
+    small indexed query per asset, not a load of every order every sweep.
     """
-    resting = db.execute(
-        select(_Trade).where(_Trade.status == "ACCEPTED").order_by(_Trade.submitted_at)
+    assets = db.execute(
+        select(_Trade.asset).where(_Trade.status == "ACCEPTED").distinct()
     ).scalars().all()
-    by_asset: dict[str, list[models.Trade]] = {}
-    for t in resting:
-        by_asset.setdefault(t.asset, []).append(t)
 
     outcomes: list[tuple[models.Trade, FillOutcome]] = []
-    for asset, trades in by_asset.items():
+    for asset in assets:
         try:
             last = trading_service.get_last_price(asset)
         except trading_service.MarketDataUnavailable:
             continue
+        trades = db.execute(
+            select(_Trade).where(_Trade.status == "ACCEPTED", _Trade.asset == asset, _actionable(last))
+            .order_by(_Trade.submitted_at)
+        ).scalars().all()
         for t in trades:
             limit = float(t.limit_price) if t.limit_price is not None else None
             stop = float(t.stop_price) if t.stop_price is not None else None
@@ -328,6 +352,27 @@ def process_open_orders(db: Session) -> list[tuple[models.Trade, FillOutcome]]:
             if fill_price is not None:
                 outcomes.append((t, fill_order(db, t, fill_price)))
     return outcomes
+
+
+def _actionable(last: float):
+    """SQL for exactly the resting orders the sweep loop below acts on at
+    price ``last``: marketable limits, triggered stops and stop-limits (a
+    triggered stop-limit that is not marketable is converted to a limit),
+    and any order without the price its type needs (filled at ``last``).
+
+    ``last`` is bound as float8 so PostgreSQL compares in the same double
+    precision as the Python checks that make the final decision.
+    """
+    p = literal(last, Float)
+    has_limit = and_(_Trade.order_type == "limit", _Trade.limit_price.is_not(None))
+    has_stop = and_(_Trade.order_type.in_(("stop", "stop_limit")), _Trade.stop_price.is_not(None))
+    return or_(
+        and_(has_limit, or_(and_(_Trade.side == "buy", _Trade.limit_price >= p),
+                            and_(_Trade.side == "sell", _Trade.limit_price <= p))),
+        and_(has_stop, or_(and_(_Trade.side == "buy", _Trade.stop_price <= p),
+                           and_(_Trade.side == "sell", _Trade.stop_price >= p))),
+        and_(not_(has_limit), not_(has_stop)),
+    )
 
 
 def stop_triggered(side: str, stop: float, last: float) -> bool:

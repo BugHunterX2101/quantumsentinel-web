@@ -34,16 +34,30 @@ def _get_spy_history():
 
 
 def recompute_positions(db: Session, user_id: str) -> None:
-    """Rebuild the `positions` materialised view from filled trades.
+    """Rebuild the `positions` materialised view from filled trades, and commit.
 
     Event-sourcing pattern: trades are the source of truth; positions are
     a derived projection rebuilt from scratch on every fill.
     """
+    rebuild_positions(db, user_id)
+    db.commit()
+
+
+def rebuild_positions(db: Session, user_id: str) -> None:
+    """recompute_positions without the commit.
+
+    Fills call this inside their own transaction, after locking the user's
+    paper account row. Two rebuilds that overlapped used to each delete only
+    the rows they could see and then insert their own, so a user could end up
+    with duplicate position rows.
+    """
+    # Only the four columns the fold needs: loading every filled trade as an
+    # ORM object made each fill several times slower on a long history.
     trades = db.execute(
-        select(models.Trade).where(
-            models.Trade.user_id == user_id, models.Trade.status == "FILLED"
-        ).order_by(models.Trade.filled_at)
-    ).scalars().all()
+        select(models.Trade.asset, models.Trade.side, models.Trade.quantity, models.Trade.filled_price)
+        .where(models.Trade.user_id == user_id, models.Trade.status == "FILLED")
+        .order_by(models.Trade.filled_at)
+    ).all()
 
     book: dict[str, dict] = {}
     for t in trades:
@@ -73,7 +87,7 @@ def recompute_positions(db: Session, user_id: str) -> None:
             user_id=user_id, asset=asset, quantity=round(b["qty"], 6),
             avg_entry_price=round(avg_entry, 4), realized_pnl=round(b["realized"], 2),
         ))
-    db.commit()
+    db.flush()
 
 
 def get_positions_with_pnl(db: Session, user_id: str) -> list[dict]:

@@ -278,6 +278,85 @@ class TestSells:
             assert cash_after - cash_before == paper_broker.to_micros(500)   # one sale of 5 x $100
             assert paper_broker.held_quantity(check, user_id, "AAPL") == 0
 
+    def test_concurrent_fills_of_one_user_leave_one_position_row_per_asset(self, make_engine):
+        """Each fill used to rebuild positions after committing, unlocked: two
+        overlapping rebuilds each deleted the rows they could see and inserted
+        their own, leaving duplicate rows that overstated holdings and equity."""
+        Session = sessionmaker(bind=make_engine())
+        with Session() as setup:
+            u = models.User(email="race-positions@example.com", password_hash="x")
+            setup.add(u)
+            setup.commit()
+            user_id = u.id
+            paper_broker.get_or_create_account(setup, user_id)
+        for round_number in range(1, 4):
+            with Session() as setup:
+                buys = [models.Trade(user_id=user_id, asset=asset, side="buy", quantity=1, order_type="limit",
+                                     limit_price=100, status="ACCEPTED") for asset in ["AAPL", "MSFT"] * 4]
+                setup.add_all(buys)
+                setup.commit()
+                buy_ids = [t.id for t in buys]
+            outcomes, barrier = [], threading.Barrier(len(buy_ids))
+
+            def fill(trade_id):
+                with Session() as s:
+                    trade = s.get(models.Trade, trade_id)
+                    barrier.wait()
+                    outcomes.append(paper_broker.fill_order(s, trade, 100.0).status)
+
+            threads = [threading.Thread(target=fill, args=(tid,)) for tid in buy_ids]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            assert outcomes == ["FILLED"] * len(buy_ids)
+            with Session() as check:
+                rows = check.query(models.Position).filter_by(user_id=user_id).all()
+                assert sorted((p.asset, float(p.quantity)) for p in rows) == [
+                    ("AAPL", 4.0 * round_number), ("MSFT", 4.0 * round_number)]
+
+    def test_a_fill_whose_positions_rebuild_fails_is_rolled_back(self, db, user, monkeypatch):
+        """The fill and its positions commit together or not at all."""
+        trade = models.Trade(user_id=user.id, asset="AAPL", side="buy", quantity=1, order_type="limit",
+                             limit_price=100, status="ACCEPTED")
+        db.add(trade)
+        db.commit()
+        cash_before = paper_broker.get_or_create_account(db, user.id).cash_micros
+
+        def broken_rebuild(_db, _user_id):
+            raise RuntimeError("positions rebuild failed")
+
+        monkeypatch.setattr(portfolio_service, "rebuild_positions", broken_rebuild)
+        with pytest.raises(RuntimeError, match="positions rebuild failed"):
+            paper_broker.fill_order(db, trade, 100.0)
+        db.rollback()
+        db.expire_all()
+        assert db.get(models.Trade, trade.id).status == "ACCEPTED"
+        assert db.get(models.PaperAccount, user.id).cash_micros == cash_before
+
+    def test_repair_positions_rebuilds_only_users_with_duplicate_rows(self, db, user, capsys):
+        from backend import manage
+
+        other = models.User(email="clean-positions@example.com", password_hash="x")
+        db.add(other)
+        db.commit()
+        for owner, quantity in ((user, 1), (user, 3), (other, 2)):
+            db.add(models.Trade(user_id=owner.id, asset="AAPL", side="buy", quantity=quantity,
+                                order_type="market", status="FILLED", filled_price=100))
+        db.commit()
+        portfolio_service.recompute_positions(db, other.id)
+        clean_row_id = db.query(models.Position).filter_by(user_id=other.id).one().id
+        # What the old race left behind: one row per overlapping rebuild.
+        db.add_all([models.Position(user_id=user.id, asset="AAPL", quantity=q, avg_entry_price=100,
+                                    realized_pnl=0) for q in (1, 4)])
+        db.commit()
+
+        assert manage._repair_positions(sessionmaker(bind=db.get_bind())) == 0
+        assert "1 user(s)" in capsys.readouterr().out
+        db.expire_all()
+        assert [float(p.quantity) for p in db.query(models.Position).filter_by(user_id=user.id)] == [4.0]
+        assert db.query(models.Position).filter_by(user_id=other.id).one().id == clean_row_id
+
     def test_the_fill_time_holding_agrees_with_the_positions_shown_to_the_user(self, db, user):
         """An account damaged by the old double-sell race has two filled sells
         of one 5-share buy. Positions clamp each sell at zero; the holding the

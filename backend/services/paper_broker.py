@@ -232,10 +232,12 @@ def fill_order(db: Session, trade: models.Trade, fill_price: float,
             .values(cash_micros=_Account.cash_micros + cost, updated_at=_now())
             .execution_options(synchronize_session=False)
         )
+    # Positions are rebuilt in the fill's own transaction, while this user's
+    # account row (updated or locked above) is held, so concurrent fills of
+    # one user rebuild one after another and each sees the fills before it.
+    portfolio_service.rebuild_positions(db, trade.user_id)
     db.commit()
     db.refresh(trade)
-    # Positions must reflect this fill before any later fill checks holdings.
-    portfolio_service.recompute_positions(db, trade.user_id)
     return FillOutcome("FILLED")
 
 

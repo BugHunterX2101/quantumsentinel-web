@@ -4,6 +4,7 @@
     python -m backend.manage migrate
     python -m backend.manage import-sqlite <path/to/quantumsentinel.db>
     python -m backend.manage generate-server-key
+    python -m backend.manage repair-positions
 
 Roles are granted only here — out of band, by someone with shell access to
 the deployment — never through the web API, so no self-registered account
@@ -14,7 +15,9 @@ startup unless DB_MIGRATE_ON_STARTUP=false). ``import-sqlite`` moves the data
 of a deployment that ran on SQLite (releases before 1.3) into the configured
 PostgreSQL database. ``generate-server-key`` prints a new server ML-DSA
 signing key as the SERVER_DSA_* settings (run it before those are set: a
-production configuration refuses to load without them).
+production configuration refuses to load without them). ``repair-positions``
+rebuilds the positions of users left with duplicate position rows by the
+concurrent-fill race that earlier releases had.
 """
 import argparse
 import sys
@@ -38,10 +41,15 @@ def main(argv: list[str] | None = None) -> int:
     import_sqlite.add_argument("path", type=Path)
     commands.add_parser("generate-server-key",
                         help="print a new ML-DSA-65 server signing key as SERVER_DSA_* settings")
+    commands.add_parser("repair-positions",
+                        help="rebuild the positions of users left with duplicate position rows")
     args = parser.parse_args(argv)
 
     if args.command == "generate-server-key":
         return _generate_server_key()
+    if args.command == "repair-positions":
+        init_db()
+        return _repair_positions(SessionLocal)
     if args.command == "migrate":
         from .database import migrate
         print(f"database schema at revision {migrate()}")
@@ -87,6 +95,35 @@ def _generate_server_key() -> int:
     print(f"SERVER_DSA_PUBLIC_KEY={pqc.b64(pk)}")
     print(f"SERVER_DSA_CREATED_AT={dt.datetime.now(dt.timezone.utc).isoformat()}")
     print(f"TRUSTED_SERVER_DSA_FINGERPRINT={hashlib.sha256(pk).hexdigest()}")
+    return 0
+
+
+def _repair_positions(session_factory) -> int:
+    """Rebuild the positions of every user with more than one row for an asset.
+
+    Earlier releases rebuilt positions after a fill had committed, without a
+    lock, so two fills for one user at the same moment could leave duplicate
+    rows. Each user's next fill rebuilds them correctly; this repairs users who
+    have not traded since. Each rebuild holds the user's paper account row, as
+    a fill does, so it is safe to run while the API is serving orders.
+    """
+    from sqlalchemy import func, select
+
+    from .services import portfolio_service
+
+    with session_factory() as db:
+        user_ids = sorted(set(db.execute(
+            select(models.Position.user_id)
+            .group_by(models.Position.user_id, models.Position.asset)
+            .having(func.count() > 1)
+        ).scalars()))
+        db.rollback()
+        for user_id in user_ids:
+            db.execute(select(models.PaperAccount.user_id)
+                       .where(models.PaperAccount.user_id == user_id).with_for_update())
+            portfolio_service.rebuild_positions(db, user_id)
+            db.commit()
+    print(f"rebuilt the positions of {len(user_ids)} user(s) with duplicate position rows")
     return 0
 
 

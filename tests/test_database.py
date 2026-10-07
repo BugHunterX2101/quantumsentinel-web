@@ -239,6 +239,54 @@ def test_an_exhausted_pool_or_unreachable_database_is_a_retryable_503(failure, r
     assert response.headers["Retry-After"] == retry_after
 
 
+class TestReadSessions:
+    """GET and HEAD requests read outside a transaction: no BEGIN before the
+    first query and no ROLLBACK when the connection returns to the pool."""
+
+    @staticmethod
+    def _status_after_a_query(method):
+        import types
+        from psycopg.pq import TransactionStatus
+
+        sessions = database.get_db(types.SimpleNamespace(method=method))
+        db = next(sessions)
+        try:
+            assert db.execute(text("SELECT 1")).scalar() == 1
+            raw = db.connection().connection.dbapi_connection
+            return raw.autocommit, TransactionStatus(raw.info.transaction_status).name
+        finally:
+            sessions.close()
+
+    @pytest.mark.parametrize("method", ["GET", "HEAD"])
+    def test_reads_open_no_transaction(self, method):
+        assert self._status_after_a_query(method) == (True, "IDLE")
+
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    def test_everything_else_runs_in_a_transaction(self, method):
+        assert self._status_after_a_query(method) == (False, "INTRANS")
+
+    def test_a_read_leaves_its_pooled_connection_transactional_again(self):
+        """The pool is shared: autocommit must not leak into the next checkout."""
+        for _ in range(3):
+            assert self._status_after_a_query("GET") == (True, "IDLE")
+            assert self._status_after_a_query("POST") == (False, "INTRANS")
+
+    def test_a_write_in_a_read_session_still_commits(self):
+        """Opening a paper account on first view is one INSERT from a GET."""
+        import types
+
+        sessions = database.get_db(types.SimpleNamespace(method="GET"))
+        db = next(sessions)
+        try:
+            db.execute(text("CREATE TEMP TABLE first_view (n int)"))
+            db.execute(text("INSERT INTO first_view VALUES (1)"))
+            db.rollback()  # nothing to roll back: each statement committed
+            assert db.execute(text("SELECT n FROM first_view")).scalar() == 1
+        finally:
+            db.execute(text("DROP TABLE IF EXISTS first_view"))
+            sessions.close()
+
+
 def test_the_readiness_probe_answers_from_the_database():
     from starlette.testclient import TestClient
 

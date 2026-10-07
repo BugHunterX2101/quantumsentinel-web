@@ -16,6 +16,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker
+from starlette.requests import Request
 
 from .config import (DATABASE_URL, DB_IDLE_IN_TRANSACTION_TIMEOUT_MS, DB_LOCK_TIMEOUT_MS,
                      DB_MAX_OVERFLOW, DB_MIGRATE_ON_STARTUP, DB_POOL_SIZE, DB_POOL_TIMEOUT_SECONDS,
@@ -62,9 +63,22 @@ def _configure_session(dbapi_connection, _record) -> None:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# Sessions for GET and HEAD requests run in autocommit, which saves two round
+# trips per request: BEGIN before the first query and ROLLBACK when the
+# connection goes back to the pool. Reads return the same rows: under READ
+# COMMITTED, PostgreSQL's default, every statement takes its own snapshot
+# inside a transaction too. What autocommit loses is multi-statement
+# atomicity and row locks held to commit, so a GET handler must not write
+# more than one statement or lock rows (writing one row, as opening a paper
+# account on first view does, stays atomic). Same pool: the isolation level
+# is set on checkout and restored on return, without a round trip.
+_ReadSession = sessionmaker(autocommit=False, autoflush=False,
+                            bind=engine.execution_options(isolation_level="AUTOCOMMIT"))
+_READ_METHODS = frozenset({"GET", "HEAD"})
 
-def get_db():
-    db = SessionLocal()
+
+def get_db(request: Request):
+    db = (_ReadSession if request.method in _READ_METHODS else SessionLocal)()
     try:
         yield db
     finally:

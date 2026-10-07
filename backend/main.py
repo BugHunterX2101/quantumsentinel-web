@@ -391,6 +391,63 @@ def _rate_window(key: str, now: float) -> deque[float]:
     return window
 
 
+# Bucket keys must name a principal the client cannot invent. Header values are
+# client-chosen until verified, so keying on a raw header let a client start a
+# fresh bucket on every request with a new made-up value: 30 of 30 logins under
+# distinct emails reached the password check, against 10 and then 429 without
+# the header. Credentials therefore count only once proven: an access token by
+# its signature (keyed on its user, so re-issued tokens share one bucket), and an
+# API key once this process has accepted it. Anything else, and every
+# /api/auth/ route, is keyed on the client address.
+_rate_users: OrderedDict[str, str] = OrderedDict()       # access token -> user id
+_rate_api_keys: OrderedDict[str, None] = OrderedDict()   # sha256 of accepted keys
+_RATE_PRINCIPAL_CACHE = 10_000
+_HMAC_HEADERS = ("x-qs-key-id", "x-qs-timestamp", "x-qs-nonce", "x-qs-signature")
+
+
+def _remember(cache: OrderedDict, key: str, value) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    if len(cache) > _RATE_PRINCIPAL_CACHE:
+        cache.popitem(last=False)
+
+
+def _sdk_api_key_hash(request: Request) -> str | None:
+    """Hash of the legacy API key that ``require_api_scope`` would check."""
+    if all(request.headers.get(name) for name in _HMAC_HEADERS):
+        return None  # the HMAC path ignores X-QS-API-KEY
+    raw = request.headers.get("x-qs-api-key")
+    return hashlib.sha256(raw.encode()).hexdigest() if raw else None
+
+
+def _rate_principal(request: Request, client: str, sdk_key: str | None) -> str:
+    path = request.url.path
+    if path.startswith("/api/auth/"):
+        return client
+    if path.startswith("/api/sdk/"):
+        if sdk_key in _rate_api_keys:
+            _rate_api_keys.move_to_end(sdk_key)
+            return f"key:{sdk_key[:16]}"
+        return client
+    # Same precedence as get_current_user: the cookie, then a Bearer header.
+    token = request.cookies.get("qs_access")
+    if not token:
+        authorization = request.headers.get("authorization", "")
+        token = authorization.split(" ", 1)[1] if authorization.startswith("Bearer ") else None
+    if not token:
+        return client
+    user_id = _rate_users.get(token)
+    if user_id is None:
+        payload = auth_service.decode_access_token(token)
+        if not payload:
+            return client
+        user_id = payload["sub"]
+        _remember(_rate_users, token, user_id)
+    else:
+        _rate_users.move_to_end(token)
+    return f"user:{user_id}"
+
+
 class SecurityHeadersAndRateLimit:
     """Rate limiting, request metrics and security headers for every HTTP response.
 
@@ -408,9 +465,8 @@ class SecurityHeadersAndRateLimit:
             return
         request = Request(scope)
         client = request.client.host if request.client else "unknown"
-        principal = request.headers.get("x-qs-api-key") or request.headers.get("authorization", "")
-        principal_hash = hashlib.sha256(principal.encode()).hexdigest()[:16] if principal else client
-        key = f"{principal_hash}:{request.url.path}"
+        sdk_key = _sdk_api_key_hash(request) if request.url.path.startswith("/api/sdk/") else None
+        key = f"{_rate_principal(request, client, sdk_key)}:{request.url.path}"
         now = time.monotonic()
         limit = 10 if request.url.path.startswith("/api/auth/") else 240
         current = 0
@@ -440,6 +496,8 @@ class SecurityHeadersAndRateLimit:
 
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
+                if sdk_key and message["status"] < 400 and sdk_key not in _rate_api_keys:
+                    _remember(_rate_api_keys, sdk_key, None)
                 metric_path = getattr(scope.get("route"), "path", request.url.path)
                 HTTP_REQUESTS.labels(request.method, metric_path, str(message["status"])).inc()
                 HTTP_LATENCY.labels(request.method, metric_path).observe(time.perf_counter() - started)

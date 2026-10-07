@@ -5,7 +5,7 @@ import uuid
 from collections import OrderedDict
 
 import pytest
-from fastapi import BackgroundTasks, HTTPException
+from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from prometheus_client import REGISTRY
 from starlette.testclient import TestClient
@@ -186,13 +186,11 @@ class TestRateLimit:
         assert blocked.json() == {"detail": "Rate limit exceeded"}
         assert blocked.headers["retry-after"] == "60"
 
-    def test_buckets_are_per_principal_and_per_path(self, client):
+    def test_buckets_are_per_path(self, client):
         path = f"/api/auth/no-such-{uuid.uuid4().hex}"
         for _ in range(11):
             client.get(path)
         assert client.get(path).status_code == 429
-        assert client.get(path, headers={"authorization": "Bearer someone-else"}).status_code == 404
-        assert client.get(path, headers={"x-qs-api-key": "a-key"}).status_code == 404
         assert client.get(path + "-other").status_code == 404
 
     def test_other_paths_allow_240_per_minute(self, client):
@@ -323,3 +321,110 @@ class TestRateLimitBuckets:
         assert len(main._request_windows) == main._RATE_MAX_KEYS
         # The previous scan-and-sort per call took ~68 s for these 5,000 calls.
         assert elapsed < 1.0, elapsed
+
+
+class TestRateLimitPrincipal:
+    """A bucket is keyed on an identity the client cannot invent: a verified
+    access token's user, an API key this process has already accepted, or
+    else the client address. Any made-up header value must land in the
+    caller's address bucket, never in a fresh one."""
+
+    @pytest.fixture
+    def sdk_route(self):
+        path = f"/api/sdk/__mw_{uuid.uuid4().hex[:8]}"
+        good = f"qs_{uuid.uuid4().hex}"
+
+        def endpoint(request: Request):
+            if request.headers.get("x-qs-api-key") != good:
+                raise HTTPException(403, "Invalid API key or insufficient scope")
+            return {"ok": True}
+
+        main.app.add_api_route(path, endpoint, methods=["GET"])
+        route = main.app.router.routes.pop()
+        main.app.router.routes.insert(0, route)
+        yield path, good
+        main.app.router.routes.remove(route)
+
+    @staticmethod
+    def remaining(response):
+        return int(response.headers["x-ratelimit-remaining"])
+
+    @staticmethod
+    def token(user_id):
+        return main.auth_service.create_access_token(user_id, "free")
+
+    @pytest.mark.parametrize("headers, cookies", [
+        ({"authorization": "Bearer made-up"}, {}),
+        ({"x-qs-api-key": "made-up"}, {}),
+        ({}, {"qs_access": "made-up"}),
+        ({"authorization": "Basic made-up"}, {}),
+    ])
+    def test_auth_paths_are_keyed_on_the_client_address_only(self, client, headers, cookies):
+        path = f"/api/auth/no-such-{uuid.uuid4().hex}"
+        for _ in range(10):
+            assert client.get(path).status_code == 404
+        client.cookies.update(cookies)
+        assert client.get(path, headers=headers).status_code == 429
+
+    def test_a_signed_token_does_not_buy_extra_login_attempts(self, client):
+        path = f"/api/auth/no-such-{uuid.uuid4().hex}"
+        for _ in range(10):
+            client.get(path)
+        bearer = {"authorization": f"Bearer {self.token(uuid.uuid4().hex)}"}
+        assert client.get(path, headers=bearer).status_code == 429
+
+    def test_made_up_credentials_share_the_address_bucket(self, client):
+        path = unmatched_api_path()
+        seen = [self.remaining(client.get(path))]
+        for i in range(3):
+            seen.append(self.remaining(client.get(path, headers={"authorization": f"Bearer x{i}"})))
+            seen.append(self.remaining(client.get(path, headers={"x-qs-api-key": f"k{i}"})))
+        client.cookies.set("qs_access", "made-up")
+        seen.append(self.remaining(client.get(path)))
+        assert seen == list(range(239, 239 - len(seen), -1))
+
+    def test_signed_tokens_are_keyed_on_their_user(self, client):
+        path = unmatched_api_path()
+        alice, bob = uuid.uuid4().hex, uuid.uuid4().hex
+        first, second = self.token(alice), self.token(alice)
+        assert first != second
+        assert self.remaining(client.get(path, headers={"authorization": f"Bearer {first}"})) == 239
+        assert self.remaining(client.get(path, headers={"authorization": f"Bearer {second}"})) == 238
+        assert self.remaining(client.get(path, headers={"authorization": f"Bearer {self.token(bob)}"})) == 239
+        assert self.remaining(client.get(path)) == 239
+
+    def test_the_cookie_wins_over_other_headers_as_in_get_current_user(self, client):
+        path = unmatched_api_path()
+        client.cookies.set("qs_access", self.token(uuid.uuid4().hex))
+        seen = [self.remaining(client.get(path, headers={"authorization": f"Bearer x{i}",
+                                                          "x-qs-api-key": f"k{i}"}))
+                for i in range(3)]
+        assert seen == [239, 238, 237]
+        client.cookies.clear()
+        assert self.remaining(client.get(path)) == 239
+
+    def test_an_api_key_gets_its_own_bucket_once_it_has_been_accepted(self, client, sdk_route):
+        path, good = sdk_route
+        assert client.get(path, headers={"x-qs-api-key": "made-up-1"}).status_code == 403
+        # A rejected key is never learned, however often it is sent.
+        assert self.remaining(client.get(path, headers={"x-qs-api-key": "made-up-1"})) == 238
+        assert self.remaining(client.get(path, headers={"x-qs-api-key": "made-up-2"})) == 237
+        accepted = client.get(path, headers={"x-qs-api-key": good})
+        assert accepted.status_code == 200 and self.remaining(accepted) == 236
+        assert self.remaining(client.get(path, headers={"x-qs-api-key": good})) == 239
+        assert self.remaining(client.get(path, headers={"x-qs-api-key": "made-up-3"})) == 235
+
+    def test_hmac_requests_are_keyed_on_the_address(self, client, sdk_route):
+        path, good = sdk_route
+        client.get(path, headers={"x-qs-api-key": good})
+        hmac = {"x-qs-key-id": "id", "x-qs-timestamp": "1", "x-qs-nonce": "n", "x-qs-signature": "s"}
+        # require_api_scope ignores X-QS-API-KEY when all four HMAC headers are present.
+        assert self.remaining(client.get(path, headers={**hmac, "x-qs-api-key": good})) == 238
+
+    def test_identity_caches_are_bounded(self, client, monkeypatch):
+        monkeypatch.setattr(main, "_RATE_PRINCIPAL_CACHE", 2)
+        monkeypatch.setattr(main, "_rate_users", OrderedDict())
+        path = unmatched_api_path()
+        for _ in range(3):
+            client.get(path, headers={"authorization": f"Bearer {self.token(uuid.uuid4().hex)}"})
+        assert len(main._rate_users) == 2

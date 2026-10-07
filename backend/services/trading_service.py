@@ -10,6 +10,7 @@ the exchange's own trade timestamp. A closed market's last close is still a
 valid valuation mark, but never an execution price.
 """
 import math
+import threading
 import time
 
 import numpy as np
@@ -21,6 +22,15 @@ from ..config import MAX_QUOTE_AGE_SECONDS
 # timestamp (epoch seconds) of the trade, or None when the source gives none.
 _price_cache: dict[str, tuple[float, float, float | None]] = {}
 PRICE_CACHE_TTL = 20
+# asset -> when a fetch last found no price. Kept apart from _price_cache so a
+# failure never replaces the last good observation that marks fall back to.
+_quote_failures: dict[str, float] = {}
+QUOTE_FAILURE_TTL = 20
+_QUOTE_FAILURES_PRUNE_AT = 1024
+# One fetch per asset at a time: requests that find the cache expired wait
+# for the fetch already in flight instead of each starting their own. A
+# fixed set of locks, so arbitrary tickers cannot grow it.
+_fetch_locks = tuple(threading.Lock() for _ in range(64))
 
 
 class MarketDataUnavailable(Exception):
@@ -122,22 +132,54 @@ def _live_quote(asset: str) -> tuple[float, float] | None:
 def _quote(asset: str) -> tuple[float, float | None]:
     """(price, market_time), fetched at most every PRICE_CACHE_TTL seconds.
 
-    Raises MarketDataUnavailable when no finite positive price exists.
+    Raises MarketDataUnavailable when no finite positive price exists. That
+    outcome is also remembered for QUOTE_FAILURE_TTL seconds: a ticker with
+    no data costs three provider calls of several seconds each, which every
+    read of a position in it would otherwise repeat.
     """
-    now = time.time()
+    cached = _fresh_quote(asset, time.time())
+    if cached is not None:
+        return cached
+    with _fetch_locks[hash(asset) % len(_fetch_locks)]:
+        # Another request may have fetched while this one waited.
+        now = time.time()
+        cached = _fresh_quote(asset, now)
+        if cached is not None:
+            return cached
+        live = _live_quote(asset)
+        if live is not None:
+            price, market_time = live
+        else:
+            # A price without a trade time: good for valuation, never executable.
+            price, market_time = _fast_info_price(asset) or _last_close(asset), None
+            if price is None:
+                _remember_failure(asset, now)
+                raise MarketDataUnavailable(f"no market price available for {asset}")
+        _price_cache[asset] = (price, now, market_time)
+        _quote_failures.pop(asset, None)
+        return price, market_time
+
+
+def _remember_failure(asset: str, now: float) -> None:
+    # Orders accept any well-formed ticker, so failures for made-up symbols
+    # would otherwise accumulate for the life of the process.
+    if len(_quote_failures) >= _QUOTE_FAILURES_PRUNE_AT:
+        for key, failed_at in list(_quote_failures.items()):
+            if now - failed_at >= QUOTE_FAILURE_TTL:
+                _quote_failures.pop(key, None)
+    _quote_failures[asset] = now
+
+
+def _fresh_quote(asset: str, now: float) -> tuple[float, float | None] | None:
+    """The cached (price, market_time) while it is fresh, else None. Raises
+    MarketDataUnavailable while a recent fetch's failure stands."""
     cached = _price_cache.get(asset)
     if cached and now - cached[1] < PRICE_CACHE_TTL:
         return cached[0], cached[2]
-    live = _live_quote(asset)
-    if live is not None:
-        price, market_time = live
-    else:
-        # A price without a trade time: good for valuation, never executable.
-        price, market_time = _fast_info_price(asset) or _last_close(asset), None
-        if price is None:
-            raise MarketDataUnavailable(f"no market price available for {asset}")
-    _price_cache[asset] = (price, now, market_time)
-    return price, market_time
+    failed_at = _quote_failures.get(asset)
+    if failed_at is not None and now - failed_at < QUOTE_FAILURE_TTL:
+        raise MarketDataUnavailable(f"no market price available for {asset}")
+    return None
 
 
 def get_last_price(asset: str) -> float:

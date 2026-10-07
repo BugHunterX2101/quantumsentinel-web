@@ -98,6 +98,91 @@ class TestStrictMarketData:
             trading_service.get_last_price("BAD")
 
 
+class TestQuoteFetching:
+    """One provider fetch per asset at a time, and a failed fetch is not
+    repeated by every read for QUOTE_FAILURE_TTL seconds."""
+
+    @pytest.fixture
+    def provider(self, monkeypatch):
+        import time
+
+        import pandas as pd
+
+        state = {"tickers": 0, "price": 250.0, "delay": 0.0}
+        lock = threading.Lock()
+
+        class Ticker:
+            def __init__(self, _sym):
+                with lock:
+                    state["tickers"] += 1
+                self.history_metadata = {}
+                self.fast_info = type("Info", (), {"last_price": None, "regularMarketPrice": None})()
+
+            def history(self, **_kw):
+                time.sleep(state["delay"])
+                if state["price"] is not None:
+                    self.history_metadata = {"regularMarketPrice": state["price"],
+                                             "regularMarketTime": time.time()}
+                return pd.DataFrame()
+
+        monkeypatch.setattr(trading_service.yf, "Ticker", Ticker)
+        trading_service._price_cache.clear()
+        return state
+
+    def test_concurrent_requests_share_one_fetch(self, provider):
+        provider["delay"] = 0.2
+        n = 8
+        barrier, prices = threading.Barrier(n), []
+
+        def read():
+            barrier.wait()
+            prices.append(trading_service.get_last_price("HERD"))
+
+        threads = [threading.Thread(target=read) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert prices == [250.0] * n
+        assert provider["tickers"] == 1
+
+    def test_a_failed_fetch_is_not_repeated_until_its_ttl_passes(self, provider):
+        provider["price"] = None
+        assert trading_service.get_mark_price("GONE") == (None, True)
+        calls = provider["tickers"]
+        assert calls == 3  # live quote, fast_info, last close
+        assert trading_service.get_mark_price("GONE") == (None, True)
+        with pytest.raises(trading_service.MarketDataUnavailable):
+            trading_service.get_last_price("GONE")
+        assert provider["tickers"] == calls
+        # Once the failure is older than its TTL the provider is asked again.
+        trading_service._quote_failures["GONE"] -= trading_service.QUOTE_FAILURE_TTL
+        provider["price"] = 12.5
+        assert trading_service.get_last_price("GONE") == 12.5
+        assert "GONE" not in trading_service._quote_failures
+
+    def test_a_failed_fetch_keeps_the_last_good_price_as_the_mark(self, provider):
+        assert trading_service.get_last_price("HELD") == 250.0
+        price, fetched_at, market_time = trading_service._price_cache["HELD"]
+        trading_service._price_cache["HELD"] = (price, fetched_at - trading_service.PRICE_CACHE_TTL, market_time)
+        provider["price"] = None
+        with pytest.raises(trading_service.MarketDataUnavailable):
+            trading_service.get_last_price("HELD")
+        assert trading_service.get_mark_price("HELD") == (250.0, True)
+
+    def test_expired_failures_are_pruned(self, provider, monkeypatch):
+        import time
+
+        monkeypatch.setattr(trading_service, "_QUOTE_FAILURES_PRUNE_AT", 4)
+        expired = time.time() - trading_service.QUOTE_FAILURE_TTL
+        for i in range(4):
+            trading_service._quote_failures[f"OLD{i}"] = expired
+        trading_service._quote_failures["RECENT"] = time.time()
+        provider["price"] = None
+        assert trading_service.get_mark_price("NEW") == (None, True)
+        assert set(trading_service._quote_failures) == {"RECENT", "NEW"}
+
+
 def test_float32_widened_prices_are_normalised_to_their_decimal_value():
     import numpy as np
     assert trading_service._valid_price(float(np.float32(341.07))) == 341.07

@@ -77,6 +77,17 @@ def pytest_sessionfinish(session, exitstatus):
     drop_schema(APP_SCHEMA)
 
 
+@pytest.fixture(autouse=True)
+def _forget_quote_failures():
+    """A ticker one test made fail must not stay unpriced for the next test.
+    (Tests reset prices with ``_price_cache.clear()``, which leaves this.)"""
+    from backend.services import trading_service
+
+    trading_service._quote_failures.clear()
+    yield
+    trading_service._quote_failures.clear()
+
+
 @pytest.fixture
 def make_engine():
     """Factory for engines on a fresh, fully created schema of their own.

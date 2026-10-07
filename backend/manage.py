@@ -5,6 +5,7 @@
     python -m backend.manage import-sqlite <path/to/quantumsentinel.db>
     python -m backend.manage generate-server-key
     python -m backend.manage repair-positions
+    python -m backend.manage verify-audit-chain
 
 Roles are granted only here — out of band, by someone with shell access to
 the deployment — never through the web API, so no self-registered account
@@ -17,7 +18,10 @@ PostgreSQL database. ``generate-server-key`` prints a new server ML-DSA
 signing key as the SERVER_DSA_* settings (run it before those are set: a
 production configuration refuses to load without them). ``repair-positions``
 rebuilds the positions of users left with duplicate position rows by the
-concurrent-fill race that earlier releases had.
+concurrent-fill race that earlier releases had. ``verify-audit-chain`` checks
+every link of the audit chain and exits non-zero if any fails; schedule it,
+because the API's default check covers only links added since the worker's
+previous check.
 """
 import argparse
 import sys
@@ -43,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="print a new ML-DSA-65 server signing key as SERVER_DSA_* settings")
     commands.add_parser("repair-positions",
                         help="rebuild the positions of users left with duplicate position rows")
+    commands.add_parser("verify-audit-chain",
+                        help="verify every link of the audit chain; exit 1 if any fails")
     args = parser.parse_args(argv)
 
     if args.command == "generate-server-key":
@@ -50,6 +56,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "repair-positions":
         init_db()
         return _repair_positions(SessionLocal)
+    if args.command == "verify-audit-chain":
+        init_db()
+        return _verify_audit_chain(SessionLocal)
     if args.command == "migrate":
         from .database import migrate
         print(f"database schema at revision {migrate()}")
@@ -96,6 +105,18 @@ def _generate_server_key() -> int:
     print(f"SERVER_DSA_CREATED_AT={dt.datetime.now(dt.timezone.utc).isoformat()}")
     print(f"TRUSTED_SERVER_DSA_FINGERPRINT={hashlib.sha256(pk).hexdigest()}")
     return 0
+
+
+def _verify_audit_chain(session_factory) -> int:
+    """Check every audit chain link; print the result as JSON."""
+    import json
+
+    from .services import security_service
+
+    with session_factory() as db:
+        status = security_service.audit_chain_status(db, full=True)
+    print(json.dumps(status))
+    return 0 if status["valid"] else 1
 
 
 def _repair_positions(session_factory) -> int:

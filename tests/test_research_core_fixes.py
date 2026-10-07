@@ -380,8 +380,10 @@ class TestAuditChain:
         sequences = [s for (s,) in db.execute(text("SELECT sequence FROM audit_chain_links ORDER BY sequence"))]
         assert sequences == list(range(1, 50))
         status = security_service.audit_chain_status(db)
+        assert status.pop("last_full_verification_at") is not None
         assert status == {"valid": True, "links": 49, "unchained_events": 0,
-                          "first_invalid_sequence": None, "reason": None}
+                          "first_invalid_sequence": None, "reason": None,
+                          "mode": "full", "verified_from_sequence": 1}
 
     def test_postgres_lock_is_taken_before_the_chain_head_is_read(self, db, monkeypatch):
         # Recorded at the driver, which sees every statement whichever API

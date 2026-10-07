@@ -2348,12 +2348,14 @@ def compliance_report(user: models.User = Depends(get_current_user), db: Session
 
 
 @app.get("/api/security/audit-chain")
-def audit_chain(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Verify the whole tamper-evident audit chain (operators only: it spans
-    every user's events)."""
+def audit_chain(user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
+                full: bool = False):
+    """Verify the tamper-evident audit chain (operators only: it spans every
+    user's events). By default only links added since this worker last
+    verified the chain are checked; ``?full=true`` checks every link."""
     if not _is_admin(user):
         raise HTTPException(403, "Operator role required")
-    status = security_service.audit_chain_status(db)
+    status = security_service.audit_chain_status(db, full=full)
     return {**status, "verified_at": dt.datetime.now(dt.timezone.utc).isoformat()}
 
 

@@ -9,6 +9,7 @@ Item 8 enhancements:
 """
 import json
 import hashlib
+import hmac
 import threading
 import datetime as dt
 from cryptography.fernet import Fernet, InvalidToken
@@ -202,6 +203,21 @@ class ServerIdentity:
 
 
 server_identity = ServerIdentity()
+
+
+def enforce_identity_pin(pinned: str | None) -> None:
+    """Refuse to run if the signing key is not the pinned one.
+
+    TRUSTED_SERVER_DSA_FINGERPRINT pins the deployment's ML-DSA identity:
+    a mismatch means the configured key material is not the key operators
+    registered, so the process must not sign audit logs or handshakes.
+    """
+    pinned = (pinned or "").strip().lower()
+    if not pinned:
+        return
+    actual = (server_identity.fingerprint or "").lower()
+    if not hmac.compare_digest(pinned, actual):
+        raise RuntimeError("server ML-DSA key does not match TRUSTED_SERVER_DSA_FINGERPRINT")
 
 
 # Orders chain appends between threads of this process. SQLite has no

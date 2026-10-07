@@ -1,4 +1,4 @@
-"""Regression test for backend/main.py:_fetch_single_asset.
+"""Regression test for backend/services/research_tasks.py:fetch_single_asset.
 
 Found via live testing (Playwright + direct API smoke test) of
 POST /api/research/regime, which crashed on every real request with
@@ -49,7 +49,7 @@ def _fake_yf_download_single_ticker(n=120, ticker="SPY"):
 class TestFetchSingleAsset:
     def test_returns_and_prices_are_1d(self, monkeypatch):
         import yfinance
-        from backend import main
+        from backend.services import research_tasks
 
         fake_data = _fake_yf_download_single_ticker(n=120)
         assert fake_data["Close"].shape == (120, 1), (
@@ -58,7 +58,7 @@ class TestFetchSingleAsset:
         )
         monkeypatch.setattr(yfinance, "download", lambda *a, **kw: fake_data)
 
-        returns, prices = main._fetch_single_asset("SPY", "6mo")
+        returns, prices = research_tasks.fetch_single_asset("SPY", "6mo")
 
         assert prices.ndim == 1
         assert returns.ndim == 1
@@ -70,14 +70,14 @@ class TestFetchSingleAsset:
         """The exact failure mode observed live: a shape-(T,0) vs (T-1,1)
         broadcast error inside np.diff(prices) / prices[:-1]."""
         import yfinance
-        from backend import main
+        from backend.services import research_tasks
 
         fake_data = _fake_yf_download_single_ticker(n=753)
         monkeypatch.setattr(yfinance, "download", lambda *a, **kw: fake_data)
 
         try:
-            returns, prices = main._fetch_single_asset("SPY", "3y")
+            returns, prices = research_tasks.fetch_single_asset("SPY", "3y")
         except ValueError as exc:
-            pytest.fail(f"_fetch_single_asset raised unexpectedly: {exc}")
+            pytest.fail(f"fetch_single_asset raised unexpectedly: {exc}")
 
         assert len(returns) == len(prices) - 1

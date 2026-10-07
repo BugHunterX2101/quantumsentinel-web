@@ -79,6 +79,28 @@ ORDER_SWEEP_INTERVAL_SECONDS = float(os.getenv("ORDER_SWEEP_INTERVAL_SECONDS", "
 # market's last close.
 MAX_QUOTE_AGE_SECONDS = float(os.getenv("MAX_QUOTE_AGE_SECONDS", "1200"))
 
+# --- Research job queue -----------------------------------------------------------
+# Research runs in a worker process, never in the API process. "embedded" (the
+# default): every API process starts one worker subprocess and stops it with
+# itself, so a deployment needs no extra service; "external": workers are
+# deployed separately (`python -m backend.worker`) and the API starts none;
+# "off": nothing runs queued jobs (tests).
+RESEARCH_WORKER_MODE = _setting("RESEARCH_WORKER_MODE", "embedded").lower()
+# Hard limit on one job's run time; the job process is killed when it passes.
+RESEARCH_JOB_TIMEOUT_SECONDS = float(os.getenv("RESEARCH_JOB_TIMEOUT_SECONDS", "900"))
+# A running job belongs to its worker only while the worker keeps renewing
+# this lease; a worker that stops renewing is presumed dead and the job is
+# handed to another worker (at most RESEARCH_JOB_MAX_ATTEMPTS runs in total).
+RESEARCH_JOB_LEASE_SECONDS = float(os.getenv("RESEARCH_JOB_LEASE_SECONDS", "60"))
+RESEARCH_JOB_MAX_ATTEMPTS = int(os.getenv("RESEARCH_JOB_MAX_ATTEMPTS", "2"))
+# Queued plus running jobs one user may have at a time.
+RESEARCH_MAX_ACTIVE_JOBS_PER_USER = int(os.getenv("RESEARCH_MAX_ACTIVE_JOBS_PER_USER", "3"))
+# Finished jobs (and their results) are deleted after this many days.
+RESEARCH_JOB_RETENTION_DAYS = float(os.getenv("RESEARCH_JOB_RETENTION_DAYS", "7"))
+RESEARCH_WORKER_POLL_SECONDS = float(os.getenv("RESEARCH_WORKER_POLL_SECONDS", "1"))
+if RESEARCH_WORKER_MODE not in ("embedded", "external", "off"):
+    raise RuntimeError("RESEARCH_WORKER_MODE must be one of: embedded, external, off")
+
 DATABASE_URL = _setting("DATABASE_URL", "sqlite:///./quantumsentinel.db")
 REDIS_URL = _setting("REDIS_URL")
 PQC_PROVIDER = _setting("PQC_PROVIDER", "reference")

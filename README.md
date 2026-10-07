@@ -420,10 +420,11 @@ quantumsentinel-web/
 │
 ├── backend/
 │   ├── main.py                          ← Central router · middleware · WebSocket · SPA fallback
-│   ├── models.py                        ← SQLAlchemy 2.0 schema (15 tables)
+│   ├── models.py                        ← SQLAlchemy 2.0 schema (20 tables)
 │   ├── schemas.py                       ← Pydantic v2 request/response validation (all endpoints)
 │   ├── database.py                      ← Engine · session factory · init_db()
 │   ├── config.py                        ← ENV-driven config with production safety constraints
+│   ├── worker.py                        ← Research worker: claims jobs · runs each in a killable child process
 │   │
 │   ├── crypto/
 │   │   └── pqc.py                       ← ML-KEM-768 · ML-DSA-65 · X25519 · HKDF · registry
@@ -441,6 +442,8 @@ quantumsentinel-web/
 │       ├── integration_service.py       ← Scoped API keys · SSRF-guarded signed webhooks
 │       │
 │       │   ── Research Engine ─────────────────────────────────────────
+│       ├── research_jobs.py             ← Job queue · leases · per-user limit · cancel · results
+│       ├── research_tasks.py            ← The research computations a job runs, one function per kind
 │       ├── backtest_service.py          ← Event-driven backtest with full execution cost model
 │       ├── execution_model.py           ← Commission · spread · slippage · borrow cost models
 │       ├── walk_forward.py              ← Rolling/expanding walk-forward OOS validation
@@ -489,6 +492,7 @@ quantumsentinel-web/
 │   ├── test_phase4.py                   ← C++ kernels · p50/p99 latency · report generator
 │   ├── test_order_security.py           ← Canonical order · nonce/idempotency · risk gate · kill-switch
 │   ├── test_research_governance.py      ← Experiment metadata · data lineage · reproducibility
+│   ├── test_research_jobs.py            ← Job queue · leases · cancel · timeouts · worker lifecycle
 │   ├── test_security_hardening.py       ← PQC handshake · audit chain · key rotation · CSRF
 │   ├── test_microstructure.py           ← L2 analytics · OBI · microprice · synthetic L2 replay
 │   ├── test_paper_exchange.py           ← Order book · matching engine · paper exchange · FIFO
@@ -559,6 +563,7 @@ uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
 
 - App: **http://127.0.0.1:8000**
 - Interactive API docs: **http://127.0.0.1:8000/docs**
+- Research runs in a background worker process that the API starts and stops with itself (`RESEARCH_WORKER_MODE=embedded`, the default); nothing else needs to be started.
 
 ---
 
@@ -594,6 +599,8 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 
 ### Research Engine Endpoints
 
+Research runs as background jobs, never inside the request. The dashboard backtest (`POST /api/backtests`) and every `POST` below except `stat-test` validate their input, queue a job and return **`202 Accepted`** at once with the job and a `Location: /api/research/jobs/{job_id}` header. Poll that URL until `status` is `succeeded` (the job then carries `result`), `failed` (`error` holds `status_code` and `detail`) or `cancelled`. Invalid input is still rejected immediately (`400`/`422`) and nothing is queued. A user may have at most `RESEARCH_MAX_ACTIVE_JOBS_PER_USER` jobs queued or running (default 3); one more is refused with `429`. Jobs and their results are visible only to the user who queued them.
+
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/research/backtest` | Event-driven backtest with commission · spread · slippage · execution delay |
@@ -609,6 +616,10 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 | **`POST`** | **`/api/research/report`** | **Full 7-section research report across all pipeline stages** |
 | `POST` | `/api/research/latency-benchmark` | Per-stage p50/p99 latency profile + C++ vs Python speedup benchmark |
 | `GET`  | `/api/research/cpp-status` | C++ extension load status · kernel names · active mode |
+| `GET`  | `/api/research/jobs` | The caller's recent research jobs, newest first, without results (`?limit=`, up to 100) |
+| `GET`  | `/api/research/jobs/{job_id}` | One job's status and queue position; its result or error once finished |
+| `POST` | `/api/research/jobs/{job_id}/cancel` | Cancel a queued job, or stop a running one (its process is killed) |
+| `GET`  | `/api/research/queue` | Operator only: queued and running counts, oldest queued job's age, live workers |
 
 ### Market Microstructure & Paper Exchange Endpoints
 
@@ -759,6 +770,13 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `PAPER_INITIAL_CASH` | No | Starting cash of every paper account (default 100000) |
 | `PAPER_MAX_POSITION_FRACTION` | No | Per-asset concentration cap as a fraction of equity (default 0.05) |
 | `ORDER_SWEEP_INTERVAL_SECONDS` | No | How often resting orders are checked for fills (default 5) |
+| `RESEARCH_WORKER_MODE` | No | `embedded` (default): every API process runs one research worker subprocess and stops it with itself; `external`: the API runs none, start workers with `python -m backend.worker`; `off`: nothing runs queued jobs |
+| `RESEARCH_JOB_TIMEOUT_SECONDS` | No | Hard run-time limit of one job; its process is killed when it passes (default 900) |
+| `RESEARCH_JOB_LEASE_SECONDS` | No | A running job goes back to the queue when its worker stops renewing it for this long (default 60) |
+| `RESEARCH_JOB_MAX_ATTEMPTS` | No | Runs a job gets when its workers are lost mid-run, before it is marked failed (default 2) |
+| `RESEARCH_MAX_ACTIVE_JOBS_PER_USER` | No | Queued plus running research jobs one user may have (default 3) |
+| `RESEARCH_JOB_RETENTION_DAYS` | No | Finished jobs and their results are deleted after this many days (default 7) |
+| `RESEARCH_WORKER_POLL_SECONDS` | No | How often an idle worker checks the queue (default 1) |
 
 ---
 
@@ -802,6 +820,9 @@ cp .env.production.example .env.production
 # 4. Deploy
 docker compose -f docker-compose.production.yml --env-file .env.production up -d --build
 ```
+
+> [!NOTE]
+> Research jobs run in worker subprocesses that the web containers start themselves (one per gunicorn worker, `WEB_CONCURRENCY`), so no extra service is needed. To scale workers separately, set `RESEARCH_WORKER_MODE=external` on the web service and run `python -m backend.worker` as its own service from the same image, with the same environment.
 
 > [!IMPORTANT]
 > Production mode deliberately refuses the bundled pure-Python reference PQC backend.

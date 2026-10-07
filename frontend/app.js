@@ -120,6 +120,48 @@ function api(path, opts = {}, opts2 = {}) {
   }).finally(() => loadingBar.done());
 }
 
+// ===========================================================================
+// Research jobs. Research endpoints answer 202 with a job and the computation
+// runs in a worker process; researchJob() polls the job and resolves with its
+// result (or throws its error), so callers read like a plain request.
+// statusEl, if given, shows the job's progress while it waits.
+// ===========================================================================
+const RESEARCH_POLL_DELAYS_MS = [500, 750, 1000, 1500, 2000];
+
+function researchJobStatusText(job) {
+  if (job.status === 'queued') {
+    if (job.workers_online === 0) return 'Queued — waiting for a research worker to come online…';
+    return job.queue_position > 1 ? `Queued — position ${job.queue_position} in line…` : 'Queued — starting shortly…';
+  }
+  if (job.status === 'running') {
+    if (job.cancel_requested) return 'Cancelling…';
+    const started = Date.parse(job.started_at || '');
+    const secs = Number.isFinite(started) ? Math.max(0, Math.round((Date.now() - started) / 1000)) : 0;
+    return `Running on a research worker… ${secs}s`;
+  }
+  return '';
+}
+
+async function researchJob(path, body, statusEl = null) {
+  const submitted = await api(path, { method: 'POST', body: JSON.stringify(body) });
+  let job = submitted;
+  for (let poll = 0; ; poll++) {
+    const text = researchJobStatusText(job);
+    if (statusEl && text) statusEl.innerHTML = `<div class="empty-state">${escapeHtml(text)}</div>`;
+    if (job.status === 'succeeded') return job.result;
+    if (job.status === 'failed' || job.status === 'cancelled') {
+      const detail = job.status === 'cancelled'
+        ? 'The research job was cancelled.'
+        : (job.error && job.error.detail) || 'Research job failed';
+      toast('Request failed', detail, 'error');
+      throw new Error(detail);
+    }
+    await new Promise((resolve) => setTimeout(resolve,
+      RESEARCH_POLL_DELAYS_MS[Math.min(poll, RESEARCH_POLL_DELAYS_MS.length - 1)]));
+    job = await api(`/api/research/jobs/${encodeURIComponent(submitted.job_id)}`);
+  }
+}
+
 
 function handleTokenExpiry() {
   if (state.tokenExpireTimer) { clearTimeout(state.tokenExpireTimer); state.tokenExpireTimer = null; }
@@ -1537,10 +1579,13 @@ document.getElementById('strategy-form').addEventListener('submit', async (e) =>
   setButtonLoading(btn, true, 'Backtesting historical data…');
   try {
     await api('/api/strategies', { method: 'POST', body: JSON.stringify(body) });
-    const result = await api('/api/backtests', { method: 'POST', body: JSON.stringify(body) });
+    const result = await researchJob('/api/backtests', body, document.getElementById('backtest-result'));
     document.getElementById('backtest-result').innerHTML = `<div class="metrics-row"><div class="metric-box"><div class="val">${(result.total_return * 100).toFixed(1)}%</div><div class="lbl">Total Return</div></div><div class="metric-box"><div class="val">${result.sharpe_ratio.toFixed(2)}</div><div class="lbl">Sharpe</div></div><div class="metric-box"><div class="val">${(result.max_drawdown * 100).toFixed(1)}%</div><div class="lbl">Max Drawdown</div></div></div><p class="hint">${result.asset} · ${result.period} · ${result.total_trades} order events · historical simulation only.</p>`;
     await loadStrategies(); toast('Backtest completed', `${result.asset} total return: ${(result.total_return * 100).toFixed(1)}%`, 'success');
-  } catch (err) { error.textContent = err.message; } finally { setButtonLoading(btn, false); }
+  } catch (err) {
+    error.textContent = err.message;
+    document.getElementById('backtest-result').innerHTML = '';
+  } finally { setButtonLoading(btn, false); }
 });
 
 const onboardingSteps = [
@@ -2583,7 +2628,7 @@ document.getElementById('research-backtest-form').addEventListener('submit', asy
   };
 
   try {
-    const d = await api('/api/research/backtest', { method: 'POST', body: JSON.stringify(body) });
+    const d = await researchJob('/api/research/backtest', body, resultEl);
     // Use the server's full-resolution daily_returns_net, not a series
     // re-derived from equity_curve_net — that curve is downsampled to ~200
     // points for chart-payload size, so differencing it would silently feed
@@ -2685,7 +2730,7 @@ document.getElementById('research-wf-form').addEventListener('submit', async (e)
   };
 
   try {
-    const d = await api('/api/research/walk-forward', { method: 'POST', body: JSON.stringify(body) });
+    const d = await researchJob('/api/research/walk-forward', body, resultEl);
     renderWalkForwardResult(d, resultEl);
   } catch (err) {
     errEl.textContent = err.message;
@@ -2890,7 +2935,7 @@ document.getElementById('alpha-research-form').addEventListener('submit', async 
   };
 
   try {
-    renderAlphaResult(await api('/api/research/alpha', { method: 'POST', body: JSON.stringify(body) }), resultEl);
+    renderAlphaResult(await researchJob('/api/research/alpha', body, resultEl), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Alpha research failed.</div>';
@@ -2999,7 +3044,7 @@ document.getElementById('factor-model-form').addEventListener('submit', async (e
   };
 
   try {
-    renderFactorModelResult(await api('/api/research/factor-model', { method: 'POST', body: JSON.stringify(body) }), resultEl);
+    renderFactorModelResult(await researchJob('/api/research/factor-model', body, resultEl), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Factor model failed.</div>';
@@ -3072,7 +3117,7 @@ document.getElementById('correlation-form').addEventListener('submit', async (e)
   };
 
   try {
-    renderCorrelationResult(await api('/api/research/correlation', { method: 'POST', body: JSON.stringify(body) }), resultEl);
+    renderCorrelationResult(await researchJob('/api/research/correlation', body, resultEl), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Correlation analysis failed.</div>';
@@ -3172,7 +3217,7 @@ document.getElementById('portopt-form').addEventListener('submit', async (e) => 
   };
 
   try {
-    renderPortOptResult(await api('/api/research/optimize', { method: 'POST', body: JSON.stringify(body) }), resultEl);
+    renderPortOptResult(await researchJob('/api/research/optimize', body, resultEl), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Optimisation failed.</div>';
@@ -3278,7 +3323,7 @@ async function _labPost(endpoint, body, btnId, errId, resultId, loadingMsg) {
   resultEl.innerHTML = `<div class="empty-state">${loadingMsg}</div>`;
   setButtonLoading(btn, true, 'Running…');
   try {
-    return await api(endpoint, { method: 'POST', body: JSON.stringify(body) });
+    return await researchJob(endpoint, body, resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Request failed. Check the parameters and try again.</div>';

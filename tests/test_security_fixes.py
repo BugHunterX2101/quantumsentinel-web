@@ -271,7 +271,6 @@ class TestExperimentManifestSigningKey:
 
 class TestNoRawExceptionLeakage:
     def test_backtest_500_hides_internal_exception_detail(self, db, monkeypatch):
-        from backend import main
         from backend.services import backtest_service
 
         class ExplodingEngine:
@@ -284,16 +283,29 @@ class TestNoRawExceptionLeakage:
                 )
 
         monkeypatch.setattr(backtest_service, "BacktestEngine", ExplodingEngine)
-        user = _make_user(db)
-        req = schemas.AdvancedBacktestRequest()
+        from backend import worker
+        from backend.services import research_jobs
 
-        with pytest.raises(main.HTTPException) as exc:
-            main.advanced_backtest(req, user=user, db=db)
+        # Research runs as a job; this is the outcome the job stores and the
+        # user sees when polling it.
+        outcome = worker._run_target(research_jobs.KINDS["advanced_backtest"].target,
+                                     schemas.AdvancedBacktestRequest().model_dump())
 
-        assert exc.value.status_code == 500
-        assert exc.value.detail == "Backtest failed"
-        assert "psycopg2" not in str(exc.value.detail)
-        assert "qs_prod" not in str(exc.value.detail)
+        assert outcome == ("error", 500, "Backtest failed")
+        assert "psycopg2" not in str(outcome)
+        assert "qs_prod" not in str(outcome)
+
+    def test_unexpected_job_exception_is_reported_generically(self, monkeypatch):
+        from backend import worker
+        from backend.services import research_jobs, research_tasks
+
+        def explode(_params):
+            raise RuntimeError('psycopg2.OperationalError: password authentication failed for user "qs_prod"')
+
+        monkeypatch.setattr(research_tasks, "correlation", explode)
+        outcome = worker._run_target(research_jobs.KINDS["correlation"].target, {})
+
+        assert outcome == ("error", 500, "Research job failed")
 
 
 # ---------------------------------------------------------------------------

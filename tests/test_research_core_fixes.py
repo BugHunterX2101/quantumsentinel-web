@@ -384,18 +384,22 @@ class TestAuditChain:
                           "first_invalid_sequence": None, "reason": None}
 
     def test_postgres_lock_is_taken_before_the_chain_head_is_read(self, db, monkeypatch):
+        # Recorded at the driver, which sees every statement whichever API
+        # sent it (the lock and the head read go out as one query string).
+        import psycopg
+
         executed = []
-        real_execute = db.execute
+        real_execute = psycopg.Cursor.execute
 
-        def recording_execute(statement, *args, **kwargs):
-            executed.append(str(statement))
-            return real_execute(statement, *args, **kwargs)
+        def recording_execute(cursor, query, *args, **kwargs):
+            executed.append(query if isinstance(query, str) else query.as_string(cursor))
+            return real_execute(cursor, query, *args, **kwargs)
 
-        monkeypatch.setattr(db, "execute", recording_execute)
+        monkeypatch.setattr(psycopg.Cursor, "execute", recording_execute)
         security_service.write_audit_log(db, None, "LOCK_ORDER")
-        lock = next(i for i, s in enumerate(executed) if "pg_advisory_xact_lock" in s)
-        head = next(i for i, s in enumerate(executed) if "FROM audit_chain_links" in s)
-        assert lock < head
+        sent = "\n".join(executed)
+        assert "pg_advisory_xact_lock" in sent and "FROM audit_chain_links" in sent
+        assert sent.index("pg_advisory_xact_lock") < sent.index("FROM audit_chain_links")
 
     def test_tampering_is_located(self, db):
         for i in range(3):

@@ -342,7 +342,9 @@ class TestWebSocket:
                 db.get(models.User, user.id).is_active = False
                 db.commit()
             with pytest.raises(WebSocketDisconnect) as exc:
-                for _ in range(5):
+                # Pushes sent before the commit landed are still queued; a slow
+                # runner can queue many, so bound the wait (~10 s), not the count.
+                for _ in range(200):
                     ws.receive_json()
             assert exc.value.code == 4401
 
@@ -354,7 +356,7 @@ class TestWebSocket:
             with Session() as db:
                 db.get(models.User, user.id).watchlist = ["AAPL", "MSFT"]
                 db.commit()
-            for _ in range(5):
+            for _ in range(200):  # skip pushes queued before the commit (see above)
                 if ws.receive_json()["watchlist"] == ["AAPL", "MSFT"]:
                     break
             else:

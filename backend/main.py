@@ -43,6 +43,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import MutableHeaders
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import redis.asyncio as redis
 
@@ -383,71 +384,98 @@ def _sweep_request_windows(now: float) -> None:
             _request_windows.pop(key, None)
 
 
-@app.middleware("http")
-async def security_headers_and_rate_limit(request, call_next):
-    client = request.client.host if request.client else "unknown"
-    principal = request.headers.get("x-qs-api-key") or request.headers.get("authorization", "")
-    principal_hash = hashlib.sha256(principal.encode()).hexdigest()[:16] if principal else client
-    key = f"{principal_hash}:{request.url.path}"
-    now = time.monotonic()
-    limit = 10 if request.url.path.startswith("/api/auth/") else 240
-    current = 0
-    if _redis_client:
-        try:
-            redis_key = f"qs:rate:{key}"
-            current = int(await _redis_client.incr(redis_key))
-            if current == 1:
-                await _redis_client.expire(redis_key, 60)
-        except Exception:
-            if ENVIRONMENT == "production":
-                return JSONResponse({"detail": "Rate-limit service unavailable"}, status_code=503)
-            current = 0
-    if not _redis_client or current == 0:
-        _sweep_request_windows(now)
-        window = _request_windows[key]
-        while window and now - window[0] > _RATE_WINDOW_SECONDS:
-            window.popleft()
-        current = len(window) + 1
-        window.append(now)
-    if current > limit:
-        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429,
-                            headers={"Retry-After": "60"})
-    started = time.perf_counter()
-    response = await call_next(request)
-    metric_path = getattr(request.scope.get("route"), "path", request.url.path)
-    HTTP_REQUESTS.labels(request.method, metric_path, str(response.status_code)).inc()
-    HTTP_LATENCY.labels(request.method, metric_path).observe(time.perf_counter() - started)
-    response.headers["X-RateLimit-Limit"] = str(limit)
-    response.headers["X-RateLimit-Remaining"] = str(max(0, limit - current))
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    # CSP: scripts only from this origin (Three.js is self-hosted), no
-    # unsafe-inline/eval, explicit form-action/object-src.
-    #
-    # style-src DOES need 'unsafe-inline': the frontend renders its Research
-    # and Lab result panels (and a fair amount of index.html itself) with
-    # inline `style="..."` attributes rather than a stylesheet — hundreds of
-    # them, generated dynamically per request (metric cards, tables, mini
-    # charts). Without 'unsafe-inline' here, browsers silently drop every one
-    # of those styles, so most of Research/Lab renders unstyled/broken while
-    # script-src stays fully locked down (inline styles cannot execute
-    # script, so this doesn't reopen the XSS surface script-src closes).
-    ws_policy = "wss:" if ENVIRONMENT == "production" else "wss: ws:"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "script-src 'self'; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src 'self' https://fonts.gstatic.com data:; "
-        "img-src 'self' data:; "
-        f"connect-src 'self' {ws_policy} https://api.github.com https://api.pwnedpasswords.com; "
-        "frame-ancestors 'none'; "
-        "base-uri 'self'; "
-        "object-src 'none'; "
-        "form-action 'self'"
-    )
-    return response
+class SecurityHeadersAndRateLimit:
+    """Rate limiting, request metrics and security headers for every HTTP response.
+
+    Plain ASGI rather than ``@app.middleware("http")``: that form runs each
+    request in its own task group behind memory streams, which measured
+    ~0.4 ms per request here — about half the time of a trivial endpoint.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        client = request.client.host if request.client else "unknown"
+        principal = request.headers.get("x-qs-api-key") or request.headers.get("authorization", "")
+        principal_hash = hashlib.sha256(principal.encode()).hexdigest()[:16] if principal else client
+        key = f"{principal_hash}:{request.url.path}"
+        now = time.monotonic()
+        limit = 10 if request.url.path.startswith("/api/auth/") else 240
+        current = 0
+        if _redis_client:
+            try:
+                redis_key = f"qs:rate:{key}"
+                current = int(await _redis_client.incr(redis_key))
+                if current == 1:
+                    await _redis_client.expire(redis_key, 60)
+            except Exception:
+                if ENVIRONMENT == "production":
+                    await JSONResponse({"detail": "Rate-limit service unavailable"},
+                                       status_code=503)(scope, receive, send)
+                    return
+                current = 0
+        if not _redis_client or current == 0:
+            _sweep_request_windows(now)
+            window = _request_windows[key]
+            while window and now - window[0] > _RATE_WINDOW_SECONDS:
+                window.popleft()
+            current = len(window) + 1
+            window.append(now)
+        if current > limit:
+            await JSONResponse({"detail": "Rate limit exceeded"}, status_code=429,
+                               headers={"Retry-After": "60"})(scope, receive, send)
+            return
+        started = time.perf_counter()
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                metric_path = getattr(scope.get("route"), "path", request.url.path)
+                HTTP_REQUESTS.labels(request.method, metric_path, str(message["status"])).inc()
+                HTTP_LATENCY.labels(request.method, metric_path).observe(time.perf_counter() - started)
+                headers = MutableHeaders(scope=message)
+                headers["X-RateLimit-Limit"] = str(limit)
+                headers["X-RateLimit-Remaining"] = str(max(0, limit - current))
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["X-Frame-Options"] = "DENY"
+                headers["Referrer-Policy"] = "no-referrer"
+                headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+                # CSP: scripts only from this origin (Three.js is self-hosted), no
+                # unsafe-inline/eval, explicit form-action/object-src.
+                #
+                # style-src DOES need 'unsafe-inline': the frontend renders its Research
+                # and Lab result panels (and a fair amount of index.html itself) with
+                # inline `style="..."` attributes rather than a stylesheet — hundreds of
+                # them, generated dynamically per request (metric cards, tables, mini
+                # charts). Without 'unsafe-inline' here, browsers silently drop every one
+                # of those styles, so most of Research/Lab renders unstyled/broken while
+                # script-src stays fully locked down (inline styles cannot execute
+                # script, so this doesn't reopen the XSS surface script-src closes).
+                ws_policy = "wss:" if ENVIRONMENT == "production" else "wss: ws:"
+                headers["Content-Security-Policy"] = (
+                    "default-src 'self'; "
+                    "script-src 'self'; "
+                    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                    "font-src 'self' https://fonts.gstatic.com data:; "
+                    "img-src 'self' data:; "
+                    f"connect-src 'self' {ws_policy} https://api.github.com https://api.pwnedpasswords.com; "
+                    "frame-ancestors 'none'; "
+                    "base-uri 'self'; "
+                    "object-src 'none'; "
+                    "form-action 'self'"
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+# Added last, so it wraps every other middleware: TrustedHost rejections and
+# CORS preflights carry the security headers too.
+app.add_middleware(SecurityHeadersAndRateLimit)
 
 
 # Startup logic is in _lifespan() above (FastAPI lifespan context manager).

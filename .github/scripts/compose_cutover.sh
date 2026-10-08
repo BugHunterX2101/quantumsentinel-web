@@ -25,6 +25,15 @@ sessions() {
   "${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -Atc \
     "SELECT string_agg(DISTINCT usename, ',' ORDER BY usename) FROM pg_stat_activity WHERE application_name = 'quantumsentinel'"
 }
+# The API and the research worker each connect as their own role.
+both_roles() {
+  for _ in $(seq 1 60); do
+    [ "$(sessions)" = "qs_app,qs_research_worker" ] && return 0
+    sleep 2
+  done
+  echo "sessions: $(sessions)"
+  return 1
+}
 
 echo "::group::Image, TLS certificate and a generated production environment"
 docker build -q -t quantumsentinel-web:production . > /dev/null
@@ -44,7 +53,8 @@ def token(): return secrets.token_urlsafe(32)
 settings = {
     "ENVIRONMENT": "production",
     "POSTGRES_PASSWORD": token(), "REDIS_PASSWORD": token(),
-    "DB_APP_PASSWORD": token(), "DB_MIGRATOR_PASSWORD": token(), "DB_BACKUP_PASSWORD": token(),
+    "DB_APP_PASSWORD": token(), "DB_RESEARCH_WORKER_PASSWORD": token(),
+    "DB_MIGRATOR_PASSWORD": token(), "DB_BACKUP_PASSWORD": token(),
     "REDIS_URL": "redis://:REPLACED_BY_COMPOSE@redis:6379/0",
     "REFRESH_TOKEN_SECRET": token(), "CSRF_SECRET": token(),
     "JWT_PRIVATE_KEY": pem(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
@@ -75,6 +85,8 @@ old = yaml.safe_load(open("/w/compose.205de7b.yml"))
 new = yaml.safe_load(open("/repo/docker-compose.production.yml"))
 for name in ("postgres", "redis", "nginx"):
     old["services"][name] = new["services"][name]
+old["services"]["quantumsentinel"]["networks"] = new["services"]["quantumsentinel"]["networks"]
+old["networks"] = new["networks"]
 with open("/w/compose.superuser.yml", "w") as out:
     yaml.safe_dump(old, out, sort_keys=False)
 EOF
@@ -111,12 +123,12 @@ ready
 echo "::endgroup::"
 
 echo "::group::D. checks"
+both_roles
 echo "sessions: $(sessions)"
-test "$(sessions)" = "qs_app"
 test "$("${NEW[@]}" ps -a --format '{{.ExitCode}}' migrate)" = "0"
 "${NEW[@]}" logs migrate 2>&1 | tail -1
 superuser_password=$(grep '^POSTGRES_PASSWORD=' .env.production | cut -d= -f2-)
-for service in quantumsentinel migrate; do
+for service in quantumsentinel research-worker migrate; do
   if "${NEW[@]}" run --rm --no-deps --entrypoint env "$service" | grep -qF "$superuser_password"; then
     echo "$service holds the superuser password"; exit 1
   fi
@@ -124,8 +136,43 @@ done
 if "${NEW[@]}" exec -T quantumsentinel env | grep -qF "$superuser_password"; then
   echo "the running API holds the superuser password"; exit 1
 fi
-echo "the API and migrate containers do not hold the superuser password"
+echo "the API, research-worker and migrate containers do not hold the superuser password"
 python3 .github/scripts/compose_smoke.py verify era-a@example.com
+# The jobs ran in the research-worker container: worker ids start with its hostname.
+worker_host=$("${NEW[@]}" exec -T research-worker python -c "import socket; print(socket.gethostname())" | tr -d '\r')
+ran_on=$("${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -Atc \
+  "SELECT string_agg(DISTINCT split_part(worker_id, ':', 1), ',') FROM research_jobs WHERE status = 'succeeded'")
+echo "research jobs ran on: $ran_on (research-worker container: $worker_host)"
+test "$ran_on" = "$worker_host"
+# Networks: nginx cannot resolve the database; the database has no route out;
+# the API and the research worker reach the internet (market data). Each
+# negative check has a positive control with the same busybox wget, so a
+# missing tool or a TLS problem cannot pass for isolation.
+fetch() {  # service url [wget options]: prints wget's own words, returns its exit code
+  "${NEW[@]}" exec -T "$1" wget -q -T 5 -O /dev/null "${@:3}" "$2" 2>&1 | tr -d '\r'
+  return "${PIPESTATUS[0]}"
+}
+"${NEW[@]}" exec -T nginx nginx -v 2>&1 | tr -d '\r'  # deploy/nginx.conf's `resolve` needs 1.27.3+
+# The API answers only the hosts in ALLOWED_HOSTS (400 otherwise).
+fetch nginx http://quantumsentinel:8000/health/ready --header "Host: localhost"
+echo "nginx reaches the API"
+if out=$(fetch nginx http://postgres:5432); then
+  echo "nginx reached postgres"; exit 1
+fi
+echo "nginx -> postgres: $out"
+case "$out" in *"bad address"*) echo "nginx cannot resolve postgres" ;; *) exit 1 ;; esac
+fetch nginx http://example.com
+echo "nginx reaches the internet"
+if out=$(fetch postgres http://example.com); then
+  echo "postgres reached the internet"; exit 1
+fi
+echo "postgres -> internet: $out"
+echo "postgres has no route to the internet"
+for service in quantumsentinel research-worker; do
+  "${NEW[@]}" exec -T "$service" python -c \
+    "import urllib.request; urllib.request.urlopen('https://example.com', timeout=15)"
+  echo "$service reaches the internet"
+done
 echo "::endgroup::"
 
 echo "::group::E. backup as qs_backup"
@@ -141,10 +188,10 @@ test "$tables" -ge 21
 test "$owners" = "qs_owner "
 echo "::endgroup::"
 
-echo "::group::F. the API restarts as qs_app"
-"${NEW[@]}" restart quantumsentinel
+echo "::group::F. the API and the research worker restart as their own roles"
+"${NEW[@]}" restart quantumsentinel research-worker
 ready
-test "$(sessions)" = "qs_app"
+both_roles
 echo "::endgroup::"
 
 echo "::group::G. a fresh install, as the README deploys it"
@@ -152,7 +199,7 @@ echo "::group::G. a fresh install, as the README deploys it"
 "${NEW[@]}" --profile provision run --rm provision
 "${NEW[@]}" up -d
 ready
-test "$(sessions)" = "qs_app"
+both_roles
 python3 .github/scripts/compose_smoke.py seed fresh@example.com
 echo "::endgroup::"
 echo "cutover verified"

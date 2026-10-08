@@ -56,7 +56,7 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
                      COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
                      REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT, OPERATOR_ROLES,
                      PAPER_MAX_POSITION_FRACTION, ORDER_SWEEPER_ENABLED, ORDER_SWEEP_INTERVAL_SECONDS,
-                     RESEARCH_WORKER_MODE)
+                     RESEARCH_WORKER_MODE, PROCESS_ROLE)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, integration_service, order_security
 from .services import paper_broker, research_jobs, research_trials
@@ -65,6 +65,11 @@ from .services import stat_tests as stat_tests_service
 from .services import redis_store
 
 log = logging.getLogger(__name__)
+
+# A research process's settings pass production's startup checks without the
+# API's secrets (backend/config.py), so the API must never run under one.
+if PROCESS_ROLE != "api":
+    raise RuntimeError(f"the API cannot run as QS_PROCESS_ROLE={PROCESS_ROLE}")
 
 # Single source of truth for the product version reported by /api/meta,
 # the OpenAPI schema and the compliance evidence bundle.

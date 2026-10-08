@@ -763,6 +763,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | Variable | Required | Description |
 |---|---|---|
 | `ENVIRONMENT` | No | `development` (default) or `production` |
+| `QS_PROCESS_ROLE` | No | Which process this is: `api` (default), `research-worker` or `research-job`. In production the API requires every secret below; a research worker only `DATABASE_URL`, the `SERVER_DSA_*` key and the PQC provider; a job process nothing. A worker starts its job processes as `research-job` with only the platform's variables (paths, locale, proxies, CA bundles, thread counts) and `ENVIRONMENT`. The API refuses to run under another role, and a worker refuses `research-job` |
 | `DATABASE_URL` | Prod | PostgreSQL URL (`postgresql+psycopg://user:password@host:5432/db`; `postgresql://` and `postgres://` are accepted). Any other database is refused at startup. Default: the `docker-compose.yml` dev database |
 | `DB_POOL_SIZE` | No | Connections each process keeps open (default 20) |
 | `DB_MAX_OVERFLOW` | No | Extra connections a process may open for bursts; they are closed when returned, so steady load should fit in `DB_POOL_SIZE` (default 0) |
@@ -838,6 +839,7 @@ Running `provision-roles` again restores the intended role attributes, membershi
 
 - The API connects as `qs_app` and runs no research itself (`RESEARCH_WORKER_MODE=external`).
 - The `research-worker` service runs research jobs as `qs_research_worker`, limited to 1 CPU and 1 GB. Run more with `--scale research-worker=N`.
+- The worker holds only the secrets it uses (`QS_PROCESS_ROLE=research-worker`): its database URL and the server signing key. The API's other secrets, and their `*_FILE` forms, are blanked for it. Its job processes start with no secret at all.
 - A one-off `migrate` service applies migrations as `qs_migrator`; the API and the worker start only once it has succeeded.
 - The `backup` service dumps as `qs_backup`.
 - A `provision` service, under its own profile, runs `provision-roles` as the superuser.
@@ -855,10 +857,11 @@ The first command runs while the API keeps serving. The second replaces the API 
 
 A deployment that already runs on these roles, provisioned before `qs_research_worker` existed, takes the same two commands after `DB_RESEARCH_WORKER_PASSWORD` is added. Without that variable Compose refuses to start; with it but before `provision`, the `research-worker` service cannot log in. It retries every 2 s (`database not reachable yet` in its log), so research jobs wait in the queue and start once `provision` has run.
 
-The CI job `deploy-compose` checks this end to end on every push. It deploys the stack with Docker and writes data as the superuser. It then provisions while the API runs and brings the stack up again. It checks five things:
+The CI job `deploy-compose` checks this end to end on every push. It deploys the stack with Docker and writes data as the superuser. It then provisions while the API runs and brings the stack up again. It checks six things:
 
 - only `qs_app` and `qs_research_worker` sessions reach the database, and none of the API, the worker and `migrate` holds the superuser password;
 - the earlier data is intact, and research jobs run in the `research-worker` container;
+- the worker holds none of the API's secrets, and its live job process has no database URL or key in its environment;
 - nginx cannot resolve `postgres`, and `postgres` cannot reach the internet, while the API and the worker can;
 - the backup is a full dump made as `qs_backup`;
 - the API and the worker restart as their own roles.

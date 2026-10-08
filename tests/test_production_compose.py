@@ -18,6 +18,9 @@ ROOT = Path(__file__).resolve().parent.parent
 COMPOSE = ROOT / "docker-compose.production.yml"
 PASSWORDS = ("POSTGRES_PASSWORD", "DB_APP_PASSWORD", "DB_RESEARCH_WORKER_PASSWORD", "DB_MIGRATOR_PASSWORD",
              "DB_BACKUP_PASSWORD")
+# Secrets only the API uses (backend/config.py); a research worker holds none.
+API_SECRETS = ("JWT_PRIVATE_KEY", "JWT_PUBLIC_KEY", "WEBHOOK_ENCRYPTION_KEY", "PRIVATE_KEY_ENCRYPTION_KEY",
+               "REFRESH_TOKEN_SECRET", "CSRF_SECRET", "REDIS_URL")
 # The services allowed to receive each password.
 HOLDERS = {
     "POSTGRES_PASSWORD": {"postgres", "provision"},
@@ -91,6 +94,15 @@ def test_research_runs_in_its_own_service(services):
     assert services["research-worker"]["depends_on"]["migrate"] == {"condition": "service_completed_successfully"}
 
 
+def test_the_research_worker_holds_none_of_the_apis_secrets(services):
+    environment = services["research-worker"]["environment"]
+    assert environment["QS_PROCESS_ROLE"] == "research-worker"
+    for name in (*API_SECRETS, "REDIS_PASSWORD"):
+        assert environment.get(name) == "", name
+    for name in API_SECRETS:
+        assert environment.get(f"{name}_FILE") == "", name
+
+
 def test_the_database_has_no_route_out_and_no_route_from_nginx():
     compose = yaml.safe_load(COMPOSE.read_text())
     services = compose["services"]
@@ -132,7 +144,8 @@ def test_resolved_configuration_confines_each_password(tmp_path):
     merging, overrides), with an env file that holds every password."""
     marks = {password: f"mark{index}{password.lower()}" for index, password in enumerate(PASSWORDS)}
     env = tmp_path / "env"
-    env.write_text("".join(f"{key}={value}\n" for key, value in marks.items())
+    api_marks = {name: f"apimark{index}" for index, name in enumerate(API_SECRETS)}
+    env.write_text("".join(f"{key}={value}\n" for key, value in {**marks, **api_marks}.items())
                    + "REDIS_PASSWORD=markredis\n"
                    + f"DATABASE_URL=postgresql+psycopg://quantumsentinel:{marks['POSTGRES_PASSWORD']}"
                      "@postgres:5432/quantumsentinel\n")
@@ -148,5 +161,9 @@ def test_resolved_configuration_confines_each_password(tmp_path):
         held = {password for password, mark in marks.items() if mark in text}
         allowed = {password for password, holders in HOLDERS.items() if name in holders}
         assert held <= allowed, (name, held - allowed)
+        if name == "research-worker":
+            assert "apimark" not in text and "markredis" not in text
+        if name == "quantumsentinel":  # the env file does reach the services that load it
+            assert all(api_marks[secret] in text for secret in API_SECRETS if secret != "REDIS_URL")
         seen.add(name)
-    assert {"quantumsentinel", "migrate", "provision", "backup"} <= seen
+    assert {"quantumsentinel", "research-worker", "migrate", "provision", "backup"} <= seen

@@ -15,6 +15,13 @@ def _setting(name: str, default: str | None = None) -> str | None:
 
 
 ENVIRONMENT = _setting("ENVIRONMENT", "development").lower()
+# Which process this is. In production each requires only the secrets it
+# uses: the API all of them; a research worker its database URL and the
+# server signing key; a research job process none, and its worker starts it
+# with none (backend/worker.py).
+PROCESS_ROLE = _setting("QS_PROCESS_ROLE", "api")
+if PROCESS_ROLE not in ("api", "research-worker", "research-job"):
+    raise RuntimeError("QS_PROCESS_ROLE must be one of: api, research-worker, research-job")
 JWT_ALGORITHM = "RS256"
 _jwt_private_pem = _setting("JWT_PRIVATE_KEY")
 _jwt_public_pem = _setting("JWT_PUBLIC_KEY")
@@ -156,7 +163,15 @@ ALLOWED_HOSTS = [host.strip() for host in os.getenv(
     "ALLOWED_HOSTS", "localhost,127.0.0.1,testserver"
 ).split(",") if host.strip()]
 
-if ENVIRONMENT == "production":
+if ENVIRONMENT == "production" and PROCESS_ROLE != "research-job":
+    # The API and research workers: both sign audit events and use the database.
+    if not SERVER_DSA_PRIVATE_KEY or not SERVER_DSA_PUBLIC_KEY:
+        raise RuntimeError("SERVER_DSA_PRIVATE_KEY and SERVER_DSA_PUBLIC_KEY are required in production")
+    if not _setting("DATABASE_URL"):
+        raise RuntimeError("DATABASE_URL is required in production")
+    if PQC_PROVIDER == "reference" or not PQC_PROVIDER_URL:
+        raise RuntimeError("Production requires a configured external liboqs/HSM PQC provider")
+if ENVIRONMENT == "production" and PROCESS_ROLE == "api":
     if not _jwt_private_pem or not _jwt_public_pem:
         raise RuntimeError("JWT_PRIVATE_KEY and JWT_PUBLIC_KEY are required in production")
     if "*" in CORS_ORIGINS:
@@ -165,14 +180,8 @@ if ENVIRONMENT == "production":
         raise RuntimeError("WEBHOOK_ENCRYPTION_KEY is required in production")
     if not PRIVATE_KEY_ENCRYPTION_KEY:
         raise RuntimeError("PRIVATE_KEY_ENCRYPTION_KEY is required in production")
-    if not SERVER_DSA_PRIVATE_KEY or not SERVER_DSA_PUBLIC_KEY:
-        raise RuntimeError("SERVER_DSA_PRIVATE_KEY and SERVER_DSA_PUBLIC_KEY are required in production")
-    if not _setting("DATABASE_URL"):
-        raise RuntimeError("DATABASE_URL is required in production")
     if not REDIS_URL:
         raise RuntimeError("REDIS_URL is required in production")
-    if PQC_PROVIDER == "reference" or not PQC_PROVIDER_URL:
-        raise RuntimeError("Production requires a configured external liboqs/HSM PQC provider")
     if not _setting("REFRESH_TOKEN_SECRET"):
         raise RuntimeError("REFRESH_TOKEN_SECRET is required in production")
     if not _setting("CSRF_SECRET"):

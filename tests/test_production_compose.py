@@ -69,6 +69,18 @@ def test_the_api_starts_only_after_migrations_succeed(services):
     assert services["provision"]["command"][-1] == "provision-roles"
 
 
+def test_every_service_can_start_with_every_capability_dropped(services):
+    """Started as root, the postgres and redis entrypoints chown their data and
+    switch user, which needs CHOWN, SETUID and SETGID; without them neither
+    starts. They run as their images' own users instead. nginx's root master
+    hands its temp directories and workers to the nginx user."""
+    for name, service in services.items():
+        assert service.get("cap_drop") == ["ALL"], name
+    assert services["postgres"]["user"] == "postgres"
+    assert services["redis"]["user"] == "redis"
+    assert set(services["nginx"]["cap_add"]) == {"NET_BIND_SERVICE", "CHOWN", "SETUID", "SETGID"}
+
+
 def test_external_research_workers_need_a_worker_service(services):
     """With RESEARCH_WORKER_MODE=external the API starts no worker, so research
     jobs are accepted and never run unless some service runs backend.worker."""

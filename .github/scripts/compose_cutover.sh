@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploys docker-compose.production.yml for real and moves it off the bootstrap
 # superuser onto the least-privilege roles, the way an operator would:
-#   A. the superuser-era stack (the compose file as of 205de7b), with data in it
+#   A. the superuser-era stack (the API wired as in 205de7b's compose file), with data in it
 #   B. `up` with the current file before provisioning: migrate cannot log in
 #   C. provision (while the API runs), then `up`: migrate as qs_migrator, API as qs_app
 #   D. who is connected, what the API's environment holds, data from era A, research jobs
@@ -10,7 +10,6 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-git show 205de7b:docker-compose.production.yml > "$RUNNER_TEMP/compose.superuser.yml"
 OLD=(docker compose -p qsci -f "$RUNNER_TEMP/compose.superuser.yml" --project-directory . --env-file .env.production)
 NEW=(docker compose -p qsci -f docker-compose.production.yml --env-file .env.production)
 
@@ -63,6 +62,21 @@ print("\n".join(f"{name}={value}" for name, value in settings.items()))
 EOF
 docker run --rm quantumsentinel-web:production python -m backend.manage generate-server-key \
   | grep -E '^(SERVER_DSA_|TRUSTED_SERVER_DSA_)' >> .env.production
+# The superuser-era deployment: the API wired as in 205de7b, and postgres,
+# redis and nginx as they are now. 205de7b's own versions of those three
+# cannot start: with every capability dropped, postgres and redis fail to
+# switch to their unprivileged users.
+git show 205de7b:docker-compose.production.yml > "$RUNNER_TEMP/compose.205de7b.yml"
+docker run --rm -i --user "$(id -u)" -v "$RUNNER_TEMP:/w" -v "$PWD:/repo:ro" \
+  quantumsentinel-web:production python - <<'EOF'
+import yaml
+old = yaml.safe_load(open("/w/compose.205de7b.yml"))
+new = yaml.safe_load(open("/repo/docker-compose.production.yml"))
+for name in ("postgres", "redis", "nginx"):
+    old["services"][name] = new["services"][name]
+with open("/w/compose.superuser.yml", "w") as out:
+    yaml.safe_dump(old, out, sort_keys=False)
+EOF
 echo "::endgroup::"
 
 echo "::group::A. the superuser-era stack"

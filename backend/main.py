@@ -51,7 +51,7 @@ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_
 import redis.asyncio as redis
 
 from . import models, schemas
-from .database import engine, get_db, init_db, SessionLocal
+from .database import engine, get_db, get_transactional_db, init_db, SessionLocal
 from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EXPIRE_SECONDS,
                      COOKIE_DOMAIN, COOKIE_SECURE, COOKIE_SAMESITE,
                      REFRESH_TOKEN_SECONDS, TRUSTED_SERVER_DSA_FINGERPRINT, OPERATOR_ROLES,
@@ -2444,11 +2444,13 @@ def compliance_report(user: models.User = Depends(get_current_user), db: Session
 
 
 @app.get("/api/security/audit-chain")
-def audit_chain(user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
-                full: bool = False):
+def audit_chain(user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_transactional_db), full: bool = False):
     """Verify the tamper-evident audit chain (operators only: it spans every
     user's events). By default only links added since this worker last
-    verified the chain are checked; ``?full=true`` checks every link."""
+    verified the chain are checked; ``?full=true`` checks every link. The
+    links are streamed through a server-side cursor, which needs the
+    transaction a GET request's session does not have."""
     if not _is_admin(user):
         raise HTTPException(403, "Operator role required")
     status = security_service.audit_chain_status(db, full=full)

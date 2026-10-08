@@ -70,8 +70,11 @@ Base = declarative_base()
 # inside a transaction too. What autocommit loses is multi-statement
 # atomicity and row locks held to commit, so a GET handler must not write
 # more than one statement or lock rows (writing one row, as opening a paper
-# account on first view does, stays atomic). Same pool: the isolation level
-# is set on checkout and restored on return, without a round trip.
+# account on first view does, stays atomic), nor stream rows through a
+# server-side cursor (yield_per), which PostgreSQL opens only inside a
+# transaction: such a handler takes get_transactional_db. Same pool: the
+# isolation level is set on checkout and restored on return, without a
+# round trip.
 _ReadSession = sessionmaker(autocommit=False, autoflush=False,
                             bind=engine.execution_options(isolation_level="AUTOCOMMIT"))
 _READ_METHODS = frozenset({"GET", "HEAD"})
@@ -79,6 +82,15 @@ _READ_METHODS = frozenset({"GET", "HEAD"})
 
 def get_db(request: Request):
     db = (_ReadSession if request.method in _READ_METHODS else SessionLocal)()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_transactional_db():
+    """A session that runs in a transaction whatever the request method."""
+    db = SessionLocal()
     try:
         yield db
     finally:

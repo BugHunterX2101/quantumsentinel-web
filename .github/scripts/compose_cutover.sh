@@ -145,15 +145,26 @@ ran_on=$("${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel
 echo "research jobs ran on: $ran_on (research-worker container: $worker_host)"
 test "$ran_on" = "$worker_host"
 # Networks: nginx cannot resolve the database; the database has no route out;
-# the API and the research worker reach the internet (market data).
-if "${NEW[@]}" exec -T nginx sh -c 'wget -q -T 3 -O /dev/null http://postgres:5432' 2>&1 | grep -q 'bad address'; then
-  echo "nginx cannot resolve postgres"
-else
-  echo "nginx can reach postgres"; exit 1
+# the API and the research worker reach the internet (market data). Each
+# negative check has a positive control with the same busybox wget, so a
+# missing tool or a TLS problem cannot pass for isolation.
+fetch() {  # service url: prints wget's own words, returns its exit code
+  "${NEW[@]}" exec -T "$1" wget -q -T 5 -O /dev/null "$2" 2>&1 | tr -d '\r'
+  return "${PIPESTATUS[0]}"
+}
+fetch nginx http://quantumsentinel:8000/health/ready
+echo "nginx reaches the API"
+if out=$(fetch nginx http://postgres:5432); then
+  echo "nginx reached postgres"; exit 1
 fi
-if "${NEW[@]}" exec -T postgres sh -c 'wget -q -T 5 -O /dev/null https://example.com' > /dev/null 2>&1; then
+echo "nginx -> postgres: $out"
+case "$out" in *"bad address"*) echo "nginx cannot resolve postgres" ;; *) exit 1 ;; esac
+fetch nginx http://example.com
+echo "nginx reaches the internet"
+if out=$(fetch postgres http://example.com); then
   echo "postgres reached the internet"; exit 1
 fi
+echo "postgres -> internet: $out"
 echo "postgres has no route to the internet"
 for service in quantumsentinel research-worker; do
   "${NEW[@]}" exec -T "$service" python -c \

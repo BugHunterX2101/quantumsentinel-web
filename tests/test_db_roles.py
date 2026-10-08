@@ -5,6 +5,7 @@ prefix, on a schema of its own, and drops them when it ends. The privilege
 checks read the catalog for every table in the schema, so a table nobody
 thought about fails them instead of slipping through.
 """
+import json
 import logging
 import secrets
 import threading
@@ -18,10 +19,10 @@ from psycopg import errors
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
-from backend import db_roles, manage, models, worker
+from backend import db_roles, main, manage, models, schemas, worker
 from backend.database import (Base, _alembic_config, _configure_session, current_revision,
                               head_revision, migrate)
-from backend.services import research_jobs, security_service
+from backend.services import backtest_service, research_jobs, security_service
 from conftest import _admin, _libpq, schema_url
 from research_job_helpers import InlineJobProcess
 
@@ -113,6 +114,8 @@ def assert_exactly_provisioned(c: Cluster) -> None:
     assert set(tables) == set(db_roles.APP_TABLE_PRIVILEGES)
     assert table_privileges(su, c.schema, roles.app) == {
         name: set(privileges) for name, privileges in db_roles.APP_TABLE_PRIVILEGES.items()}
+    assert table_privileges(su, c.schema, roles.research_worker) == {
+        name: set(db_roles.WORKER_TABLE_PRIVILEGES.get(name, ())) for name in tables}
     assert table_privileges(su, c.schema, roles.backup) == {name: {"SELECT"} for name in tables}
     for role in (roles.migrator, "public"):
         assert table_privileges(su, c.schema, role) == {name: set() for name in tables}, role
@@ -120,7 +123,8 @@ def assert_exactly_provisioned(c: Cluster) -> None:
         "SELECT has_schema_privilege(%s, %s, 'USAGE'), has_schema_privilege(%s, %s, 'CREATE')",
         (role, c.schema, role, c.schema)).fetchone()) for role in (*roles.logins, "public")}
     assert schema_privileges == {roles.migrator: (True, False), roles.app: (True, False),
-                                 roles.backup: (True, False), "public": (False, False)}
+                                 roles.research_worker: (True, False), roles.backup: (True, False),
+                                 "public": (False, False)}
     assert su.execute(
         "SELECT count(*) FROM pg_class c WHERE c.relnamespace = %s::regnamespace"
         " AND c.relowner <> %s::regrole", (c.schema, roles.owner)).fetchone()[0] == 0
@@ -131,7 +135,8 @@ def assert_exactly_provisioned(c: Cluster) -> None:
         " rolcanlogin, rolinherit FROM pg_roles WHERE rolname = ANY(%s)",
         ([roles.owner, *roles.logins],))}
     assert attributes == {roles.owner: (False, False, False), roles.migrator: (False, True, False),
-                          roles.app: (False, True, True), roles.backup: (False, True, True)}
+                          roles.app: (False, True, True), roles.research_worker: (False, True, True),
+                          roles.backup: (False, True, True)}
     names = [roles.owner, *roles.logins]
     memberships = su.execute(
         "SELECT m.member::regrole::text, m.roleid::regrole::text FROM pg_auth_members m"
@@ -211,6 +216,81 @@ def test_the_application_runs_as_the_app_role(provisioned, monkeypatch):
         status = security_service.audit_chain_status(db, full=True)
         assert status["valid"] and status["links"] == 2, status
         assert research_jobs.purge_finished(db, retention_days=0) == 1
+
+
+# Tables with users' identities, money, orders and credentials.
+TRADING_AND_IDENTITY = {"users", "paper_accounts", "positions", "trades", "api_keys", "key_pairs",
+                        "refresh_tokens", "webhooks", "idempotency_records", "order_security_records"}
+
+
+def test_the_worker_allow_list_is_a_subset_that_leaves_out_trading_and_identity():
+    for table, privileges in db_roles.WORKER_TABLE_PRIVILEGES.items():
+        assert set(privileges) <= set(db_roles.APP_TABLE_PRIVILEGES[table]), table
+    assert not set(db_roles.WORKER_TABLE_PRIVILEGES) & TRADING_AND_IDENTITY
+
+
+def test_the_research_worker_runs_every_kind_of_job_as_its_own_role(provisioned, monkeypatch):
+    """The API, as qs_app, queues jobs; a worker connected as
+    qs_research_worker runs them: an experiment's run, validation and replay
+    (their finalizers lock and update the experiment), the dashboard backtest
+    (its history row and trial ledger) and a stat-test on that backtest, each
+    finished with a signed audit event, plus the worker's own housekeeping."""
+    returns = [0.001 * ((i % 7) - 3) for i in range(60)]
+    monkeypatch.setattr(backtest_service, "run_moving_average_backtest", lambda *a: {
+        "initial_capital": 100_000.0, "final_capital": 101_500.0, "total_return": 0.015,
+        "sharpe_ratio": 1.25, "max_drawdown": -0.04, "win_rate": 0.5, "total_trades": 6,
+        "daily_returns_net": returns})
+    roles = provisioned.roles
+    api = sessionmaker(bind=provisioned.engine_as(roles.app))()
+    worker_sessions = sessionmaker(bind=provisioned.engine_as(roles.research_worker))
+    with worker_sessions() as db:
+        assert db.execute(text("SELECT current_user")).scalar() == roles.research_worker
+        assert security_service.server_identity.register_in_db(db)
+    user = models.User(email="worker-role@example.com", password_hash="x", role="user")
+    api.add(user)
+    api.commit()
+    runner = worker.Worker(job_process=InlineJobProcess(), session_factory=worker_sessions,
+                           lease_seconds=60, timeout_seconds=300, poll_seconds=0.1)
+
+    def run(response):
+        job_id = json.loads(response.body)["job_id"]
+        assert runner.run_once() is True
+        api.expire_all()
+        view = research_jobs.view(api, api.get(models.ResearchJob, job_id))
+        assert view["status"] == "succeeded", view
+        return view["result"]
+
+    bars = [{"timestamp": 1_700_000_000 + i * 86400, "open": 100 + 0.5 * i, "high": 102 + 0.5 * i,
+             "low": 99 + 0.5 * i, "close": 100.5 + 0.5 * i, "volume": 200_000} for i in range(6)]
+    experiment = main.experiment_create({
+        "strategy_id": "obi_momentum", "strategy_version": "1.0", "dataset_id": "roles", "dataset": bars,
+        "parameters": {"obi_threshold": 0.2, "events_per_bar": 120, "warmup_events": 30,
+                       "latency_preset": "cloud"}, "random_seed": 11}, user, api)["experiment_id"]
+    run(main.experiment_run(experiment, user, api))
+    run(main.experiment_validate(experiment, user, api))
+    assert run(main.experiment_replay(experiment, {}, user, api))["result_reproduced"] is True
+    backtest = run(main.run_backtest(schemas.BacktestRequest(asset="aapl"), user=user, db=api))
+    assert backtest["trials_in_family"] == 1
+    run(main.statistical_tests(schemas.StatTestRequest(backtest_id=backtest["id"]), user, api))
+    status = security_service.audit_chain_status(api, full=True)
+    assert status["valid"] and status["links"] >= 5, status
+    with worker_sessions() as db:
+        assert research_jobs.purge_finished(db, retention_days=0) == 5
+    api.close()
+
+
+def test_the_research_worker_cannot_reach_trading_or_identity(provisioned):
+    roles = provisioned.roles
+    research_worker = provisioned.connect(roles.research_worker)
+    for table in sorted(set(db_roles.APP_TABLE_PRIVILEGES) - set(db_roles.WORKER_TABLE_PRIVILEGES)):
+        with pytest.raises(errors.InsufficientPrivilege):
+            research_worker.execute(f'SELECT 1 FROM "{table}" LIMIT 1')
+    for statement in ("UPDATE audit_logs SET action = 'x'", "DELETE FROM audit_chain_links",
+                      "INSERT INTO research_jobs (id) VALUES ('x')", "UPDATE backtests SET result_json = NULL",
+                      "DELETE FROM research_trials", "DELETE FROM server_signing_keys",
+                      *(s.format(app=roles.research_worker, owner=roles.owner) for s in REFUSED)):
+        with pytest.raises(errors.InsufficientPrivilege):
+            research_worker.execute(statement)
 
 
 def test_the_backup_role_reads_everything_and_writes_nothing(provisioned):
@@ -453,6 +533,7 @@ def test_passwords_reach_the_server_only_as_scram_verifiers(cluster):
 
 def test_the_provision_roles_command(cluster, monkeypatch, capsys):
     settings = {cluster.roles.migrator: "DB_MIGRATOR_PASSWORD", cluster.roles.app: "DB_APP_PASSWORD",
+                cluster.roles.research_worker: "DB_RESEARCH_WORKER_PASSWORD",
                 cluster.roles.backup: "DB_BACKUP_PASSWORD"}
     for role, name in settings.items():
         monkeypatch.setenv(name, cluster.passwords[role])

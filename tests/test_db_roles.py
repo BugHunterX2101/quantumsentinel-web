@@ -373,13 +373,15 @@ def test_provisioning_cannot_deadlock_with_the_order_path(cluster):
 
 def test_provisioning_never_keeps_a_queue_waiting_long_enough_to_look_for_deadlocks(cluster):
     """A free-standing sequence cannot be LOCKed in advance, so taking it can
-    still wait; the wait must end before a session queued behind provisioning
-    reaches PostgreSQL's deadlock check (1 s), or that session is the one
-    aborted."""
+    still wait, while the attempt holds its table locks. That wait must end
+    before a session queued behind provisioning reaches PostgreSQL's deadlock
+    check (1 s), or that session is the one aborted; and it must stay short,
+    or every query on every table stalls behind it."""
     cluster.connect().execute("CREATE SEQUENCE free_standing")
     session = _hold(cluster, "SELECT nextval('free_standing')")
     thread, outcome = _provision_in_background(cluster)
     time.sleep(0.5)
+    assert _finishes_promptly(cluster.connect(), "SELECT count(*) FROM users") < 0.5  # a bystander
     assert _finishes_promptly(session, "SELECT count(*) FROM users") < 0.9
     session.commit()
     thread.join(30)

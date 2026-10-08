@@ -1,2 +1,4 @@
 # Vendored third-party files are pinned by hash: never convert their line endings.
 frontend/vendor/** -text
+# Shell scripts run on Linux, where a carriage return breaks every line.
+*.sh text eol=lf

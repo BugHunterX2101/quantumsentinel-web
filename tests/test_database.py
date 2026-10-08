@@ -296,6 +296,33 @@ def test_the_readiness_probe_answers_from_the_database():
     assert response.status_code == 200 and response.json()["database"] == "ok"
 
 
+@pytest.mark.parametrize("query", ["", "?full=true"])
+def test_operators_can_verify_the_audit_chain_over_http(query):
+    """The check streams links through a server-side cursor, which PostgreSQL
+    opens only inside a transaction. On a GET request's autocommit session
+    every call answered 500 ("DECLARE CURSOR can only be used in transaction
+    blocks"); it must run in a transaction of its own."""
+    import uuid
+
+    from starlette.testclient import TestClient
+
+    from backend import main
+    from backend.services import auth_service
+
+    database.init_db()  # as the app does at startup
+    with database.SessionLocal() as db:
+        operator = models.User(email=f"op_{uuid.uuid4().hex[:8]}@example.com", password_hash="x",
+                               role="admin")
+        db.add(operator)
+        db.commit()
+        security_service.write_audit_log(db, operator.id, "EVENT", metadata={"n": 1})
+        token = auth_service.create_access_token(operator.id, "free")
+    response = TestClient(main.app).get("/api/security/audit-chain" + query,
+                                        headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200, response.text
+    assert response.json()["links"] >= 1 and "valid" in response.json()
+
+
 @pytest.mark.parametrize("url, expected", [
     ("postgresql://u:p@db:5432/qs", "postgresql+psycopg://u:p@db:5432/qs"),
     ("postgres://u:p@db/qs", "postgresql+psycopg://u:p@db/qs"),

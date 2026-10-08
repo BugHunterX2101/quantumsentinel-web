@@ -745,6 +745,7 @@ Research runs as background jobs, never inside the request. The dashboard backte
 - [ ] Configure `WEBHOOK_ENCRYPTION_KEY` and `PRIVATE_KEY_ENCRYPTION_KEY` (Fernet)
 - [ ] Replace `reference` PQC backend with a reviewed liboqs/HSM adapter
 - [ ] Enable PostgreSQL with encrypted connections
+- [ ] Connect the application as `qs_app`, never as the PostgreSQL superuser: run `python -m backend.manage provision-roles` once (see [Database roles](#database-roles))
 - [ ] Size connection pools: (API processes + research workers) × (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`) must stay below PostgreSQL's `max_connections`
 - [ ] Configure Redis with AUTH password and AOF persistence
 - [ ] Set strict `CORS_ORIGINS` and `ALLOWED_HOSTS` — no wildcards in production
@@ -770,6 +771,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `DB_LOCK_TIMEOUT_MS` | No | Server-side limit on waiting for a lock (default 10000) |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | No | A session idle inside an open transaction is ended after this long (default 60000) |
 | `DB_MIGRATE_ON_STARTUP` | No | `true` (default): API processes apply pending migrations at startup, serialised by a database lock; `false`: run `python -m backend.manage migrate` as a release step |
+| `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD`, `DB_BACKUP_PASSWORD` | `provision-roles` only | Passwords for `qs_app`, `qs_migrator` and `qs_backup`, read only by `python -m backend.manage provision-roles` (each also as `*_FILE`). Needed to create a role; given for an existing role, its password is changed |
 | `JWT_PRIVATE_KEY` | Prod | RS256 private key (PEM, `\n`-escaped) |
 | `JWT_PUBLIC_KEY` | Prod | RS256 public key (PEM, `\n`-escaped) |
 | `WEBHOOK_ENCRYPTION_KEY` | Prod | Fernet key for encrypting webhook signing secrets at rest |
@@ -806,6 +808,28 @@ PostgreSQL 16 or newer is the only supported database; any other `DATABASE_URL` 
 - **Connection budget.** Every API process and research worker has its own pool: keep (processes) × (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`) below the server's `max_connections` (100 by default), leaving room for maintenance sessions. The default of 20 per process fits four API processes plus their workers.
 - **Large tables.** The indexes added by migration `0002` are created `IF NOT EXISTS`; on a large `trades` or `audit_logs` table, build them first with `CREATE INDEX CONCURRENTLY` under the same names to avoid blocking writes during the upgrade.
 - **Connection poolers.** Each session is configured when it connects (UTC, statement/lock/idle timeouts) and the order sweeper uses a session-level advisory lock, so a PgBouncer in front of the database must use session pooling, not transaction pooling.
+
+### Database roles
+
+Connected as the superuser that the `postgres` image creates from `POSTGRES_USER`, the application bypasses every grant, row-level security policy and trigger, and any SQL it runs can drop the schema, read server files or run programs on the database host (`COPY ... TO PROGRAM`). [`backend/db_roles.py`](backend/db_roles.py) defines four roles instead:
+
+| Role | Login | Privileges |
+|---|---|---|
+| `qs_owner` | No | Owns the schema and every object in it |
+| `qs_migrator` | Yes | None of its own. Migrations run after `SET LOCAL ROLE qs_owner`, so everything they create is owned by `qs_owner` |
+| `qs_app` | Yes | The API and research workers: exactly the table privileges in `APP_TABLE_PRIVILEGES` (`SELECT` only on `alembic_version`). No DDL or `TRUNCATE`; it cannot change roles, ownership or triggers |
+| `qs_backup` | Yes | `pg_read_all_data`, for `pg_dump` |
+
+`APP_TABLE_PRIVILEGES` is an allow-list: a table it does not name gets no privilege, and the test suite fails until the table is listed. Grants are reapplied after every migration that changes the schema revision.
+
+To move a deployment over:
+
+1. As the superuser (`DATABASE_URL` naming it), with `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` set, run `python -m backend.manage provision-roles`. It migrates the schema to the latest revision first, then creates the roles and hands them the schema in one transaction. Only SCRAM verifiers reach the server, so no password appears in its logs. Each table changes owner under a brief exclusive lock; the command gives up after 10 s rather than queue behind a long transaction, and it is safe to run again.
+2. Point `DATABASE_URL` for the API and workers at `qs_app`. With `DB_MIGRATE_ON_STARTUP=true` they start normally while the schema is current, and refuse to start if a migration is pending.
+3. Run each release's migrations as `qs_migrator`: `DATABASE_URL=<qs_migrator URL> python -m backend.manage migrate`.
+4. Take backups as `qs_backup`: `pg_dump -U qs_backup`. A dump made this way records `qs_owner` as the owner of everything; create the roles before restoring it, or restore with `--no-owner`.
+
+Running `provision-roles` again restores the intended role attributes, memberships, ownership and grants and removes anything extra. On a schema that has not been provisioned, migrations run as whoever connects, as before.
 
 ### Measured capacity
 

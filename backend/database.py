@@ -113,10 +113,20 @@ def schema_is_current() -> bool:
     return current_revision() == head_revision()
 
 
-def migrate(target_engine=None) -> str:
-    """Upgrade the schema to the latest revision; returns that revision."""
+def migrate(target_engine=None, roles=None) -> str:
+    """Upgrade the schema to the latest revision; returns that revision.
+
+    Once ``manage provision-roles`` has handed the schema to the owner role
+    (backend/db_roles.py), migrations run as that role, so everything they
+    create has one owner, and the application role's grants are reapplied
+    afterwards. A role that cannot act as the owner, such as the
+    application's own, may call this only while the schema is current.
+    """
     from alembic import command
 
+    from . import db_roles
+
+    roles = roles or db_roles.ROLES
     with (target_engine or engine).begin() as connection:
         # A migration may build indexes on large tables: no statement limit.
         connection.execute(text("SET LOCAL statement_timeout = 0"))
@@ -126,9 +136,26 @@ def migrate(target_engine=None) -> str:
             if time.monotonic() > deadline:
                 raise RuntimeError("timed out waiting for another process's schema migration")
             time.sleep(0.5)
+        driver = connection.connection.driver_connection
+        provisioned = db_roles.owns_current_schema(driver, roles)
+        if provisioned:
+            if not db_roles.can_become(driver, roles.owner):
+                current, head = current_revision(connection), head_revision()
+                if current != head:
+                    user = connection.execute(text("SELECT current_user")).scalar()
+                    raise RuntimeError(
+                        f"database schema is at revision {current}, expected {head}, and {user} "
+                        f"cannot migrate it: run `python -m backend.manage migrate` as {roles.migrator}")
+                return current
+            db_roles.become(driver, roles.owner)
         before = current_revision(connection)
         command.upgrade(_alembic_config(connection), "head")
         after = current_revision(connection)
+        if provisioned and before != after:
+            unlisted = db_roles.apply_grants(driver, roles)
+            if unlisted:
+                log.warning("tables missing from db_roles.APP_TABLE_PRIVILEGES, so the application "
+                            "cannot use them: %s", ", ".join(unlisted))
     if before != after:
         log.info("database schema migrated from %s to %s", before or "empty", after)
     return after

@@ -6,6 +6,7 @@
     python -m backend.manage generate-server-key
     python -m backend.manage repair-positions
     python -m backend.manage verify-audit-chain
+    python -m backend.manage provision-roles
 
 Roles are granted only here — out of band, by someone with shell access to
 the deployment — never through the web API, so no self-registered account
@@ -22,6 +23,14 @@ concurrent-fill race that earlier releases had. ``verify-audit-chain`` checks
 every link of the audit chain and exits non-zero if any fails; schedule it,
 because the API's default check covers only links added since the worker's
 previous check.
+
+``provision-roles`` creates the least-privilege database roles
+(backend/db_roles.py) and hands the schema to them. Run it as the database
+superuser, with DATABASE_URL naming that superuser. A role that does not
+exist yet takes its password from DB_MIGRATOR_PASSWORD, DB_APP_PASSWORD or
+DB_BACKUP_PASSWORD (or the matching *_FILE setting); given for a role that
+exists, the password is changed. It is safe to run again: it repairs any
+drift from the intended privileges.
 """
 import argparse
 import sys
@@ -49,10 +58,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="rebuild the positions of users left with duplicate position rows")
     commands.add_parser("verify-audit-chain",
                         help="verify every link of the audit chain; exit 1 if any fails")
+    commands.add_parser("provision-roles",
+                        help="create the least-privilege database roles and hand them the schema "
+                             "(run as the database superuser)")
     args = parser.parse_args(argv)
 
     if args.command == "generate-server-key":
         return _generate_server_key()
+    if args.command == "provision-roles":
+        return _provision_roles()
     if args.command == "repair-positions":
         init_db()
         return _repair_positions(SessionLocal)
@@ -104,6 +118,41 @@ def _generate_server_key() -> int:
     print(f"SERVER_DSA_PUBLIC_KEY={pqc.b64(pk)}")
     print(f"SERVER_DSA_CREATED_AT={dt.datetime.now(dt.timezone.utc).isoformat()}")
     print(f"TRUSTED_SERVER_DSA_FINGERPRINT={hashlib.sha256(pk).hexdigest()}")
+    return 0
+
+
+def _provision_roles(target_engine=None, roles=None) -> int:
+    """Bring the schema to the latest revision, then provision the roles.
+
+    Prints what changed, never a password. Exits 1 if the schema has tables
+    the allow-list does not name: the application role cannot use them.
+    """
+    from . import db_roles
+    from .config import _setting
+    from .database import engine, migrate
+
+    roles = roles or db_roles.ROLES
+    target = target_engine or engine
+    migrate(target, roles)
+    passwords = {role: _setting(name) for role, name in (
+        (roles.migrator, "DB_MIGRATOR_PASSWORD"), (roles.app, "DB_APP_PASSWORD"),
+        (roles.backup, "DB_BACKUP_PASSWORD"))}
+    try:
+        with target.begin() as connection:
+            summary = db_roles.provision(connection.connection.driver_connection, roles,
+                                         {role: pw for role, pw in passwords.items() if pw})
+    except (PermissionError, ValueError, RuntimeError) as exc:
+        print(f"provision-roles: {exc}", file=sys.stderr)
+        return 1
+    print(f"schema {summary['schema']}: roles created: {', '.join(summary['created']) or 'none'}; "
+          f"objects given to {roles.owner}: {summary['ownership_moved']}; "
+          f"passwords set: {', '.join(role for role, pw in passwords.items() if pw) or 'none'}")
+    print(f"connect the application as {roles.app}, migrations as {roles.migrator}, "
+          f"backups as {roles.backup}")
+    if summary["unlisted"]:
+        print("tables missing from db_roles.APP_TABLE_PRIVILEGES, which the application cannot use: "
+              + ", ".join(summary["unlisted"]), file=sys.stderr)
+        return 1
     return 0
 
 

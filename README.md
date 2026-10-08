@@ -605,7 +605,7 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 
 ### Research Engine Endpoints
 
-Research runs as background jobs, never inside the request. The dashboard backtest (`POST /api/backtests`) and every `POST` below except `stat-test` validate their input, queue a job and return **`202 Accepted`** at once with the job and a `Location: /api/research/jobs/{job_id}` header. Poll that URL until `status` is `succeeded` (the job then carries `result`), `failed` (`error` holds `status_code` and `detail`) or `cancelled`. Invalid input is still rejected immediately (`400`/`422`) and nothing is queued. A user may have at most `RESEARCH_MAX_ACTIVE_JOBS_PER_USER` jobs queued or running (default 3); one more is refused with `429`. Jobs and their results are visible only to the user who queued them.
+Research runs as background jobs, never inside the request. The dashboard backtest (`POST /api/backtests`), every `POST` below and the experiment `run`, `replay` and `validate` endpoints validate their input, queue a job and return **`202 Accepted`** at once with the job and a `Location: /api/research/jobs/{job_id}` header. Poll that URL until `status` is `succeeded` (the job then carries `result`), `failed` (`error` holds `status_code` and `detail`) or `cancelled`. Invalid input is still rejected immediately (`400`/`422`) and nothing is queued. A user may have at most `RESEARCH_MAX_ACTIVE_JOBS_PER_USER` jobs queued or running (default 3); one more is refused with `429`. Jobs and their results are visible only to the user who queued them.
 
 | Method | Endpoint | Description |
 |---|---|---|
@@ -616,7 +616,7 @@ Research runs as background jobs, never inside the request. The dashboard backte
 | `POST` | `/api/research/correlation` | Shrinkage (Ledoit-Wolf) and PCA-denoised correlation matrix estimation |
 | `POST` | `/api/research/optimize` | Mean-variance · turnover-aware MVO · Risk-Parity · Min-Vol · efficient frontier |
 | `POST` | `/api/research/regime` | 2-state Gaussian HMM · Viterbi decoding · volatility and trend regime |
-| `POST` | `/api/research/stat-test` | Newey-West · DSR · block bootstrap CI · permutation p-value · ADF · cointegration |
+| `POST` | `/api/research/stat-test` | Newey-West and OLS t-tests · bootstrap Sharpe CI (`n_bootstrap`) · sign-flip permutation p-value (`n_permutations`) · Ljung-Box · Deflated Sharpe Ratio, on `returns` (5 to 10,000 finite values) or a stored backtest's returns |
 | `POST` | `/api/research/pairs-trading` | Engle-Granger cointegration · Kalman filter hedge ratio · z-score signal · OU half-life |
 | `POST` | `/api/research/event-backtest` | Event-driven backtest with execution costs, leverage, and short-borrow accounting |
 | **`POST`** | **`/api/research/report`** | **Full 7-section research report across all pipeline stages** |
@@ -642,10 +642,10 @@ Research runs as background jobs, never inside the request. The dashboard backte
 | `POST` | `/api/execution/capacity` | Strategy capacity analysis across capital sizes |
 | `POST` | `/api/experiments/create` | Create experiment; records dataset, parameter and strategy-code hashes, code commit and dependency-lock hash |
 | `GET` | `/api/experiments/{id}` | Get experiment |
-| `POST` | `/api/experiments/{id}/run` | Execute a platform strategy (`obi_momentum`) on the stored inputs; results are recorded once and the manifest is ML-DSA-signed |
+| `POST` | `/api/experiments/{id}/run` | Research job: execute a platform strategy (`obi_momentum`) on the stored inputs; results are recorded once and the manifest is ML-DSA-signed. Submitting again while it is queued or running returns the same job |
 | `GET` | `/api/experiments/{id}/manifest` | The signed manifest exactly as signed, verified with the key that signed it (valid after key rotation) |
-| `POST` | `/api/experiments/{id}/replay` | Verify inputs by hash; for executable strategies, re-execute from stored inputs and compare the result hash |
-| `POST` | `/api/experiments/{id}/validate` | Integrity gates (signature, manifest consistency, inputs unchanged, result reproduced) plus deployment gates |
+| `POST` | `/api/experiments/{id}/replay` | Research job: verify inputs by hash; for executable strategies, re-execute from stored inputs and compare the result hash |
+| `POST` | `/api/experiments/{id}/validate` | Research job: integrity gates (signature, manifest consistency, inputs unchanged, result reproduced) plus deployment gates. Submitting again while it is queued or running returns the same job |
 | `POST` | `/api/experiments/{id}/approve` | Operator-only, four-eyes approval of a validated experiment (audit-logged) |
 | `GET` | `/api/latency/presets` | List all latency presets (zero → retail, 0ms → 50ms) |
 

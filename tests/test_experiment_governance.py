@@ -11,6 +11,7 @@ from backend import main, models
 from backend.services import experiment_registry as er
 from backend.services import security_service
 from backend.services.l2_event_replay import obi_momentum_strategy
+from research_job_helpers import result_of
 
 
 @pytest.fixture
@@ -68,7 +69,7 @@ class TestManifest:
 
     def test_manifest_v2_binds_code_dependencies_engine_and_key(self, db, owner):
         exp = create(db, owner)
-        main.experiment_run(exp["experiment_id"], owner, db)
+        result_of(db, main.experiment_run(exp["experiment_id"], owner, db))
         manifest = main.experiment_manifest(exp["experiment_id"], owner, db)
         source_hash = hashlib.sha256(b"source:" + inspect.getsource(obi_momentum_strategy).encode()).hexdigest()
         assert manifest["manifest_version"] == 2
@@ -109,20 +110,20 @@ class TestManifest:
 class TestTrueReplay:
     def test_run_records_results_once_and_replay_re_executes(self, db, owner):
         exp = create(db, owner)
-        ran = main.experiment_run(exp["experiment_id"], owner, db)
+        ran = result_of(db, main.experiment_run(exp["experiment_id"], owner, db))
         assert ran["status"] == "COMPLETED" and ran["results"]["data_source"] == "synthetic"
         with pytest.raises(HTTPException) as exc:
             main.experiment_run(exp["experiment_id"], owner, db)
         assert exc.value.status_code == 422
-        replay = main.experiment_replay(exp["experiment_id"], {}, owner, db)
+        replay = result_of(db, main.experiment_replay(exp["experiment_id"], {}, owner, db))
         assert replay["replay_status"] == "re-executed"
         assert replay["result_reproduced"] is True
         assert replay["result_hash"] == ran["result_hash"]
 
     def test_changed_inputs_are_not_replayed(self, db, owner):
         exp = create(db, owner)
-        main.experiment_run(exp["experiment_id"], owner, db)
-        replay = main.experiment_replay(exp["experiment_id"], {"random_seed": 12}, owner, db)
+        result_of(db, main.experiment_run(exp["experiment_id"], owner, db))
+        replay = result_of(db, main.experiment_replay(exp["experiment_id"], {"random_seed": 12}, owner, db))
         assert replay["matches_experiment"] is False
         assert replay["replay_status"] == "deterministic_input_verification"
 
@@ -142,19 +143,19 @@ class TestTrueReplay:
 class TestValidationAndApproval:
     def test_integrity_gates_are_evaluated_for_real(self, db, owner):
         exp = create(db, owner)
-        main.experiment_run(exp["experiment_id"], owner, db)
-        report = main.experiment_validate(exp["experiment_id"], owner, db)
+        result_of(db, main.experiment_run(exp["experiment_id"], owner, db))
+        report = result_of(db, main.experiment_validate(exp["experiment_id"], owner, db))
         for gate in ("signature_valid", "manifest_consistent", "inputs_unchanged", "result_reproducible"):
             assert report["gates"][gate]["passed"] is True, gate
         assert {"net_pnl", "fill_ratio", "implementation_shortfall"} <= set(report["gates"])
 
     def test_tampered_inputs_fail_validation(self, db, owner):
         exp = create(db, owner)
-        main.experiment_run(exp["experiment_id"], owner, db)
+        result_of(db, main.experiment_run(exp["experiment_id"], owner, db))
         row = db.get(models.ResearchExperiment, exp["experiment_id"])
         row.dataset_json = BARS[:-1]
         db.commit()
-        report = main.experiment_validate(exp["experiment_id"], owner, db)
+        report = result_of(db, main.experiment_validate(exp["experiment_id"], owner, db))
         assert report["gates"]["inputs_unchanged"]["passed"] is False
         assert report["all_gates_passed"] is False
 
@@ -171,21 +172,21 @@ class TestValidationAndApproval:
 
         exp = create(db, owner)
         exp_id = exp["experiment_id"]
-        main.experiment_run(exp_id, owner, db)
+        result_of(db, main.experiment_run(exp_id, owner, db))
         with pytest.raises(HTTPException) as exc:
             main.experiment_approve(exp_id, operator, db)
         assert exc.value.status_code == 409                       # not validated yet
 
         monkeypatch.setattr(er, "validate_for_deployment", quality_passes)
-        assert main.experiment_validate(exp_id, owner, db)["all_gates_passed"] is True
+        assert result_of(db, main.experiment_validate(exp_id, owner, db))["all_gates_passed"] is True
 
         with pytest.raises(HTTPException) as exc:
             main.experiment_approve(exp_id, owner, db)
         assert exc.value.status_code == 403                       # owner is not an operator
 
         operator_exp = create(db, operator)
-        main.experiment_run(operator_exp["experiment_id"], operator, db)
-        main.experiment_validate(operator_exp["experiment_id"], operator, db)
+        result_of(db, main.experiment_run(operator_exp["experiment_id"], operator, db))
+        result_of(db, main.experiment_validate(operator_exp["experiment_id"], operator, db))
         with pytest.raises(HTTPException) as exc:
             main.experiment_approve(operator_exp["experiment_id"], operator, db)
         assert exc.value.status_code == 409                       # four-eyes: no self-approval

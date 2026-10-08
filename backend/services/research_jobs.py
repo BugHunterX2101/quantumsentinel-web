@@ -22,6 +22,7 @@ that was presumed dead and replaced can never overwrite the newer attempt.
 from __future__ import annotations
 
 import datetime as dt
+import importlib
 import math
 import threading
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from .. import models, schemas
 from ..config import (RESEARCH_JOB_MAX_ATTEMPTS, RESEARCH_JOB_RETENTION_DAYS,
                       RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
 from . import research_trials, security_service
+from .research_tasks import TaskError
 
 QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED = "queued", "running", "succeeded", "failed", "cancelled"
 ACTIVE = (QUEUED, RUNNING)
@@ -54,9 +56,15 @@ class JobKind:
     schema: type
     target: str          # "module:function" run in the job process
     audit_action: str
+    # "module:function"(db, job, result, audit) run in the worker process
+    # when the task succeeds, inside the transaction that stores the result:
+    # it may write rows and returns (result, (resource_type, resource_id),
+    # audit); a TaskError fails the job instead, recording nothing.
+    finalize: str | None = None
 
 
 _TASKS = "backend.services.research_tasks"
+_EXPERIMENTS = "backend.services.experiment_registry"
 KINDS: dict[str, JobKind] = {
     "ma_backtest": JobKind(schemas.BacktestRequest, f"{_TASKS}:ma_backtest", "BACKTEST_COMPLETED"),
     "advanced_backtest": JobKind(schemas.AdvancedBacktestRequest, f"{_TASKS}:advanced_backtest",
@@ -74,6 +82,13 @@ KINDS: dict[str, JobKind] = {
     "latency_benchmark": JobKind(schemas.LatencyBenchmarkRequest, f"{_TASKS}:latency_benchmark",
                                  "LATENCY_BENCHMARK"),
     "report": JobKind(schemas.ReportRequest, f"{_TASKS}:research_report", "RESEARCH_REPORT"),
+    "stat_test": JobKind(schemas.StatTestJob, f"{_TASKS}:statistical_tests", "STAT_TEST"),
+    "experiment_run": JobKind(schemas.ExperimentJob, f"{_TASKS}:experiment_execution", "EXPERIMENT_RUN",
+                              f"{_EXPERIMENTS}:finalize_run_job"),
+    "experiment_validate": JobKind(schemas.ExperimentJob, f"{_TASKS}:experiment_execution",
+                                   "EXPERIMENT_VALIDATED", f"{_EXPERIMENTS}:finalize_validate_job"),
+    "experiment_replay": JobKind(schemas.ExperimentJob, f"{_TASKS}:experiment_execution",
+                                 "EXPERIMENT_REPLAYED", f"{_EXPERIMENTS}:finalize_replay_job"),
 }
 
 
@@ -131,23 +146,39 @@ def _finite(value):
 _enqueue_lock = threading.Lock()
 
 
-def enqueue(db: Session, user_id: str, kind: str, params: dict) -> models.ResearchJob:
-    """Queue a job, or raise QueueFull when the user is at their active limit."""
+def enqueue(db: Session, user_id: str, kind: str, params: dict,
+            same_as: tuple[str, ...] = ()) -> models.ResearchJob:
+    """Queue a job, or raise QueueFull when the user is at their active limit.
+
+    With ``same_as`` (names of params fields), a queued or running job of
+    this kind whose params match on all of them is returned instead of
+    queueing a duplicate.
+    """
     if kind not in KINDS:
         raise ValueError(f"unknown research job kind {kind!r}")
+    params = json_safe(params)
     with _enqueue_lock:
         try:
             db.execute(text("SELECT id FROM users WHERE id = :uid FOR UPDATE"), {"uid": user_id})
-            active = int(db.execute(
-                select(func.count()).select_from(models.ResearchJob).where(
-                    models.ResearchJob.user_id == user_id,
-                    models.ResearchJob.status.in_(ACTIVE))
-            ).scalar() or 0)
-            if active >= RESEARCH_MAX_ACTIVE_JOBS_PER_USER:
-                raise QueueFull(active, RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
-            job = models.ResearchJob(user_id=user_id, kind=kind, params_json=json_safe(params),
-                                     status=QUEUED, max_attempts=RESEARCH_JOB_MAX_ATTEMPTS)
-            db.add(job)
+            job = None
+            if same_as:
+                job = next((existing for existing in db.execute(
+                    select(models.ResearchJob).where(
+                        models.ResearchJob.user_id == user_id, models.ResearchJob.kind == kind,
+                        models.ResearchJob.status.in_(ACTIVE))
+                    .order_by(models.ResearchJob.created_at)).scalars()
+                    if all((existing.params_json or {}).get(f) == params.get(f) for f in same_as)), None)
+            if job is None:
+                active = int(db.execute(
+                    select(func.count()).select_from(models.ResearchJob).where(
+                        models.ResearchJob.user_id == user_id,
+                        models.ResearchJob.status.in_(ACTIVE))
+                ).scalar() or 0)
+                if active >= RESEARCH_MAX_ACTIVE_JOBS_PER_USER:
+                    raise QueueFull(active, RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
+                job = models.ResearchJob(user_id=user_id, kind=kind, params_json=params,
+                                         status=QUEUED, max_attempts=RESEARCH_JOB_MAX_ATTEMPTS)
+                db.add(job)
             db.commit()
         except Exception:
             db.rollback()
@@ -280,6 +311,11 @@ def claim_next(db: Session, worker_id: str, lease_seconds: float) -> models.Rese
     return None
 
 
+def _resolve(target: str):
+    module_name, _, attr = target.partition(":")
+    return getattr(importlib.import_module(module_name), attr)
+
+
 def _owned(job: models.ResearchJob, worker_id: str, attempt: int):
     return (models.ResearchJob.id == job.id, models.ResearchJob.worker_id == worker_id,
             models.ResearchJob.attempts == attempt, models.ResearchJob.status == RUNNING)
@@ -317,9 +353,11 @@ def _finish(db: Session, job: models.ResearchJob, worker_id: str, attempt: int, 
 
 def complete(db: Session, job: models.ResearchJob, worker_id: str, attempt: int,
              result: dict, audit: dict, trials: dict | None) -> bool:
-    """Store a successful result with its side effects. False if the job is
-    no longer this worker's (nothing is stored then, apart from trials: the
-    configurations were evaluated whether or not the result is kept)."""
+    """Store a successful result with its side effects (the kind's finalizer,
+    if any, records them in the same transaction). False if the job is no
+    longer this worker's (nothing is stored then, apart from trials: the
+    configurations were evaluated whether or not the result is kept). A
+    finalizer that refuses the outcome fails the job instead."""
     kind = KINDS[job.kind]
     result = dict(result)
     if trials:
@@ -328,6 +366,8 @@ def complete(db: Session, job: models.ResearchJob, worker_id: str, attempt: int,
             db, job.user_id, trials["family"], trials["configs"], trials["source"])
     resource_type, resource_id = "research", None
     try:
+        if kind.finalize is not None:
+            result, (resource_type, resource_id), audit = _resolve(kind.finalize)(db, job, result, audit)
         if job.kind == "ma_backtest":
             # The dashboard backtest keeps its history row, as before.
             result = json_safe(result)
@@ -344,6 +384,11 @@ def complete(db: Session, job: models.ResearchJob, worker_id: str, attempt: int,
             db.rollback()
             return False
         db.commit()
+    except TaskError as exc:
+        # The finalizer refused the outcome (e.g. the experiment changed
+        # while the job waited): nothing it wrote is kept; the job fails.
+        db.rollback()
+        return fail(db, job, worker_id, attempt, exc.status_code, exc.detail)
     except Exception:
         db.rollback()
         raise

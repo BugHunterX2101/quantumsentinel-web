@@ -1,5 +1,5 @@
-from typing import Literal
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from typing import Any, Literal
+from pydantic import BaseModel, EmailStr, Field, FiniteFloat, field_validator, model_validator
 import re
 
 # ---------------------------------------------------------------------------
@@ -491,18 +491,47 @@ class WalkForwardRequest(BaseModel):
         return [v.strip().upper() for v in value]
 
 
+# About 40 years of daily returns. At this length and the largest bootstrap
+# and permutation counts the tests take ~30 s on a worker.
+STAT_TEST_MAX_RETURNS = 10_000
+
+
 class StatTestRequest(BaseModel):
     """Request for statistical testing on strategy returns."""
     # Can provide returns directly or reference a backtest ID
     backtest_id: str | None = None
     # Or provide raw returns
-    returns: list[float] | None = None
+    returns: list[FiniteFloat] | None = Field(default=None, max_length=STAT_TEST_MAX_RETURNS)
     n_strategies_tested: int = Field(default=1, ge=1, le=10_000)
     # Research family returned by the backtest that produced these returns;
     # the server then counts at least every trial it ran for that family.
     trial_family: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     n_bootstrap: int = Field(default=10_000, ge=100, le=100_000)
     n_permutations: int = Field(default=10_000, ge=100, le=100_000)
+
+
+class StatTestJob(BaseModel):
+    """A queued statistical test: returns and trial count resolved by the API."""
+    returns: list[FiniteFloat] = Field(min_length=5, max_length=STAT_TEST_MAX_RETURNS)
+    n_trials: int = Field(ge=1)
+    declared: int = Field(ge=1)
+    server_counted: int = Field(ge=0)
+    trial_family: str | None = None
+    n_bootstrap: int = Field(ge=100, le=100_000)
+    n_permutations: int = Field(ge=100, le=100_000)
+
+
+class ExperimentJob(BaseModel):
+    """A queued experiment run, validation or replay: the experiment's
+    stored inputs, and whether the strategy is to be executed on them."""
+    experiment_id: str
+    strategy_id: str
+    dataset: Any = None
+    parameters: dict = Field(default_factory=dict)
+    random_seed: int
+    execute: bool
+    # Replay only: the input verification the API already did.
+    verification: dict | None = None
 
 
 # ---------------------------------------------------------------------------

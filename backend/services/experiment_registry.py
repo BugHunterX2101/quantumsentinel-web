@@ -215,20 +215,12 @@ def _obi_parameters(parameters: dict) -> dict:
     return p
 
 
-def run_strategy(strategy_id: str, dataset: Any, parameters: dict, seed: int) -> dict:
-    """Execute a platform strategy deterministically from its inputs.
-
-    ``obi_momentum``: ``dataset`` is a list of OHLCV bars; synthetic L2 is
-    generated from them with ``seed`` and replayed through the paper
-    exchange (latency preset, queue-aware matching). Identical inputs give
-    byte-identical results.
-    """
+def check_strategy_inputs(strategy_id: str, dataset: Any, parameters: dict) -> dict:
+    """Validate a platform strategy's inputs without executing it; returns
+    the full parameter set. Cheap, so the API can reject bad inputs before
+    queueing an execution."""
     if strategy_id not in EXECUTABLE_STRATEGY_IDS:
         raise ExperimentError(f"strategy {strategy_id!r} is not executable by the platform")
-    from backend.services.l2_event_replay import L2EventStream, ReplayConfig, replay_session, obi_momentum_strategy
-    from backend.services.latency_model import LATENCY_PRESETS
-    from backend.services.paper_exchange import PaperExchange
-
     p = _obi_parameters(parameters or {})
     if not isinstance(dataset, list) or not dataset or len(dataset) > 500:
         raise ExperimentError("obi_momentum needs a dataset of 1-500 OHLCV bars")
@@ -237,6 +229,28 @@ def run_strategy(strategy_id: str, dataset: Any, parameters: dict, seed: int) ->
         raise ExperimentError(f"every bar needs {sorted(required)}")
     if len(dataset) * int(p["events_per_bar"]) > 100_000:
         raise ExperimentError("bars x events_per_bar must not exceed 100,000 events")
+    return p
+
+
+def input_hashes(dataset: Any, parameters: dict, seed: int) -> dict:
+    """The identity of an experiment's inputs, computed as ``create`` records it."""
+    return {"dataset_hash": hash_dataset(dataset) if dataset is not None else "",
+            "parameter_hash": hash_parameters(parameters or {}),
+            "random_seed": seed}
+
+
+def run_strategy(strategy_id: str, dataset: Any, parameters: dict, seed: int) -> dict:
+    """Execute a platform strategy deterministically from its inputs.
+
+    ``obi_momentum``: ``dataset`` is a list of OHLCV bars; synthetic L2 is
+    generated from them with ``seed`` and replayed through the paper
+    exchange (latency preset, queue-aware matching). Identical inputs give
+    byte-identical results.
+    """
+    p = check_strategy_inputs(strategy_id, dataset, parameters)
+    from backend.services.l2_event_replay import L2EventStream, ReplayConfig, replay_session, obi_momentum_strategy
+    from backend.services.latency_model import LATENCY_PRESETS
+    from backend.services.paper_exchange import PaperExchange
 
     stream = L2EventStream.from_synthetic(dataset, seed=int(seed), events_per_bar=int(p["events_per_bar"]),
                                           tick_size=float(p["tick_size"]))
@@ -555,10 +569,22 @@ class PersistentExperimentRegistry:
             manifest_signature=row.manifest_signature or "",
         )
 
-    def _row(self, experiment_id: str):
+    def _row(self, experiment_id: str, for_update: bool = False):
         from backend import models
-        row = self.db.get(models.ResearchExperiment, experiment_id)
+        if for_update:
+            from sqlalchemy import select
+            row = self.db.execute(
+                select(models.ResearchExperiment).where(models.ResearchExperiment.id == experiment_id)
+                .with_for_update().execution_options(populate_existing=True)
+            ).scalar_one_or_none()
+        else:
+            row = self.db.get(models.ResearchExperiment, experiment_id)
         return row if row is not None and row.user_id == self.user_id else None
+
+    @staticmethod
+    def _recorded_inputs(row) -> dict:
+        return {"dataset_hash": row.dataset_hash, "parameter_hash": row.parameter_hash,
+                "random_seed": row.random_seed}
 
     def create(self, strategy_id: str, strategy_version: str, dataset_id: str,
                dataset: Any = None, parameters: dict | None = None,
@@ -592,35 +618,28 @@ class PersistentExperimentRegistry:
         row = self._row(experiment_id)
         return self._to_experiment(row) if row else None
 
-    def inputs(self, experiment_id: str) -> tuple[Any, dict, int] | None:
-        """Return the immutable stored inputs for deterministic verification."""
-        row = self._row(experiment_id)
-        if not row:
-            return None
-        return row.dataset_json, row.parameters_json or {}, row.random_seed
+    def _register_signing_key(self) -> None:
+        """Register the server key in *this* database (idempotent by
+        fingerprint) so the key named in a manifest is resolvable wherever
+        the manifest is. Commits, so call it before writing anything else."""
+        from backend.services import security_service
+        identity = security_service.server_identity
+        if identity.dsa_sk is None:
+            identity.sign(b"")
+        identity.register_in_db(self.db)
 
-    def complete(self, experiment_id: str, results: dict, sign: bool = True) -> Experiment | None:
-        """Record results once and sign the manifest; results are then immutable."""
-        row = self._row(experiment_id)
-        if not row:
-            return None
-        if row.status != ExperimentStatus.CREATED.value:
-            raise ExperimentError(f"results already recorded (status {row.status})")
+    def _record(self, row, results: dict, result_hash: str, sign: bool) -> Experiment:
+        """Set results, completion time and the signed manifest on ``row``;
+        the caller commits."""
         exp = self._to_experiment(row)
         exp.results = results
-        exp.result_hash = hash_results(results)
+        exp.result_hash = result_hash
         exp.completed_at = time.time()
         exp.status = ExperimentStatus.COMPLETED
         manifest = None
         if sign:
             from backend.services import security_service
-            # Register in *this* database (idempotent by fingerprint) so the
-            # key named in the manifest is resolvable wherever the manifest is.
-            identity = security_service.server_identity
-            if identity.dsa_sk is None:
-                identity.sign(b"")
-            identity.register_in_db(self.db)
-            exp.signing_key_id = identity.key_id
+            exp.signing_key_id = security_service.server_identity.key_id
             manifest = build_manifest(exp)
             exp.manifest_signature = sign_manifest(manifest)
         row.results_json = results
@@ -630,11 +649,33 @@ class PersistentExperimentRegistry:
         row.signing_key_id = exp.signing_key_id
         row.manifest_json = manifest
         row.manifest_signature = exp.manifest_signature
+        return exp
+
+    def complete(self, experiment_id: str, results: dict, sign: bool = True) -> Experiment | None:
+        """Record results once and sign the manifest; results are then immutable."""
+        row = self._row(experiment_id)
+        if not row:
+            return None
+        if row.status != ExperimentStatus.CREATED.value:
+            raise ExperimentError(f"results already recorded (status {row.status})")
+        if sign:
+            self._register_signing_key()
+        self._record(row, results, hash_results(results), sign)
         self.db.commit()
         return self._to_experiment(row)
 
-    def run(self, experiment_id: str) -> Experiment | None:
-        """Execute a platform strategy on the stored inputs and record the result."""
+    # -- research jobs: the API checks and queues, a worker computes --------
+
+    @staticmethod
+    def _job_params(row, execute: bool) -> dict:
+        return {"experiment_id": row.id, "strategy_id": row.strategy_id,
+                "dataset": row.dataset_json if execute else None,
+                "parameters": (row.parameters_json or {}) if execute else {},
+                "random_seed": row.random_seed, "execute": execute}
+
+    def run_job_params(self, experiment_id: str) -> dict | None:
+        """Parameters for a job that executes the strategy on the stored
+        inputs; ExperimentError if it cannot be run."""
         row = self._row(experiment_id)
         if not row:
             return None
@@ -642,20 +683,56 @@ class PersistentExperimentRegistry:
             raise ExperimentError(f"strategy {row.strategy_id!r} is not executable by the platform")
         if row.status != ExperimentStatus.CREATED.value:
             raise ExperimentError(f"experiment already has results (status {row.status})")
-        results = run_strategy(row.strategy_id, row.dataset_json, row.parameters_json or {}, row.random_seed)
-        return self.complete(experiment_id, results)
+        check_strategy_inputs(row.strategy_id, row.dataset_json, row.parameters_json or {})
+        return self._job_params(row, execute=True)
 
-    def reexecute(self, experiment_id: str) -> dict | None:
-        """Re-run a completed executable experiment and compare result hashes."""
+    def validate_job_params(self, experiment_id: str) -> dict | None:
+        """Parameters for a validation job; ExperimentError unless completed."""
         row = self._row(experiment_id)
         if not row:
             return None
-        if row.strategy_id not in EXECUTABLE_STRATEGY_IDS or not row.result_hash:
+        if row.status not in (ExperimentStatus.COMPLETED.value, ExperimentStatus.VALIDATED.value):
+            raise ExperimentError(f"only completed experiments can be validated (status {row.status})")
+        return self._job_params(row, execute=row.strategy_id in EXECUTABLE_STRATEGY_IDS and bool(row.result_hash))
+
+    def replay_job_params(self, experiment_id: str, supplied: dict) -> dict | None:
+        """Parameters for a replay job.
+
+        Always verifies inputs: the (optionally supplied) dataset, parameters
+        and seed are hashed and compared with the recorded ones. A completed
+        platform-executable experiment whose inputs match is re-executed by
+        the job and its result hash compared (true replay).
+        """
+        row = self._row(experiment_id)
+        if not row:
+            return None
+        dataset = supplied.get("dataset", row.dataset_json)
+        parameters = supplied.get("parameters", row.parameters_json or {})
+        seed = supplied.get("random_seed", row.random_seed)
+        d_hash = hash_dataset(dataset) if dataset is not None else ""
+        p_hash = hash_parameters(parameters)
+        matches = d_hash == row.dataset_hash and p_hash == row.parameter_hash and seed == row.random_seed
+        verification = {
+            "experiment_id": experiment_id,
+            "dataset_hash": d_hash,
+            "parameter_hash": p_hash,
+            "random_seed": seed,
+            "matches_experiment": matches,
+            "replay_status": "deterministic_input_verification",
+            "result_reproduced": None,
+        }
+        execute = matches and bool(row.result_hash) and row.strategy_id in EXECUTABLE_STRATEGY_IDS
+        return {**self._job_params(row, execute=execute), "verification": verification}
+
+    def _replay_outcome(self, row, execution: dict) -> dict:
+        """Compare a job's execution of the stored inputs with the recorded result."""
+        if (not execution.get("executed") or row.strategy_id not in EXECUTABLE_STRATEGY_IDS
+                or not row.result_hash):
             return {"executed": False, "result_reproduced": None}
-        results = run_strategy(row.strategy_id, row.dataset_json, row.parameters_json or {}, row.random_seed)
-        replay_hash = hash_results(results)
-        return {"executed": True, "result_hash": replay_hash,
-                "result_reproduced": replay_hash == row.result_hash,
+        # Reproduced only if what was executed is exactly the recorded input.
+        same_inputs = execution["inputs"] == self._recorded_inputs(row)
+        return {"executed": True, "result_hash": execution["result_hash"],
+                "result_reproduced": same_inputs and execution["result_hash"] == row.result_hash,
                 "engine_version_matches": (row.engine_version or "") == ENGINE_VERSION}
 
     def get_manifest(self, experiment_id: str) -> dict | None:
@@ -663,6 +740,9 @@ class PersistentExperimentRegistry:
         row = self._row(experiment_id)
         if not row:
             return None
+        return self._manifest_view(row)
+
+    def _manifest_view(self, row) -> dict:
         manifest = row.manifest_json
         if not manifest:
             return {"experiment_id": row.id, "signature": row.manifest_signature or "",
@@ -673,16 +753,12 @@ class PersistentExperimentRegistry:
                 "signature_valid": verify_manifest_signature(manifest, row.manifest_signature, self.db),
                 "consistent_with_record": consistent}
 
-    def validate(self, experiment_id: str) -> dict | None:
-        """Integrity gates plus deployment gates; VALIDATED only if all pass."""
-        row = self._row(experiment_id)
-        if not row:
-            return None
-        if row.status not in (ExperimentStatus.COMPLETED.value, ExperimentStatus.VALIDATED.value):
-            raise ExperimentError(f"only completed experiments can be validated (status {row.status})")
+    def _validate_row(self, row, replay: dict) -> dict:
+        """Integrity gates plus deployment gates, recorded on ``row``
+        (VALIDATED only if all pass); the caller commits."""
         exp = self._to_experiment(row)
         report = validate_for_deployment(exp)
-        manifest = self.get_manifest(experiment_id)
+        manifest = self._manifest_view(row)
         gates = report["gates"]
         gates["signature_valid"] = {"passed": bool(manifest["signature_valid"]),
                                     "description": "Manifest signature verifies with the key that signed it"}
@@ -692,7 +768,6 @@ class PersistentExperimentRegistry:
                      and hash_parameters(row.parameters_json or {}) == row.parameter_hash)
         gates["inputs_unchanged"] = {"passed": inputs_ok,
                                      "description": "Stored dataset and parameters still hash to the recorded values"}
-        replay = self.reexecute(experiment_id)
         gates["result_reproducible"] = {
             "passed": bool(replay.get("result_reproduced")),
             "value": replay.get("result_hash"),
@@ -705,18 +780,89 @@ class PersistentExperimentRegistry:
         row.validation_gates_json = report
         row.status = (ExperimentStatus.VALIDATED if report["all_gates_passed"]
                       else ExperimentStatus.COMPLETED).value
-        self.db.commit()
         return report
+
+
+# ---------------------------------------------------------------------------
+# Recording research-job outcomes (worker process)
+# ---------------------------------------------------------------------------
+#
+# Each runs in the worker process when a job's execution succeeded, inside
+# the transaction that marks the job succeeded (research_jobs.complete), and
+# returns (result, (resource_type, resource_id), audit). A TaskError fails
+# the job with its status and message and records nothing. The experiment
+# row is re-read and locked here: the API checked it when queueing, but it
+# may have changed while the job waited.
+
+def _job_error(status_code: int, detail: str):
+    from backend.services.research_tasks import TaskError
+    return TaskError(status_code, detail)
+
+
+def _job_registry(db, job) -> tuple["PersistentExperimentRegistry", str]:
+    return PersistentExperimentRegistry(db, job.user_id), job.params_json["experiment_id"]
+
+
+def finalize_run_job(db, job, execution: dict, audit: dict):
+    """Record a run's results once and sign the manifest."""
+    registry, experiment_id = _job_registry(db, job)
+    registry._register_signing_key()  # commits: before taking the row lock
+    row = registry._row(experiment_id, for_update=True)
+    if row is None:
+        raise _job_error(404, f"Experiment {experiment_id} not found")
+    if row.status != ExperimentStatus.CREATED.value:
+        raise _job_error(422, f"experiment already has results (status {row.status})")
+    if execution["inputs"] != registry._recorded_inputs(row):
+        raise _job_error(409, "The executed inputs differ from the experiment's recorded inputs; "
+                              "no result was recorded.")
+    exp = registry._record(row, execution["results"], execution["result_hash"], sign=True)
+    return {**exp.to_dict(), "results": exp.results}, ("experiment", row.id), {"result_hash": exp.result_hash}
+
+
+def finalize_validate_job(db, job, execution: dict, audit: dict):
+    """Evaluate and record every validation gate, using the job's re-execution."""
+    registry, experiment_id = _job_registry(db, job)
+    row = registry._row(experiment_id, for_update=True)
+    if row is None:
+        raise _job_error(404, f"Experiment {experiment_id} not found")
+    if row.status not in (ExperimentStatus.COMPLETED.value, ExperimentStatus.VALIDATED.value):
+        # e.g. approved while this validation waited: never overwrite that.
+        raise _job_error(409, f"only completed experiments can be validated (status {row.status})")
+    report = registry._validate_row(row, registry._replay_outcome(row, execution))
+    return report, ("experiment", row.id), {"all_gates_passed": report["all_gates_passed"]}
+
+
+def finalize_replay_job(db, job, execution: dict, audit: dict):
+    """The API's input verification, plus the re-execution's outcome."""
+    registry, experiment_id = _job_registry(db, job)
+    row = registry._row(experiment_id)
+    if row is None:
+        raise _job_error(404, f"Experiment {experiment_id} not found")
+    response = dict(job.params_json["verification"])
+    replay = registry._replay_outcome(row, execution)
+    if replay["executed"]:
+        response.update(replay_status="re-executed", result_hash=replay["result_hash"],
+                        recorded_result_hash=row.result_hash,
+                        result_reproduced=replay["result_reproduced"],
+                        engine_version_matches=replay["engine_version_matches"])
+    return (response, ("experiment", row.id),
+            {"replay_status": response["replay_status"], "result_reproduced": response["result_reproduced"]})
 
 
 def approve_experiment(db, experiment_id: str, approver_id: str) -> Experiment:
     """Approve a VALIDATED experiment (operator action, four-eyes).
 
     Callers must check that the approver holds an operator role. The owner
-    cannot approve their own experiment.
+    cannot approve their own experiment. The row is locked so a validation
+    finishing at the same moment cannot interleave with the approval.
     """
+    from sqlalchemy import select
+
     from backend import models
-    row = db.get(models.ResearchExperiment, experiment_id)
+    row = db.execute(
+        select(models.ResearchExperiment).where(models.ResearchExperiment.id == experiment_id)
+        .with_for_update().execution_options(populate_existing=True)
+    ).scalar_one_or_none()
     if row is None:
         raise LookupError(experiment_id)
     if row.user_id == approver_id:

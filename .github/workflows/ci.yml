@@ -53,6 +53,28 @@ jobs:
         continue-on-error: true
         run: python -c "import _qs_fast; print(_qs_fast.__file__)"
 
+  # Deploys docker-compose.production.yml with Docker, then moves it off the
+  # bootstrap superuser onto the least-privilege database roles.
+  deploy-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Cut a production deployment over to the least-privilege roles
+        run: bash .github/scripts/compose_cutover.sh
+      - name: Container logs
+        if: failure()
+        run: >-
+          docker compose -p qsci -f docker-compose.production.yml --env-file .env.production
+          --profile provision --profile backup logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: >-
+          docker compose -p qsci -f docker-compose.production.yml --env-file .env.production
+          --profile provision --profile backup down -v --remove-orphans || true
+
 
   # --------------------------------------------------------------------------
   # Security scanning stages

@@ -1,6 +1,31 @@
+# Database credentials (backend/db_roles.py). The API connects as qs_app,
+# migrations run as qs_migrator in the one-off `migrate` service, backups run
+# as qs_backup, and only `postgres` and `provision` see the bootstrap
+# superuser's password. Every service that loads PRODUCTION_ENV_FILE blanks
+# the database passwords it must not hold, so none leaks through that file.
+# Before the first `up` with these roles (and to change a role's password):
+#   docker compose -f docker-compose.production.yml --env-file .env.production --profile provision run --rm provision
+x-app: &app
+  build: .
+  image: quantumsentinel-web:production
+  env_file: ${PRODUCTION_ENV_FILE:-.env.production}
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777,size=64m
+    - /var/run:mode=1777,size=8m
+
 services:
+  # postgres and redis run as their images' own unprivileged users. Started as
+  # root, their entrypoints chown the data directory and then switch user,
+  # which needs CHOWN, SETUID and SETGID; with every capability dropped that
+  # fails ("failed switching to 'postgres': operation not permitted"). The
+  # images' data directories, and so new named volumes, already belong to
+  # these users.
   postgres:
     image: postgres:16-alpine
+    user: postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: quantumsentinel
@@ -18,6 +43,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    user: redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD}"]
     environment:
@@ -32,14 +58,53 @@ services:
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
 
-  quantumsentinel:
-    build: .
-    restart: unless-stopped
-    env_file: ${PRODUCTION_ENV_FILE:-.env.production}
+  # As the bootstrap superuser: creates the roles and hands them the schema,
+  # migrating it first. Idempotent and safe while the application runs.
+  provision:
+    <<: *app
+    profiles: ["provision"]
+    restart: "no"
+    command: ["python", "-m", "backend.manage", "provision-roles"]
     environment:
       ENVIRONMENT: production
-      DATABASE_URL: postgresql+psycopg://quantumsentinel:${POSTGRES_PASSWORD}@postgres:5432/quantumsentinel
+      DATABASE_URL: postgresql+psycopg://quantumsentinel:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/quantumsentinel
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:?Set DB_APP_PASSWORD}
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:?Set DB_MIGRATOR_PASSWORD}
+      DB_BACKUP_PASSWORD: ${DB_BACKUP_PASSWORD:?Set DB_BACKUP_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Applies pending schema migrations as qs_migrator and exits; the API
+  # starts only once it has succeeded.
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["python", "-m", "backend.manage", "migrate"]
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://qs_migrator:${DB_MIGRATOR_PASSWORD:?Set DB_MIGRATOR_PASSWORD}@postgres:5432/quantumsentinel
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      POSTGRES_PASSWORD: ""
+      DB_APP_PASSWORD: ""
+      DB_MIGRATOR_PASSWORD: ""
+      DB_BACKUP_PASSWORD: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  quantumsentinel:
+    <<: *app
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://qs_app:${DB_APP_PASSWORD:?Set DB_APP_PASSWORD}@postgres:5432/quantumsentinel
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      POSTGRES_PASSWORD: ""
+      DB_APP_PASSWORD: ""
+      DB_MIGRATOR_PASSWORD: ""
+      DB_BACKUP_PASSWORD: ""
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
       # Safe as "*" only because this service uses `expose` (below), not `ports`:
       # it is unreachable from outside the compose network, so every peer that
@@ -54,18 +119,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
       interval: 15s
       timeout: 5s
       retries: 5
-    # Security hardening
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: ["ALL"]
-    read_only: true
-    tmpfs:
-      - /tmp:mode=1777,size=64m
-      - /var/run:mode=1777,size=8m
     mem_limit: 2g
     cpus: "1.5"
 
@@ -83,21 +143,25 @@ services:
         condition: service_healthy
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
-    cap_add: ["NET_BIND_SERVICE"]
+    # The master binds 80/443 as root, creates its temp directories for the
+    # nginx user (CHOWN) and starts its workers as that user (SETUID/SETGID).
+    cap_add: ["NET_BIND_SERVICE", "CHOWN", "SETUID", "SETGID"]
 
   backup:
     image: postgres:16-alpine
     profiles: ["backup"]
     restart: unless-stopped
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      PGPASSWORD: ${DB_BACKUP_PASSWORD:?Set DB_BACKUP_PASSWORD}
     volumes:
       - postgres_backups:/backups
     depends_on:
       postgres:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
-    command: ["while true; do pg_dump -h postgres -U quantumsentinel -d quantumsentinel -Fc > /backups/quantumsentinel-$$(date +%Y%m%d%H%M%S).dump && find /backups -type f -mtime +7 -delete; sleep 21600; done"]
+    # The dump names qs_owner as the owner of everything: create the roles
+    # before restoring it, or restore with --no-owner.
+    command: ["while true; do pg_dump -h postgres -U qs_backup -d quantumsentinel -Fc > /backups/quantumsentinel-$$(date +%Y%m%d%H%M%S).dump && find /backups -type f -mtime +7 -delete; sleep 21600; done"]
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
 

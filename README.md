@@ -771,7 +771,9 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `DB_LOCK_TIMEOUT_MS` | No | Server-side limit on waiting for a lock (default 10000) |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | No | A session idle inside an open transaction is ended after this long (default 60000) |
 | `DB_MIGRATE_ON_STARTUP` | No | `true` (default): API processes apply pending migrations at startup, serialised by a database lock; `false`: run `python -m backend.manage migrate` as a release step |
-| `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD`, `DB_BACKUP_PASSWORD` | `provision-roles` only | Passwords for `qs_app`, `qs_migrator` and `qs_backup`, read only by `python -m backend.manage provision-roles` (each also as `*_FILE`). Needed to create a role; given for an existing role, its password is changed |
+| `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD`, `DB_BACKUP_PASSWORD` | `provision-roles`; Docker production | Passwords for `qs_app`, `qs_migrator` and `qs_backup`, read by `python -m backend.manage provision-roles` (each also as `*_FILE`). Needed to create a role; given for an existing role, its password is changed. `docker-compose.production.yml` also builds each service's `DATABASE_URL` from them, so they must be URL-safe |
+| `CSRF_SECRET` | Prod | Signs CSRF tokens and keys the experiment-manifest HMACs; every API process must share it. Outside production each process makes up its own |
+| `REFRESH_TOKEN_SECRET` | Prod | Required by the production startup check |
 | `JWT_PRIVATE_KEY` | Prod | RS256 private key (PEM, `\n`-escaped) |
 | `JWT_PUBLIC_KEY` | Prod | RS256 public key (PEM, `\n`-escaped) |
 | `WEBHOOK_ENCRYPTION_KEY` | Prod | Fernet key for encrypting webhook signing secrets at rest |
@@ -831,6 +833,32 @@ To move a deployment over:
 
 Running `provision-roles` again restores the intended role attributes, memberships, ownership and grants and removes anything extra. On a schema that has not been provisioned, migrations run as whoever connects, as before.
 
+`docker-compose.production.yml` is wired this way:
+
+- The API connects as `qs_app`.
+- A one-off `migrate` service applies migrations as `qs_migrator`, and the API starts only once it has succeeded.
+- The `backup` service dumps as `qs_backup`.
+- A `provision` service, under its own profile, runs `provision-roles` as the superuser.
+- Only `postgres` and `provision` receive the superuser's password. Every service that loads `.env.production` blanks the database password variables, so that file cannot leak one into the API.
+
+To move an existing Docker deployment over, add `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` to `.env.production`, then run, in this order:
+
+```bash
+docker compose -f docker-compose.production.yml --env-file .env.production --profile provision run --rm provision
+docker compose -f docker-compose.production.yml --env-file .env.production up -d
+```
+
+The first command runs while the API keeps serving. The second replaces the API container; in CI the API was back about 18 s later. Run them in this order. `up` before `provision` takes the API down: Compose replaces the API container, then `migrate` cannot log in (`password authentication failed for user "qs_migrator"`), so the new API never starts. Running the two commands then restores it; that took 19 s in CI.
+
+The CI job `deploy-compose` checks this end to end on every push. It deploys the stack with Docker and writes data as the superuser. It then provisions while the API runs and brings the stack up again. It checks four things:
+
+- only `qs_app` sessions reach the database, and neither the API nor `migrate` holds the superuser password;
+- the earlier data is intact and research jobs run;
+- the backup is a full dump made as `qs_backup`;
+- the API restarts as `qs_app`.
+
+It also deploys a fresh install the same way (`provision`, then `up`).
+
 ### Measured capacity
 
 One run of 1,000,000 requests: 1,000 users, a mix of portfolio, orders, watchlist, jobs, audit-log and settings-update requests, against 4 API processes and PostgreSQL 16 holding 1M trades and 1M audit events, all on one 8-core Windows laptop together with the load generator:
@@ -877,14 +905,19 @@ print('PRIVATE:', k.private_bytes(serialization.Encoding.PEM, serialization.Priv
 print('PUBLIC:', k.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode().replace('\n','\\n'))
 "
 
-# 2. Fill production env
+# 2. Fill production env (every password URL-safe: python -c "import secrets; print(secrets.token_urlsafe(32))")
 cp .env.production.example .env.production
 
 # 3. Place TLS certs at deploy/tls/
 
-# 4. Deploy
+# 4. Create the least-privilege database roles (once; again only to change a role's password)
+docker compose -f docker-compose.production.yml --env-file .env.production --profile provision run --rm --build provision
+
+# 5. Deploy
 docker compose -f docker-compose.production.yml --env-file .env.production up -d --build
 ```
+
+The API connects as `qs_app`, never as the superuser; see [Database roles](#database-roles). `postgres` and `redis` run as their images' unprivileged users, because every service drops all Linux capabilities. Started as root, their entrypoints need `CHOWN`, `SETUID` and `SETGID` to switch user, and without those capabilities neither starts.
 
 > [!NOTE]
 > Research jobs run in worker subprocesses that the web containers start themselves (one per gunicorn worker, `WEB_CONCURRENCY`), so no extra service is needed. To scale workers separately, set `RESEARCH_WORKER_MODE=external` on the web service and run `python -m backend.worker` as its own service from the same image, with the same environment.

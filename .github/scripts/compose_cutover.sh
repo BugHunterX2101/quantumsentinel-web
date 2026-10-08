@@ -7,6 +7,7 @@
 #   D. who is connected, what the API's environment holds, data from era A, research jobs
 #   E. the backup service dumps as qs_backup
 #   F. the API restarts as qs_app
+#   G. a fresh install: provision, then up
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -144,5 +145,14 @@ echo "::group::F. the API restarts as qs_app"
 "${NEW[@]}" restart quantumsentinel
 ready
 test "$(sessions)" = "qs_app"
+echo "::endgroup::"
+
+echo "::group::G. a fresh install, as the README deploys it"
+"${NEW[@]}" --profile provision --profile backup down -v
+"${NEW[@]}" --profile provision run --rm provision
+"${NEW[@]}" up -d
+ready
+test "$(sessions)" = "qs_app"
+python3 .github/scripts/compose_smoke.py seed fresh@example.com
 echo "::endgroup::"
 echo "cutover verified"

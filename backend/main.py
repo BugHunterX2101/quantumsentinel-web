@@ -29,10 +29,13 @@ import sys
 import asyncio
 from contextlib import asynccontextmanager
 import hashlib
+import math
 from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect, Query, Cookie
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -333,6 +336,24 @@ async def _risk_state_unavailable(_request, _exc):
     # Security-critical shared state (kill switches) could not be read:
     # refuse the action rather than assume the state is permissive.
     return JSONResponse({"detail": "risk state unavailable"}, status_code=503)
+
+
+def _non_finite_as_text(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)                     # "nan", "inf", "-inf"
+    if isinstance(value, dict):
+        return {k: _non_finite_as_text(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_non_finite_as_text(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _invalid_request(_request, exc: RequestValidationError):
+    # FastAPI's own 422 response, except that a rejected NaN or Infinity
+    # echoed back as the error's input is written as text: JSON cannot carry
+    # it, and encoding it turned the 422 into a 500.
+    return JSONResponse({"detail": _non_finite_as_text(jsonable_encoder(exc.errors()))}, status_code=422)
 
 
 @app.exception_handler(SQLAlchemyTimeoutError)
@@ -1768,7 +1789,8 @@ def export_portfolio(user: models.User = Depends(get_current_user), db: Session 
 # Research Engine (Phase 1) — Advanced backtesting, walk-forward, stat tests
 # --------------------------------------------------------------------------
 
-def _queue_research(db: Session, user: models.User, kind: str, req) -> JSONResponse:
+def _queue_job(db: Session, user: models.User, kind: str, params: dict,
+               same_as: tuple[str, ...] = ()) -> JSONResponse:
     """Queue a research job and answer 202 with the job to poll.
 
     Research runs in a worker process (backend/worker.py), never in the API
@@ -1776,11 +1798,15 @@ def _queue_research(db: Session, user: models.User, kind: str, req) -> JSONRespo
     database connection for its whole duration and stall trading requests.
     """
     try:
-        job = research_jobs.enqueue(db, user.id, kind, req.model_dump())
+        job = research_jobs.enqueue(db, user.id, kind, params, same_as=same_as)
     except research_jobs.QueueFull as exc:
         raise HTTPException(429, str(exc)) from exc
     return JSONResponse(research_jobs.view(db, job), status_code=202,
                         headers={"Location": f"/api/research/jobs/{job.id}"})
+
+
+def _queue_research(db: Session, user: models.User, kind: str, req) -> JSONResponse:
+    return _queue_job(db, user, kind, req.model_dump())
 
 
 @app.post("/api/research/backtest", status_code=202)
@@ -1801,19 +1827,16 @@ def walk_forward_validation(req: schemas.WalkForwardRequest,
     return _queue_research(db, user, "walk_forward", req)
 
 
-@app.post("/api/research/stat-test", status_code=200)
+@app.post("/api/research/stat-test", status_code=202)
 def statistical_tests(req: schemas.StatTestRequest,
                       user: models.User = Depends(get_current_user),
                       db: Session = Depends(get_db)):
-    """Run statistical tests on strategy returns: t-test, bootstrap,
+    """Queue statistical tests on strategy returns: t-test, bootstrap,
     permutation, Deflated Sharpe Ratio, and multiple-testing corrections."""
-    import numpy as np
-    from .services.stat_tests import run_full_stat_tests
-
     returns = None
     trial_family = req.trial_family
     if req.returns:
-        returns = np.array(req.returns)
+        returns = list(req.returns)
     elif req.backtest_id:
         row = db.get(models.Backtest, req.backtest_id)
         if not row or row.user_id != user.id:
@@ -1823,31 +1846,31 @@ def statistical_tests(req: schemas.StatTestRequest,
         if rj.get("daily_returns_net"):
             # Full-resolution daily returns; the stored equity curve is
             # downsampled for charting and has the wrong periodicity.
-            returns = np.array(rj["daily_returns_net"], dtype=float)
+            returns = list(rj["daily_returns_net"])
         else:
             curve = rj.get("equity_curve_net") or rj.get("equity_curve", [])
             if len(curve) > 2:
-                returns = np.array([
-                    (curve[i] - curve[i - 1]) / curve[i - 1] if curve[i - 1] else 0
-                    for i in range(1, len(curve))
-                ])
+                returns = [(curve[i] - curve[i - 1]) / curve[i - 1] if curve[i - 1] else 0
+                           for i in range(1, len(curve))]
     if returns is None or len(returns) < 5:
         raise HTTPException(422, "Need at least 5 return observations")
+    if len(returns) > schemas.STAT_TEST_MAX_RETURNS:
+        raise HTTPException(422, f"At most {schemas.STAT_TEST_MAX_RETURNS:,} return observations "
+                                 f"can be tested; got {len(returns):,}")
+    if not all(isinstance(r, (int, float)) and math.isfinite(r) for r in returns):
+        raise HTTPException(422, "Every return observation must be a finite number")
 
     # The Deflated Sharpe discount uses at least every configuration the
-    # server evaluated for this research family, whatever is declared.
+    # server evaluated for this research family (counted now, when the test
+    # is queued), whatever is declared.
     server_counted = research_trials.count(db, user.id, trial_family) if trial_family else 0
     n_trials = max(req.n_strategies_tested, server_counted)
-    result = run_full_stat_tests(returns, n_strategies_tested=n_trials)
-    result["trial_count"] = {"used": n_trials, "declared": req.n_strategies_tested,
-                             "server_counted": server_counted, "family": trial_family}
-
-    security_service.write_audit_log(
-        db, user.id, "STAT_TEST", "research", None,
-        {"n_obs": len(returns), "n_strategies": n_trials,
-         "declared_strategies": req.n_strategies_tested, "server_counted": server_counted}
-    )
-    return result
+    return _queue_job(db, user, "stat_test", {
+        "returns": [float(r) for r in returns], "n_trials": n_trials,
+        "declared": req.n_strategies_tested, "server_counted": server_counted,
+        "trial_family": trial_family, "n_bootstrap": req.n_bootstrap,
+        "n_permutations": req.n_permutations,
+    })
 
 
 # --------------------------------------------------------------------------
@@ -2253,22 +2276,20 @@ def experiment_get(experiment_id: str, user: models.User = Depends(get_current_u
     return exp.to_dict()
 
 
-@app.post("/api/experiments/{experiment_id}/run", status_code=200)
+@app.post("/api/experiments/{experiment_id}/run", status_code=202)
 def experiment_run(experiment_id: str, user: models.User = Depends(get_current_user),
                    db: Session = Depends(get_db)):
-    """Execute a platform strategy on the experiment's stored inputs, then
-    record the result and sign the manifest. Results are recorded once."""
+    """Queue execution of a platform strategy on the experiment's stored
+    inputs; the job then records the result and signs the manifest (once).
+    Submitting again while the run is queued or running returns its job."""
     from .services.experiment_registry import ExperimentError, PersistentExperimentRegistry
-    registry = PersistentExperimentRegistry(db, user.id)
     try:
-        exp = registry.run(experiment_id)
+        params = PersistentExperimentRegistry(db, user.id).run_job_params(experiment_id)
     except ExperimentError as exc:
         raise HTTPException(422, str(exc)) from exc
-    if not exp:
+    if params is None:
         raise HTTPException(404, f"Experiment {experiment_id} not found")
-    security_service.write_audit_log(db, user.id, "EXPERIMENT_RUN", "experiment", experiment_id,
-                                     {"result_hash": exp.result_hash})
-    return {**exp.to_dict(), "results": exp.results}
+    return _queue_job(db, user, "experiment_run", params, same_as=("experiment_id",))
 
 
 @app.get("/api/experiments/{experiment_id}/manifest", status_code=200)
@@ -2282,62 +2303,37 @@ def experiment_manifest(experiment_id: str, user: models.User = Depends(get_curr
     return manifest
 
 
-@app.post("/api/experiments/{experiment_id}/replay", status_code=200)
+@app.post("/api/experiments/{experiment_id}/replay", status_code=202)
 def experiment_replay(experiment_id: str, request_body: dict, user: models.User = Depends(get_current_user),
                       db: Session = Depends(get_db)):
-    """Deterministic verification of an experiment.
+    """Queue deterministic verification of an experiment.
 
     Always verifies inputs: the (optionally supplied) dataset, parameters and
     seed are hashed and compared with the recorded ones. For a completed
-    platform-executable experiment it then re-executes the strategy from the
-    stored inputs and compares the result hash (true replay).
+    platform-executable experiment the job then re-executes the strategy from
+    the stored inputs and compares the result hash (true replay).
     """
-    from .services.experiment_registry import PersistentExperimentRegistry, hash_dataset, hash_parameters
-    registry = PersistentExperimentRegistry(db, user.id)
-    exp = registry.get(experiment_id)
-    inputs = registry.inputs(experiment_id)
-    if not exp or inputs is None:
+    from .services.experiment_registry import PersistentExperimentRegistry
+    params = PersistentExperimentRegistry(db, user.id).replay_job_params(experiment_id, request_body)
+    if params is None:
         raise HTTPException(404, f"Experiment {experiment_id} not found")
-    stored_dataset, stored_parameters, stored_seed = inputs
-    dataset = request_body.get("dataset", stored_dataset)
-    parameters = request_body.get("parameters", stored_parameters)
-    seed = request_body.get("random_seed", stored_seed)
-    d_hash = hash_dataset(dataset) if dataset is not None else ""
-    p_hash = hash_parameters(parameters)
-    matches = d_hash == exp.dataset_hash and p_hash == exp.parameter_hash and seed == exp.random_seed
-    response = {
-        "experiment_id": experiment_id,
-        "dataset_hash": d_hash,
-        "parameter_hash": p_hash,
-        "random_seed": seed,
-        "matches_experiment": matches,
-        "replay_status": "deterministic_input_verification",
-        "result_reproduced": None,
-    }
-    if matches and exp.result_hash:
-        replay = registry.reexecute(experiment_id)
-        if replay and replay["executed"]:
-            response.update(replay_status="re-executed", result_hash=replay["result_hash"],
-                            recorded_result_hash=exp.result_hash,
-                            result_reproduced=replay["result_reproduced"],
-                            engine_version_matches=replay["engine_version_matches"])
-    return response
+    return _queue_job(db, user, "experiment_replay", params)
 
 
-@app.post("/api/experiments/{experiment_id}/validate", status_code=200)
+@app.post("/api/experiments/{experiment_id}/validate", status_code=202)
 def experiment_validate(experiment_id: str, user: models.User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
-    """Run integrity and deployment gates; VALIDATED only if every gate passes."""
+    """Queue the integrity and deployment gates (re-executing the strategy);
+    the experiment becomes VALIDATED only if every gate passes. Submitting
+    again while validation is queued or running returns its job."""
     from .services.experiment_registry import ExperimentError, PersistentExperimentRegistry
     try:
-        report = PersistentExperimentRegistry(db, user.id).validate(experiment_id)
+        params = PersistentExperimentRegistry(db, user.id).validate_job_params(experiment_id)
     except ExperimentError as exc:
         raise HTTPException(409, str(exc)) from exc
-    if report is None:
+    if params is None:
         raise HTTPException(404, f"Experiment {experiment_id} not found")
-    security_service.write_audit_log(db, user.id, "EXPERIMENT_VALIDATED", "experiment", experiment_id,
-                                     {"all_gates_passed": report["all_gates_passed"]})
-    return report
+    return _queue_job(db, user, "experiment_validate", params, same_as=("experiment_id",))
 
 
 @app.post("/api/experiments/{experiment_id}/approve", status_code=200)
@@ -2672,9 +2668,31 @@ if FRONTEND_DIR.exists():
 
     app.mount("/assets", CachedStaticFiles(directory=str(FRONTEND_DIR)), name="assets")
 
+    # Assets are cached for a day, so index.html names each one with a hash
+    # of its content: a deploy that changes app.js (e.g. to follow an API
+    # change) reaches every browser on its next page load, never a day late.
+    _VERSIONED_ASSETS = ("styles.css", "vendor/three-global.js", "bg3d.js", "app.js")
+    _index_cache: tuple = (None, "")
+
+    def _index_html() -> str:
+        global _index_cache
+        files = [FRONTEND_DIR / "index.html"] + [FRONTEND_DIR / name for name in _VERSIONED_ASSETS]
+        key = tuple(f.stat().st_mtime_ns if f.exists() else None for f in files)
+        if _index_cache[0] != key:
+            html = files[0].read_text(encoding="utf-8")
+            for name, path in zip(_VERSIONED_ASSETS, files[1:]):
+                if path.exists():
+                    version = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+                    html = html.replace(f'"/assets/{name}"', f'"/assets/{name}?v={version}"')
+            _index_cache = (key, html)
+        return _index_cache[1]
+
+    def _index_response() -> HTMLResponse:
+        return HTMLResponse(_index_html(), headers={"Cache-Control": "no-cache"})
+
     @app.get("/")
     def index():
-        return FileResponse(str(FRONTEND_DIR / "index.html"))
+        return _index_response()
 
     @app.get("/robots.txt", include_in_schema=False)
     def robots():
@@ -2699,4 +2717,4 @@ if FRONTEND_DIR.exists():
         excluded = ("api/", "assets/", "health/", "health", "metrics")
         if any(path.startswith(prefix) for prefix in excluded):
             raise HTTPException(404, "Not found")
-        return FileResponse(str(FRONTEND_DIR / "index.html"))
+        return _index_response()

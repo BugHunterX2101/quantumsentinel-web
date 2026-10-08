@@ -199,6 +199,7 @@ class TestExperimentRegistry:
     def test_experiment_endpoints_use_the_durable_user_owned_registry(self, db):
         """Create → retrieve → replay works across independently built registries."""
         from backend import main
+        from research_job_helpers import result_of
 
         owner = models.User(email="research-endpoint-owner@example.com", password_hash="x")
         other_user = models.User(email="research-endpoint-other@example.com", password_hash="x")
@@ -213,7 +214,7 @@ class TestExperimentRegistry:
 
         created = main.experiment_create(request, owner, db)
         restored = main.experiment_get(created["experiment_id"], owner, db)
-        replay = main.experiment_replay(created["experiment_id"], {}, owner, db)
+        replay = result_of(db, main.experiment_replay(created["experiment_id"], {}, owner, db))
 
         assert restored["dataset_hash"] == created["dataset_hash"]
         assert replay["matches_experiment"] is True

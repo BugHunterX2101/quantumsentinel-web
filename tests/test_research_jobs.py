@@ -23,6 +23,7 @@ from sqlalchemy.orm import sessionmaker
 from backend import main, models, schemas, worker
 from backend.services import (backtest_service, research_jobs, research_tasks, research_trials,
                               security_service)
+from research_job_helpers import InlineJobProcess, result_of
 
 
 # ── fixtures and helpers ──────────────────────────────────────────────────────
@@ -48,16 +49,6 @@ def make_user(db, email="researcher@example.com", role="user"):
 
 def body(response):
     return json.loads(response.body)
-
-
-class InlineJobProcess:
-    """Runs tasks in this process (so monkeypatches apply); no time limit."""
-
-    def run(self, target, params, timeout, on_tick, tick_seconds=1.0):
-        return worker._run_target(target, params)
-
-    def stop(self):
-        pass
 
 
 def make_worker(Session, job_process=None, **kwargs):
@@ -244,7 +235,7 @@ class TestWorkerExecution:
         assert result["trials_in_family"] == 1
         assert main.list_backtests(user=user, db=db)[0]["id"] == row.id
         # The stored row feeds the statistical tests exactly as before.
-        stat = main.statistical_tests(schemas.StatTestRequest(backtest_id=row.id), user, db)
+        stat = result_of(db, main.statistical_tests(schemas.StatTestRequest(backtest_id=row.id), user, db))
         assert stat["trial_count"]["server_counted"] == 1
         audit = db.execute(select(models.AuditLog).where(
             models.AuditLog.action == "BACKTEST_COMPLETED")).scalars().one()

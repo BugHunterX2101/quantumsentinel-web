@@ -397,7 +397,9 @@ def deflated_sharpe_ratio(observed_sharpe: float,
 
 def run_full_stat_tests(returns: np.ndarray,
                         n_strategies_tested: int = 1,
-                        strategy_p_values: list[float] | None = None
+                        strategy_p_values: list[float] | None = None,
+                        n_bootstrap: int = 10_000,
+                        n_permutations: int = 10_000,
                         ) -> dict:
     """Run the complete statistical testing suite on strategy returns.
 
@@ -410,10 +412,10 @@ def run_full_stat_tests(returns: np.ndarray,
     results["ttest_ols"] = ttest_mean_return(returns, use_nw=False)
 
     # 2. Bootstrap CI for Sharpe
-    results["bootstrap_sharpe"] = bootstrap_sharpe_ci(returns)
+    results["bootstrap_sharpe"] = bootstrap_sharpe_ci(returns, n_bootstrap=n_bootstrap)
 
     # 3. Permutation test
-    results["permutation_test"] = permutation_test(returns)
+    results["permutation_test"] = permutation_test(returns, n_permutations=n_permutations)
 
     # 4. Autocorrelation
     results["ljung_box"] = ljung_box_test(returns)

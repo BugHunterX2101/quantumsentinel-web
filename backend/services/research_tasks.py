@@ -636,3 +636,40 @@ def research_report(params: dict) -> TaskOutput:
 
     audit = {"n_assets": len(req.assets), "period": req.period, "strategy": req.strategy_type}
     return TaskOutput(report, audit)
+
+
+# --------------------------------------------------------------------------
+# Statistical tests and experiment execution
+# --------------------------------------------------------------------------
+
+def statistical_tests(params: dict) -> TaskOutput:
+    """t-tests, bootstrap and permutation tests, Ljung-Box and the Deflated
+    Sharpe Ratio on returns the API resolved (with its trial count)."""
+    from .stat_tests import run_full_stat_tests
+    req = schemas.StatTestJob.model_validate(params)
+    returns = np.asarray(req.returns, dtype=float)
+    result = run_full_stat_tests(returns, n_strategies_tested=req.n_trials,
+                                 n_bootstrap=req.n_bootstrap, n_permutations=req.n_permutations)
+    result["trial_count"] = {"used": req.n_trials, "declared": req.declared,
+                             "server_counted": req.server_counted, "family": req.trial_family}
+    audit = {"n_obs": len(returns), "n_strategies": req.n_trials,
+             "declared_strategies": req.declared, "server_counted": req.server_counted}
+    return TaskOutput(result, audit)
+
+
+def experiment_execution(params: dict) -> TaskOutput:
+    """Execute a platform strategy on an experiment's stored inputs, for a
+    run, validation or replay job. The worker records the outcome (see
+    experiment_registry.finalize_*_job); this only computes."""
+    from . import experiment_registry as er
+    req = schemas.ExperimentJob.model_validate(params)
+    if not req.execute:
+        return TaskOutput({"executed": False}, {})
+    try:
+        results = er.run_strategy(req.strategy_id, req.dataset, req.parameters, req.random_seed)
+    except er.ExperimentError as exc:
+        raise TaskError(422, str(exc)) from exc
+    # Hashed here, on the strategy's own output, exactly as a synchronous
+    # run hashed it, so replays compare like with like.
+    return TaskOutput({"executed": True, "results": results, "result_hash": er.hash_results(results),
+                       "inputs": er.input_hashes(req.dataset, req.parameters, req.random_seed)}, {})

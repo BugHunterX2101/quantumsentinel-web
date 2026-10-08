@@ -20,6 +20,7 @@ from backend.services import (backtest_service, event_simulator, historical_data
                               research_trials, security_service, stat_tests, strategy_signals,
                               trading_service, walk_forward)
 from backend.services.execution_model import zero_cost_config
+from research_job_helpers import result_of
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -308,10 +309,10 @@ class TestResearchTrials:
         fam = research_trials.family_hash("ma_crossover", ["AAPL"])
         research_trials.record(db, user.id, fam, [{"fast": f} for f in range(25)], "walk_forward")
         returns = list(np.random.default_rng(1).normal(0.001, 0.01, 300))
-        declared_only = main.statistical_tests(
-            schemas.StatTestRequest(returns=returns, n_strategies_tested=1), user, db)
-        counted = main.statistical_tests(
-            schemas.StatTestRequest(returns=returns, n_strategies_tested=1, trial_family=fam), user, db)
+        declared_only = result_of(db, main.statistical_tests(
+            schemas.StatTestRequest(returns=returns, n_strategies_tested=1), user, db))
+        counted = result_of(db, main.statistical_tests(
+            schemas.StatTestRequest(returns=returns, n_strategies_tested=1, trial_family=fam), user, db))
         assert declared_only["trial_count"]["used"] == 1
         assert counted["trial_count"] == {"used": 25, "declared": 1, "server_counted": 25, "family": fam}
         assert counted["deflated_sharpe"]["n_trials"] == 25

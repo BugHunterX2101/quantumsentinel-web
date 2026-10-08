@@ -2828,8 +2828,7 @@ document.getElementById('research-stat-form').addEventListener('submit', async (
   if (_lastBacktestTrialFamily) body.trial_family = _lastBacktestTrialFamily;
 
   try {
-    const d = await api('/api/research/stat-test', { method: 'POST', body: JSON.stringify(body) });
-    renderStatResult(d, resultEl);
+    renderStatResult(await researchJob('/api/research/stat-test', body, resultEl), resultEl);
   } catch (err) {
     errEl.textContent = err.message;
     resultEl.innerHTML = '<div class="empty-state">Statistical tests failed.</div>';

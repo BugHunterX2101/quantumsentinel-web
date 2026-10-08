@@ -243,9 +243,17 @@ def test_the_research_worker_runs_every_kind_of_job_as_its_own_role(provisioned,
     roles = provisioned.roles
     api = sessionmaker(bind=provisioned.engine_as(roles.app))()
     worker_sessions = sessionmaker(bind=provisioned.engine_as(roles.research_worker))
+    # The worker registers the signing key itself (worker.py at startup). Reset
+    # the process-wide flag so that happens here whichever tests ran before.
+    identity = security_service.server_identity
+    monkeypatch.setattr(identity, "_registered", False)
     with worker_sessions() as db:
         assert db.execute(text("SELECT current_user")).scalar() == roles.research_worker
-        assert security_service.server_identity.register_in_db(db)
+        # Its startup check (worker._wait_for_schema) reads the schema revision.
+        assert current_revision(db.connection()) == head_revision()
+        identity.ensure_registered(db)
+        assert db.execute(text("SELECT key_id FROM server_signing_keys WHERE fingerprint = :f"),
+                          {"f": identity.fingerprint}).scalar() == identity.key_id
     user = models.User(email="worker-role@example.com", password_hash="x", role="user")
     api.add(user)
     api.commit()
@@ -351,6 +359,23 @@ def test_migrations_run_as_the_owner_and_restore_exact_grants(provisioned, monke
         app.execute("INSERT INTO unlisted_table VALUES (1)")
     su.execute("DROP TABLE unlisted_table, listed_table")
     monkeypatch.undo()
+    assert_exactly_provisioned(provisioned)
+
+
+def test_a_schema_provisioned_before_a_role_existed_still_migrates(provisioned):
+    """A deployment provisioned before qs_research_worker was added has no such
+    role. The next release's migration still reapplies the grants of the roles
+    it has, and running provision-roles again creates the missing one."""
+    roles = provisioned.roles
+    provisioned.migrate_as_owner("0002")
+    su = provisioned.connect()
+    su.execute(f'DROP OWNED BY "{roles.research_worker}"')
+    su.execute(f'DROP ROLE "{roles.research_worker}"')
+    su.execute(f'GRANT TRUNCATE ON trades TO "{roles.app}"')
+    assert migrate(provisioned.engine_as(roles.migrator), roles) == head_revision()
+    assert table_privileges(su, provisioned.schema, roles.app) == {
+        name: set(p) for name, p in db_roles.APP_TABLE_PRIVILEGES.items()}
+    assert provisioned.provision()["created"] == [roles.research_worker]
     assert_exactly_provisioned(provisioned)
 
 

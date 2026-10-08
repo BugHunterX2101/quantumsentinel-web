@@ -771,7 +771,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `DB_LOCK_TIMEOUT_MS` | No | Server-side limit on waiting for a lock (default 10000) |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | No | A session idle inside an open transaction is ended after this long (default 60000) |
 | `DB_MIGRATE_ON_STARTUP` | No | `true` (default): API processes apply pending migrations at startup, serialised by a database lock; `false`: run `python -m backend.manage migrate` as a release step |
-| `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD`, `DB_BACKUP_PASSWORD` | `provision-roles`; Docker production | Passwords for `qs_app`, `qs_migrator` and `qs_backup`, read by `python -m backend.manage provision-roles` (each also as `*_FILE`). Needed to create a role; given for an existing role, its password is changed. `docker-compose.production.yml` also builds each service's `DATABASE_URL` from them, so they must be URL-safe |
+| `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_MIGRATOR_PASSWORD`, `DB_BACKUP_PASSWORD` | `provision-roles`; Docker production | Passwords for `qs_app`, `qs_research_worker`, `qs_migrator` and `qs_backup`, read by `python -m backend.manage provision-roles` (each also as `*_FILE`). Needed to create a role; given for an existing role, its password is changed. `docker-compose.production.yml` also builds each service's `DATABASE_URL` from them, so they must be URL-safe |
 | `CSRF_SECRET` | Prod | Signs CSRF tokens and keys the experiment-manifest HMACs; every API process must share it. Outside production each process makes up its own |
 | `REFRESH_TOKEN_SECRET` | Prod | Required by the production startup check |
 | `JWT_PRIVATE_KEY` | Prod | RS256 private key (PEM, `\n`-escaped) |
@@ -813,20 +813,21 @@ PostgreSQL 16 or newer is the only supported database; any other `DATABASE_URL` 
 
 ### Database roles
 
-Connected as the superuser that the `postgres` image creates from `POSTGRES_USER`, the application bypasses every grant, row-level security policy and trigger, and any SQL it runs can drop the schema, read server files or run programs on the database host (`COPY ... TO PROGRAM`). [`backend/db_roles.py`](backend/db_roles.py) defines four roles instead:
+Connected as the superuser that the `postgres` image creates from `POSTGRES_USER`, the application bypasses every grant, row-level security policy and trigger, and any SQL it runs can drop the schema, read server files or run programs on the database host (`COPY ... TO PROGRAM`). [`backend/db_roles.py`](backend/db_roles.py) defines five roles instead:
 
 | Role | Login | Privileges |
 |---|---|---|
 | `qs_owner` | No | Owns the schema and every object in it |
 | `qs_migrator` | Yes | None of its own. Migrations run after `SET LOCAL ROLE qs_owner`, so everything they create is owned by `qs_owner` |
-| `qs_app` | Yes | The API and research workers: exactly the table privileges in `APP_TABLE_PRIVILEGES` (`SELECT` only on `alembic_version`). No DDL or `TRUNCATE`; it cannot change roles, ownership or triggers |
+| `qs_app` | Yes | The API (and the research worker it embeds, outside Docker production): exactly the table privileges in `APP_TABLE_PRIVILEGES` (`SELECT` only on `alembic_version`). No DDL or `TRUNCATE`; it cannot change roles, ownership or triggers |
+| `qs_research_worker` | Yes | A research worker run as its own service: exactly `WORKER_TABLE_PRIVILEGES`. That covers the job queue, research results, the server signing key, backtest history (insert only) and the audit trail (read and append only). It has nothing on users, accounts, orders, positions, API keys, user keys, refresh tokens or webhooks |
 | `qs_backup` | Yes | `pg_read_all_data`, for `pg_dump` |
 
-`APP_TABLE_PRIVILEGES` is an allow-list: a table it does not name gets no privilege, and the test suite fails until the table is listed. Grants are reapplied after every migration that changes the schema revision.
+Both privilege maps are allow-lists. A table `APP_TABLE_PRIVILEGES` does not name gets no privilege, and the test suite fails until the table is listed; a table `WORKER_TABLE_PRIVILEGES` does not name is out of the worker's reach. A test runs every kind of research job through a worker connected as `qs_research_worker`, and another checks that every other table and every privileged statement is refused to it. Grants are reapplied after every migration that changes the schema revision.
 
 To move a deployment over:
 
-1. As the superuser (`DATABASE_URL` naming it), with `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` set, run `python -m backend.manage provision-roles`. It migrates the schema to the latest revision first, then creates the roles and hands them the schema in one transaction. Only SCRAM verifiers reach the server, so no password appears in its logs. It can run while the application serves requests. Changing a table's owner needs the table's exclusive lock, and taking those one at a time deadlocked with order traffic in a rehearsal (provisioning held `positions` and waited for `users`, while an order held `users` and waited for `positions`). So the command takes every lock it needs in one `LOCK ... NOWAIT`. If any table is in use, it lets go of everything and tries again moments later; queries wait at most a moment. If the tables stay busy for 10 s, it exits 1 without changing anything. It is safe to run again, and a second run takes no table locks.
+1. As the superuser (`DATABASE_URL` naming it), with `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` set, run `python -m backend.manage provision-roles`. It migrates the schema to the latest revision first, then creates the roles and hands them the schema in one transaction. Only SCRAM verifiers reach the server, so no password appears in its logs. It can run while the application serves requests. Changing a table's owner needs the table's exclusive lock, and taking those one at a time deadlocked with order traffic in a rehearsal (provisioning held `positions` and waited for `users`, while an order held `users` and waited for `positions`). So the command takes every lock it needs in one `LOCK ... NOWAIT`. If any table is in use, it lets go of everything and tries again moments later; queries wait at most a moment. If the tables stay busy for 10 s, it exits 1 without changing anything. It is safe to run again, and a second run takes no table locks.
 2. Point `DATABASE_URL` for the API and workers at `qs_app`. With `DB_MIGRATE_ON_STARTUP=true` they start normally while the schema is current, and refuse to start if a migration is pending.
 3. Run each release's migrations as `qs_migrator`: `DATABASE_URL=<qs_migrator URL> python -m backend.manage migrate`.
 4. Take backups as `qs_backup`: `pg_dump -U qs_backup`. A dump made this way records `qs_owner` as the owner of everything; create the roles before restoring it, or restore with `--no-owner`.
@@ -835,13 +836,15 @@ Running `provision-roles` again restores the intended role attributes, membershi
 
 `docker-compose.production.yml` is wired this way:
 
-- The API connects as `qs_app`.
-- A one-off `migrate` service applies migrations as `qs_migrator`, and the API starts only once it has succeeded.
+- The API connects as `qs_app` and runs no research itself (`RESEARCH_WORKER_MODE=external`).
+- The `research-worker` service runs research jobs as `qs_research_worker`, limited to 1 CPU and 1 GB. Run more with `--scale research-worker=N`.
+- A one-off `migrate` service applies migrations as `qs_migrator`; the API and the worker start only once it has succeeded.
 - The `backup` service dumps as `qs_backup`.
 - A `provision` service, under its own profile, runs `provision-roles` as the superuser.
-- Only `postgres` and `provision` receive the superuser's password. Every service that loads `.env.production` blanks the database password variables, so that file cannot leak one into the API.
+- Only `postgres` and `provision` receive the superuser's password. Every service that loads `.env.production` blanks every database password variable, so that file cannot leak one into the API or the worker.
+- `postgres` and `redis` are only on the `data` network, which has no route out. So the database cannot reach the internet, and nginx (only on `edge`) cannot reach the database. The API and the research worker join both networks, because they need the internet for market data.
 
-To move an existing Docker deployment over, add `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` to `.env.production`, then run, in this order:
+To move an existing Docker deployment over, add `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` to `.env.production`, then run, in this order:
 
 ```bash
 docker compose -f docker-compose.production.yml --env-file .env.production --profile provision run --rm provision
@@ -850,12 +853,15 @@ docker compose -f docker-compose.production.yml --env-file .env.production up -d
 
 The first command runs while the API keeps serving. The second replaces the API container; in CI the API was back about 18 s later. Run them in this order. `up` before `provision` takes the API down: Compose replaces the API container, then `migrate` cannot log in (`password authentication failed for user "qs_migrator"`), so the new API never starts. Running the two commands then restores it; that took 19 s in CI.
 
-The CI job `deploy-compose` checks this end to end on every push. It deploys the stack with Docker and writes data as the superuser. It then provisions while the API runs and brings the stack up again. It checks four things:
+A deployment that already runs on these roles, provisioned before `qs_research_worker` existed, takes the same two commands after `DB_RESEARCH_WORKER_PASSWORD` is added. Without that variable Compose refuses to start; with it but before `provision`, the `research-worker` service cannot log in. It retries every 2 s (`database not reachable yet` in its log), so research jobs wait in the queue and start once `provision` has run.
 
-- only `qs_app` sessions reach the database, and neither the API nor `migrate` holds the superuser password;
-- the earlier data is intact and research jobs run;
+The CI job `deploy-compose` checks this end to end on every push. It deploys the stack with Docker and writes data as the superuser. It then provisions while the API runs and brings the stack up again. It checks five things:
+
+- only `qs_app` and `qs_research_worker` sessions reach the database, and none of the API, the worker and `migrate` holds the superuser password;
+- the earlier data is intact, and research jobs run in the `research-worker` container;
+- nginx cannot resolve `postgres`, and `postgres` cannot reach the internet, while the API and the worker can;
 - the backup is a full dump made as `qs_backup`;
-- the API restarts as `qs_app`.
+- the API and the worker restart as their own roles.
 
 It also deploys a fresh install the same way (`provision`, then `up`).
 
@@ -920,7 +926,7 @@ docker compose -f docker-compose.production.yml --env-file .env.production up -d
 The API connects as `qs_app`, never as the superuser; see [Database roles](#database-roles). `postgres` and `redis` run as their images' unprivileged users, because every service drops all Linux capabilities. Started as root, their entrypoints need `CHOWN`, `SETUID` and `SETGID` to switch user, and without those capabilities neither starts.
 
 > [!NOTE]
-> Research jobs run in worker subprocesses that the web containers start themselves (one per gunicorn worker, `WEB_CONCURRENCY`), so no extra service is needed. To scale workers separately, set `RESEARCH_WORKER_MODE=external` on the web service and run `python -m backend.worker` as its own service from the same image, with the same environment.
+> In `docker-compose.production.yml`, research jobs run in the `research-worker` service as `qs_research_worker`, and the web container runs none (`RESEARCH_WORKER_MODE=external`). Outside it, each API process starts its own worker subprocess by default (`embedded`, one per gunicorn worker), so nothing else needs to be started.
 
 > [!IMPORTANT]
 > Production mode deliberately refuses the bundled pure-Python reference PQC backend.

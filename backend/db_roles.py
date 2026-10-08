@@ -74,12 +74,14 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
 # the audit writer). Foreign-key checks run as the table owner, so writing
 # rows that reference users needs no privilege on users.
 WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
+    # The worker waits at startup until the schema is at its code's revision.
     "alembic_version": ("SELECT",),
     # Signed audit events for finished jobs; the chain is append-only here.
     "audit_chain_links": ("SELECT", "INSERT"),
     "audit_logs": ("SELECT", "INSERT"),
-    # The dashboard backtest's history row.
-    "backtests": ("SELECT", "INSERT"),
+    # The dashboard backtest's history row. Its id is made client-side, so
+    # the insert returns nothing and needs no SELECT; the API reads it back.
+    "backtests": ("INSERT",),
     # Experiment finalizers lock the experiment row and record the outcome.
     "research_experiments": ("SELECT", "UPDATE"),
     # Claim, lease, finish, reap and purge jobs; only the API enqueues them.
@@ -248,7 +250,12 @@ def apply_grants(conn: Connection, roles: Roles = ROLES) -> list[str]:
     role has no privilege on them.
     """
     schema = sql.Identifier(conn.execute("SELECT current_schema()").fetchone()[0])
-    grantees = sql.SQL(", ").join([sql.SQL("PUBLIC"), *map(sql.Identifier, roles.logins)])
+    # A schema provisioned before a login role was added lacks that role
+    # until provision-roles runs again; it has nothing to revoke or receive.
+    present = {name for (name,) in conn.execute(
+        "SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)", (list(roles.logins),))}
+    grantees = sql.SQL(", ").join([sql.SQL("PUBLIC"), *(sql.Identifier(role) for role in roles.logins
+                                                         if role in present)])
     for kind in ("TABLES", "SEQUENCES"):
         conn.execute(sql.SQL("REVOKE ALL ON ALL {} IN SCHEMA {} FROM {}").format(
             sql.SQL(kind), schema, grantees))
@@ -257,6 +264,8 @@ def apply_grants(conn: Connection, roles: Roles = ROLES) -> list[str]:
         " AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND "
         + _NOT_EXTENSION_MEMBER.format(oid="c.oid", catalog="'pg_class'") + " ORDER BY 1")]
     for role, allowed in roles.table_privileges():
+        if role not in present:
+            continue
         grantee = sql.Identifier(role)
         for table in tables:
             privileges = allowed.get(table)

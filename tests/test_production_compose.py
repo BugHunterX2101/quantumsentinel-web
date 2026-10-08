@@ -16,11 +16,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE = ROOT / "docker-compose.production.yml"
-PASSWORDS = ("POSTGRES_PASSWORD", "DB_APP_PASSWORD", "DB_MIGRATOR_PASSWORD", "DB_BACKUP_PASSWORD")
+PASSWORDS = ("POSTGRES_PASSWORD", "DB_APP_PASSWORD", "DB_RESEARCH_WORKER_PASSWORD", "DB_MIGRATOR_PASSWORD",
+             "DB_BACKUP_PASSWORD")
 # The services allowed to receive each password.
 HOLDERS = {
     "POSTGRES_PASSWORD": {"postgres", "provision"},
     "DB_APP_PASSWORD": {"quantumsentinel", "provision"},
+    "DB_RESEARCH_WORKER_PASSWORD": {"research-worker", "provision"},
     "DB_MIGRATOR_PASSWORD": {"migrate", "provision"},
     "DB_BACKUP_PASSWORD": {"backup", "provision"},
 }
@@ -39,6 +41,8 @@ def test_each_service_connects_as_its_own_role(services):
     def url(name):
         return services[name]["environment"]["DATABASE_URL"]
     assert url("quantumsentinel").startswith("postgresql+psycopg://qs_app:${DB_APP_PASSWORD")
+    assert url("research-worker").startswith(
+        "postgresql+psycopg://qs_research_worker:${DB_RESEARCH_WORKER_PASSWORD")
     assert url("migrate").startswith("postgresql+psycopg://qs_migrator:${DB_MIGRATOR_PASSWORD")
     assert url("provision").startswith("postgresql+psycopg://quantumsentinel:${POSTGRES_PASSWORD")
     assert "-U qs_backup" in _text(services["backup"])
@@ -55,7 +59,7 @@ def test_services_that_load_the_env_file_blank_every_password_variable(services)
     """Their own password reaches them inside DATABASE_URL; the variables
     themselves would otherwise come straight from the env file."""
     loading = [name for name, service in services.items() if "env_file" in service and name != "provision"]
-    assert loading == ["migrate", "quantumsentinel"]
+    assert loading == ["migrate", "quantumsentinel", "research-worker"]
     for name in loading:
         for password in PASSWORDS:
             assert services[name]["environment"].get(password) == "", (name, password)
@@ -79,6 +83,23 @@ def test_every_service_can_start_with_every_capability_dropped(services):
     assert services["postgres"]["user"] == "postgres"
     assert services["redis"]["user"] == "redis"
     assert set(services["nginx"]["cap_add"]) == {"NET_BIND_SERVICE", "CHOWN", "SETUID", "SETGID"}
+
+
+def test_research_runs_in_its_own_service(services):
+    assert services["quantumsentinel"]["environment"]["RESEARCH_WORKER_MODE"] == "external"
+    assert services["research-worker"]["command"] == ["python", "-m", "backend.worker"]
+    assert services["research-worker"]["depends_on"]["migrate"] == {"condition": "service_completed_successfully"}
+
+
+def test_the_database_has_no_route_out_and_no_route_from_nginx():
+    compose = yaml.safe_load(COMPOSE.read_text())
+    services = compose["services"]
+    assert compose["networks"]["data"] == {"internal": True}
+    for name in ("postgres", "redis", "migrate", "provision", "backup"):
+        assert services[name]["networks"] == ["data"], name
+    assert services["nginx"]["networks"] == ["edge"]
+    for name in ("quantumsentinel", "research-worker"):
+        assert services[name]["networks"] == ["data", "edge"], name
 
 
 def test_external_research_workers_need_a_worker_service(services):

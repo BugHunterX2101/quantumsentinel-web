@@ -929,7 +929,7 @@ docker compose -f docker-compose.production.yml --env-file .env.production up -d
 The API connects as `qs_app`, never as the superuser; see [Database roles](#database-roles). `postgres` and `redis` run as their images' unprivileged users, because every service drops all Linux capabilities. Started as root, their entrypoints need `CHOWN`, `SETUID` and `SETGID` to switch user, and without those capabilities neither starts.
 
 > [!NOTE]
-> In `docker-compose.production.yml`, research jobs run in the `research-worker` service as `qs_research_worker`, and the web container runs none (`RESEARCH_WORKER_MODE=external`). Outside it, each API process starts its own worker subprocess by default (`embedded`, one per gunicorn worker), so nothing else needs to be started.
+> In `docker-compose.production.yml`, research jobs run in the `research-worker` service as `qs_research_worker`, and the web container runs none (`RESEARCH_WORKER_MODE=external`). Outside it, each API process starts its own worker subprocess by default (`embedded`, one per gunicorn worker), so nothing else needs to be started. Either way, research code cannot reach trading or identity code. [`tests/test_research_boundary.py`](tests/test_research_boundary.py) follows every import statement from the worker and from each job kind's target, including imports inside functions, and fails if any path reaches the API, the operator CLI, authentication, trading, the paper broker, portfolios, integrations or Redis.
 
 > [!IMPORTANT]
 > Production mode deliberately refuses the bundled pure-Python reference PQC backend.

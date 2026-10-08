@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .. import models
 from ..crypto import pqc
-from ..config import (PRIVATE_KEY_ENCRYPTION_KEY, SERVER_DSA_PRIVATE_KEY,
+from ..config import (PROCESS_ROLE, PRIVATE_KEY_ENCRYPTION_KEY, SERVER_DSA_PRIVATE_KEY,
                       SERVER_DSA_PUBLIC_KEY, SERVER_DSA_CREATED_AT)
 
 import logging as _logging
@@ -31,6 +31,10 @@ SERVER_KEY_ROTATION_DAYS = 90
 
 if PRIVATE_KEY_ENCRYPTION_KEY:
     _PRIVATE_KEY_FERNET = Fernet(PRIVATE_KEY_ENCRYPTION_KEY.encode())
+elif PROCESS_ROLE != "api":
+    # Research processes never handle users' private keys and are not given
+    # the key that protects them; using it here is a bug, so it fails.
+    _PRIVATE_KEY_FERNET = None
 else:
     # FIX S2: generate an ephemeral key ONLY in development. Every process restart
     # will generate a new key, making previously encrypted private keys permanently
@@ -46,8 +50,14 @@ else:
 
 
 
+def _private_key_fernet() -> Fernet:
+    if _PRIVATE_KEY_FERNET is None:
+        raise RuntimeError(f"users' private keys are not available to a {PROCESS_ROLE} process")
+    return _PRIVATE_KEY_FERNET
+
+
 def protect_private_key(value: str) -> str:
-    return "enc:" + _PRIVATE_KEY_FERNET.encrypt(value.encode()).decode()
+    return "enc:" + _private_key_fernet().encrypt(value.encode()).decode()
 
 
 def unprotect_private_key(value: str) -> str:
@@ -56,7 +66,7 @@ def unprotect_private_key(value: str) -> str:
         # deployment can rotate them without losing access to old orders.
         return value
     try:
-        return _PRIVATE_KEY_FERNET.decrypt(value[4:].encode()).decode()
+        return _private_key_fernet().decrypt(value[4:].encode()).decode()
     except InvalidToken as exc:
         raise ValueError("private key cannot be decrypted with the configured key") from exc
 

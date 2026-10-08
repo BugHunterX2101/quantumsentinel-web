@@ -28,6 +28,25 @@ x-no-db-passwords: &no-db-passwords
   DB_MIGRATOR_PASSWORD: ""
   DB_BACKUP_PASSWORD: ""
 
+# The API's own secrets, which a research worker never uses. Each is blanked
+# along with its *_FILE form, which backend/config.py reads in its place.
+x-no-api-secrets: &no-api-secrets
+  JWT_PRIVATE_KEY: ""
+  JWT_PRIVATE_KEY_FILE: ""
+  JWT_PUBLIC_KEY: ""
+  JWT_PUBLIC_KEY_FILE: ""
+  WEBHOOK_ENCRYPTION_KEY: ""
+  WEBHOOK_ENCRYPTION_KEY_FILE: ""
+  PRIVATE_KEY_ENCRYPTION_KEY: ""
+  PRIVATE_KEY_ENCRYPTION_KEY_FILE: ""
+  REFRESH_TOKEN_SECRET: ""
+  REFRESH_TOKEN_SECRET_FILE: ""
+  CSRF_SECRET: ""
+  CSRF_SECRET_FILE: ""
+  REDIS_PASSWORD: ""
+  REDIS_URL: ""
+  REDIS_URL_FILE: ""
+
 services:
   # postgres and redis run as their images' own unprivileged users. Started as
   # root, their entrypoints chown the data directory and then switch user,
@@ -146,15 +165,17 @@ services:
   # Runs queued research jobs as qs_research_worker, which reaches the job
   # queue, research results and the audit trail, and no user, account, order,
   # position, key or token table. Scale with --scale research-worker=N.
+  # It holds only the secrets it uses (QS_PROCESS_ROLE, backend/config.py):
+  # its database URL and the server signing key. Its job processes hold none.
   research-worker:
     <<: *app
     restart: unless-stopped
     command: ["python", "-m", "backend.worker"]
     environment:
-      <<: *no-db-passwords
+      <<: [*no-db-passwords, *no-api-secrets]
       ENVIRONMENT: production
+      QS_PROCESS_ROLE: research-worker
       DATABASE_URL: postgresql+psycopg://qs_research_worker:${DB_RESEARCH_WORKER_PASSWORD:?Set DB_RESEARCH_WORKER_PASSWORD}@postgres:5432/quantumsentinel
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     networks: [data, edge]
     depends_on:
       postgres:

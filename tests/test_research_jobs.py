@@ -471,6 +471,39 @@ class TestLeases:
 # ── 4. The real child job process ─────────────────────────────────────────────
 
 class TestJobProcess:
+    def test_the_job_process_starts_with_none_of_the_workers_secrets(self, monkeypatch):
+        """Research code runs on users' inputs, so the job process gets the
+        platform's settings and nothing secret: not the database URL, not a
+        key, not a *_FILE pointer to one. The worker's own environment is
+        left exactly as it was."""
+        planted = {"DATABASE_URL": "postgresql+psycopg://u:plant-db@db:5432/x",
+                   "SERVER_DSA_PRIVATE_KEY": "plant-dsa", "JWT_PRIVATE_KEY": "plant-jwt",
+                   "CSRF_SECRET": "plant-csrf", "REDIS_URL": "redis://:plant-redis@redis:6379/0",
+                   "PRIVATE_KEY_ENCRYPTION_KEY_FILE": "/run/secrets/plant-fernet"}
+        for name, value in planted.items():
+            monkeypatch.setenv(name, value)
+        before = dict(os.environ)
+        process = worker.JobProcess()
+        try:
+            status, result, _, _ = process.run("research_job_helpers:environment_task", {}, 120, lambda: None)
+        finally:
+            process.stop()
+        assert status == "ok"
+        assert dict(os.environ) == before
+        # Names the OS or Python add to a new process are not inherited.
+        allowed = worker.job_environment(before)
+        assert {name for name in result["environ"] if name in before and name not in allowed} == set()
+        assert "plant" not in json.dumps(result)
+        assert result["process_role"] == "research-job" and result["dsa_key"] is None
+        assert not result["csrf_secret_set"]
+
+    def test_the_job_environment_keeps_platform_settings_only(self):
+        kept = worker.job_environment({"PATH": "/bin", "lc_all": "C", "https_proxy": "http://proxy:3128",
+                                       "DATABASE_URL": "x", "DB_APP_PASSWORD": "x", "CSRF_SECRET_FILE": "x",
+                                       "SERVER_DSA_PRIVATE_KEY": "x", "QS_PROCESS_ROLE": "api"})
+        assert kept == {"PATH": "/bin", "lc_all": "C", "https_proxy": "http://proxy:3128",
+                        "QS_PROCESS_ROLE": "research-job"}
+
     def test_child_is_reused_then_recycled(self, Session, monkeypatch):
         register_kind(monkeypatch, "test_echo", "echo_task")
         db = Session()

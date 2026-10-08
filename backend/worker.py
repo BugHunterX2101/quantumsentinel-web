@@ -11,6 +11,7 @@ the child computes; run several workers to run several jobs at once.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import logging
 import multiprocessing as mp
@@ -23,7 +24,7 @@ import threading
 import time
 import traceback
 
-from .config import (RESEARCH_JOB_LEASE_SECONDS, RESEARCH_JOB_TIMEOUT_SECONDS,
+from .config import (PROCESS_ROLE, RESEARCH_JOB_LEASE_SECONDS, RESEARCH_JOB_TIMEOUT_SECONDS,
                      RESEARCH_WORKER_POLL_SECONDS)
 from .database import SessionLocal, head_revision, schema_is_current
 
@@ -38,6 +39,49 @@ _READY = "ready"
 PURGE_INTERVAL_SECONDS = 3600
 WORKER_HEARTBEAT_SECONDS = 5
 GENERIC_FAILURE = "Research job failed"
+# What a job process keeps of its worker's environment: what the platform and
+# the research libraries need (paths, locale, temporary and cache
+# directories, proxies, CA bundles, thread counts) and ENVIRONMENT. Nothing
+# else: not the database URL, not a key, not a *_FILE pointer to a secret.
+# Research code runs on users' inputs and needs none of them.
+_JOB_ENVIRONMENT = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP",
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "MPLCONFIGDIR",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA",
+    "LOCALAPPDATA", "PROGRAMDATA",
+    "VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH", "PYTHONUTF8", "PYTHONIOENCODING", "PYTHONUNBUFFERED",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONHASHSEED",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+    "NUMEXPR_MAX_THREADS",
+    "ENVIRONMENT",
+})
+
+
+def job_environment(environ) -> dict[str, str]:
+    """The environment a job process starts with, from its worker's."""
+    kept = {name: value for name, value in environ.items()
+            if name.upper() in _JOB_ENVIRONMENT or name.upper().startswith("LC_")}
+    # Production's startup checks ask a job process for no secrets (config.py).
+    kept["QS_PROCESS_ROLE"] = "research-job"
+    return kept
+
+
+@contextlib.contextmanager
+def _job_process_environment():
+    """multiprocessing starts a child with this process's environment as it
+    is at that moment, and has no way to pass another, so os.environ holds the
+    job process's environment while it starts. The worker's other thread (the
+    lifeline watcher) never reads it."""
+    saved = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(job_environment(saved))
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 # --------------------------------------------------------------------------
@@ -101,7 +145,8 @@ class JobProcess:
         parent, child = self._ctx.Pipe()
         self._proc = self._ctx.Process(target=_child_main, args=(child,), daemon=True,
                                        name="qs-research-job")
-        self._proc.start()
+        with _job_process_environment():
+            self._proc.start()
         child.close()
         self._conn = parent
         self._jobs = 0
@@ -386,6 +431,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lifeline", action="store_true",
                         help="stop when stdin closes (set by the API for its embedded worker)")
     args = parser.parse_args(argv)
+    if PROCESS_ROLE == "research-job":
+        # That role's settings pass production's checks without a signing key.
+        parser.error("a research worker cannot run as QS_PROCESS_ROLE=research-job")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     worker = Worker()
 

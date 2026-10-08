@@ -52,3 +52,11 @@ def sleep_task(params: dict) -> TaskOutput:
 
 def crash_task(params: dict) -> TaskOutput:
     os._exit(3)
+
+
+def environment_task(params: dict) -> TaskOutput:
+    """What the job process can see: its environment and the secrets its config holds."""
+    from backend import config
+    return TaskOutput({"environ": dict(os.environ), "process_role": config.PROCESS_ROLE,
+                       "database_url": config.DATABASE_URL, "dsa_key": config.SERVER_DSA_PRIVATE_KEY,
+                       "csrf_secret_set": bool(config._setting("CSRF_SECRET"))}, {})

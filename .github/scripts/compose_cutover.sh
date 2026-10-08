@@ -144,6 +144,35 @@ ran_on=$("${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel
   "SELECT string_agg(DISTINCT split_part(worker_id, ':', 1), ',') FROM research_jobs WHERE status = 'succeeded'")
 echo "research jobs ran on: $ran_on (research-worker container: $worker_host)"
 test "$ran_on" = "$worker_host"
+# The research worker holds none of the API's secrets, and its job process
+# (alive after those jobs, kept for the next one) holds no secret at all.
+for secret in JWT_PRIVATE_KEY WEBHOOK_ENCRYPTION_KEY PRIVATE_KEY_ENCRYPTION_KEY REFRESH_TOKEN_SECRET \
+              CSRF_SECRET REDIS_PASSWORD; do
+  value=$(grep "^$secret=" .env.production | cut -d= -f2-)
+  test -n "$value"
+  if "${NEW[@]}" exec -T research-worker env | grep -qF -- "$value"; then
+    echo "research-worker holds $secret"; exit 1
+  fi
+done
+echo "research-worker holds none of the API's secrets"
+"${NEW[@]}" exec -T research-worker python - <<'EOF'
+from pathlib import Path
+
+for proc in Path("/proc").glob("[0-9]*"):
+    try:
+        if b"spawn_main" not in (proc / "cmdline").read_bytes():
+            continue
+        names = {entry.split(b"=", 1)[0].decode() for entry in (proc / "environ").read_bytes().split(b"\0") if entry}
+    except OSError:
+        continue
+    print(f"job process {proc.name} environment: {' '.join(sorted(names))}")
+    leaked = names & {"DATABASE_URL", "SERVER_DSA_PRIVATE_KEY", "JWT_PRIVATE_KEY", "CSRF_SECRET", "REDIS_URL",
+                      "PRIVATE_KEY_ENCRYPTION_KEY", "WEBHOOK_ENCRYPTION_KEY", "REFRESH_TOKEN_SECRET"}
+    assert not leaked, leaked
+    break
+else:
+    raise SystemExit("no job process found")
+EOF
 # Networks: nginx cannot resolve the database; the database has no route out;
 # the API and the research worker reach the internet (market data). Each
 # negative check has a positive control with the same busybox wget, so a

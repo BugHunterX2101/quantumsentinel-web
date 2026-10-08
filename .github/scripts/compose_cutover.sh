@@ -148,12 +148,13 @@ test "$ran_on" = "$worker_host"
 # the API and the research worker reach the internet (market data). Each
 # negative check has a positive control with the same busybox wget, so a
 # missing tool or a TLS problem cannot pass for isolation.
-fetch() {  # service url: prints wget's own words, returns its exit code
-  "${NEW[@]}" exec -T "$1" wget -q -T 5 -O /dev/null "$2" 2>&1 | tr -d '\r'
+fetch() {  # service url [wget options]: prints wget's own words, returns its exit code
+  "${NEW[@]}" exec -T "$1" wget -q -T 5 -O /dev/null "${@:3}" "$2" 2>&1 | tr -d '\r'
   return "${PIPESTATUS[0]}"
 }
 "${NEW[@]}" exec -T nginx nginx -v 2>&1 | tr -d '\r'  # deploy/nginx.conf's `resolve` needs 1.27.3+
-fetch nginx http://quantumsentinel:8000/health/ready
+# The API answers only the hosts in ALLOWED_HOSTS (400 otherwise).
+fetch nginx http://quantumsentinel:8000/health/ready --header "Host: localhost"
 echo "nginx reaches the API"
 if out=$(fetch nginx http://postgres:5432); then
   echo "nginx reached postgres"; exit 1

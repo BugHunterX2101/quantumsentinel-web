@@ -7,6 +7,8 @@ thought about fails them instead of slipping through.
 """
 import logging
 import secrets
+import threading
+import time
 import uuid
 
 import psycopg
@@ -322,6 +324,96 @@ def test_new_login_roles_need_passwords_and_nothing_is_left_behind(cluster):
                       (cluster.roles.prefix + "%",)).fetchone() == (0,)
     assert su.execute("SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = %s",
                       (cluster.schema,)).fetchone() != (cluster.roles.owner,)
+
+
+def _hold(cluster, *statements) -> psycopg.Connection:
+    """Another session, left inside a transaction that has run ``statements``."""
+    conn = psycopg.connect(_libpq(cluster.url()), application_name=cluster.schema)
+    cluster._closers.append(conn.close)
+    for statement in statements:
+        conn.execute(statement)
+    return conn
+
+
+def _provision_in_background(cluster, **kwargs):
+    outcome = {}
+
+    def run():
+        try:
+            with cluster.engine.begin() as connection:
+                outcome["summary"] = db_roles.provision(connection.connection.driver_connection, cluster.roles,
+                                                        cluster.passwords, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - the test inspects it
+            outcome["error"] = exc
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, outcome
+
+
+def _finishes_promptly(conn, statement) -> float:
+    started = time.monotonic()
+    conn.execute(statement)
+    return time.monotonic() - started
+
+
+def test_provisioning_cannot_deadlock_with_the_order_path(cluster):
+    """An order locks its user, then reads positions. Provisioning used to take
+    positions while waiting for users, a lock cycle PostgreSQL broke by
+    aborting one side: the provisioning or the user's order."""
+    order = _hold(cluster, "SELECT id FROM users FOR UPDATE")
+    thread, outcome = _provision_in_background(cluster)
+    time.sleep(0.5)  # provisioning is now retrying around the order's lock
+    assert _finishes_promptly(order, "SELECT count(*) FROM positions") < 0.5
+    order.commit()
+    thread.join(30)
+    assert "error" not in outcome, outcome.get("error")
+    assert outcome["summary"]["attempts"] > 1
+    assert_exactly_provisioned(cluster)
+
+
+def test_provisioning_never_keeps_a_queue_waiting_long_enough_to_look_for_deadlocks(cluster):
+    """A free-standing sequence cannot be LOCKed in advance, so taking it can
+    still wait; the wait must end before a session queued behind provisioning
+    reaches PostgreSQL's deadlock check (1 s), or that session is the one
+    aborted."""
+    cluster.connect().execute("CREATE SEQUENCE free_standing")
+    session = _hold(cluster, "SELECT nextval('free_standing')")
+    thread, outcome = _provision_in_background(cluster)
+    time.sleep(0.5)
+    assert _finishes_promptly(session, "SELECT count(*) FROM users") < 0.9
+    session.commit()
+    thread.join(30)
+    assert "error" not in outcome, outcome.get("error")
+    su = cluster.connect()
+    assert su.execute("SELECT relowner::regrole::text FROM pg_class WHERE oid = 'free_standing'::regclass"
+                      ).fetchone() == (cluster.roles.owner,)
+    assert_exactly_provisioned(cluster)
+
+
+def test_provisioning_gives_up_cleanly_while_a_table_stays_busy(cluster):
+    reader = _hold(cluster, "SELECT count(*) FROM trades")
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match='"trades"'):
+        with cluster.engine.begin() as connection:
+            db_roles.provision(connection.connection.driver_connection, cluster.roles, cluster.passwords,
+                               lock_wait_ms=800)
+    assert time.monotonic() - started < 5
+    assert _finishes_promptly(reader, "SELECT count(*) FROM users") < 0.5  # never queued behind it
+    su = cluster.connect()
+    assert su.execute("SELECT count(*) FROM pg_roles WHERE rolname LIKE %s",
+                      (cluster.roles.prefix + "%",)).fetchone() == (0,)
+    reader.rollback()
+
+
+def test_provisioning_again_takes_no_table_lock(provisioned):
+    """Once the schema is handed over, a re-run (drift repair, a new password)
+    changes only grants, which wait for no table lock."""
+    reader = _hold(provisioned, "SELECT count(*) FROM trades", "SELECT id FROM users FOR UPDATE")
+    with provisioned.engine.begin() as connection:
+        summary = db_roles.provision(connection.connection.driver_connection, provisioned.roles,
+                                     lock_wait_ms=800)
+    assert summary["attempts"] == 1 and summary["ownership_moved"] == 0
+    reader.rollback()
 
 
 def test_only_a_superuser_can_provision(provisioned):

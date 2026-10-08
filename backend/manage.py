@@ -30,7 +30,10 @@ superuser, with DATABASE_URL naming that superuser. A role that does not
 exist yet takes its password from DB_MIGRATOR_PASSWORD, DB_APP_PASSWORD or
 DB_BACKUP_PASSWORD (or the matching *_FILE setting); given for a role that
 exists, the password is changed. It is safe to run again: it repairs any
-drift from the intended privileges.
+drift from the intended privileges. It is safe while the application runs:
+it takes the table locks it needs all at once or not at all, so it cannot
+deadlock with a request, and if tables stay in use for 10 s it exits 1
+without changing anything.
 """
 import argparse
 import sys

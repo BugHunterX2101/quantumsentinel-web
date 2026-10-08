@@ -26,10 +26,12 @@ memberships, ownership and grants above and removes anything extra.
 """
 from __future__ import annotations
 
+import random
 import re
+import time
 from dataclasses import dataclass
 
-from psycopg import Connection, sql
+from psycopg import Connection, errors, sql
 
 DML = ("SELECT", "INSERT", "UPDATE", "DELETE")
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
@@ -117,7 +119,7 @@ def become(conn: Connection, role: str) -> None:
 
 
 def provision(conn: Connection, roles: Roles = ROLES, passwords: dict[str, str] | None = None,
-              lock_timeout_ms: int = 10_000) -> dict:
+              lock_wait_ms: int = 10_000) -> dict:
     """Create or repair the roles and hand them the connection's current schema.
 
     Runs in the caller's transaction, so it applies completely or not at
@@ -125,6 +127,11 @@ def provision(conn: Connection, roles: Roles = ROLES, passwords: dict[str, str] 
     not exist yet needs one, and an existing role keeps its password unless
     one is given. Only a SCRAM verifier, computed here, reaches the server,
     so no password appears in its logs.
+
+    Safe while the application runs: it never waits for a table lock while
+    holding another (see _ALL_OR_NOTHING_LOCKS), and it retries while tables
+    are in use, for up to ``lock_wait_ms``, before giving up with
+    RuntimeError and changing nothing.
     """
     passwords = passwords or {}
     me, superuser = conn.execute(
@@ -136,10 +143,54 @@ def provision(conn: Connection, roles: Roles = ROLES, passwords: dict[str, str] 
     schema = conn.execute("SELECT current_schema()").fetchone()[0]
     if schema is None:
         raise RuntimeError("the connection has no current schema (check search_path)")
-    # Changing an owner takes the table's ACCESS EXCLUSIVE lock. Queued behind
-    # a long transaction, that request would block every query on the table,
-    # so give up instead and let the operator retry.
-    conn.execute(sql.SQL("SET LOCAL lock_timeout = {}").format(sql.Literal(f"{int(lock_timeout_ms)}ms")))
+    deadline = time.monotonic() + lock_wait_ms / 1000
+    pause, attempts = _RETRY_FIRST_PAUSE_S, 0
+    while True:
+        attempts += 1
+        conn.execute("SAVEPOINT qs_provision")
+        try:
+            summary = _provision_attempt(conn, roles, passwords, schema)
+        except (errors.LockNotAvailable, errors.DeadlockDetected) as exc:
+            # Rolling back to the savepoint releases every lock this attempt took.
+            conn.execute("ROLLBACK TO SAVEPOINT qs_provision")
+            if time.monotonic() + pause > deadline:
+                raise RuntimeError(
+                    f"schema {schema} stayed in use for {lock_wait_ms} ms ({attempts} attempts; last: "
+                    f"{exc.diag.message_primary}); nothing was changed, run it again when it is quieter"
+                ) from exc
+            time.sleep(pause * random.uniform(0.5, 1.0))
+            pause = min(pause * 2, _RETRY_MAX_PAUSE_S)
+            continue
+        conn.execute("RELEASE SAVEPOINT qs_provision")
+        return {**summary, "attempts": attempts}
+
+
+# Changing an owner takes the object's ACCESS EXCLUSIVE lock. Taken one table
+# at a time, that is a deadlock: provisioning held positions and waited for
+# users while an order held users and waited for positions, and PostgreSQL
+# broke the cycle by aborting one of them, possibly the order. So each attempt
+# first takes the lock of every table it will change in one LOCK ... NOWAIT,
+# which waits for nothing: if any table is in use it fails at once, the
+# attempt lets go of everything, and provisioning tries again shortly after.
+_ALL_OR_NOTHING_LOCKS = "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE NOWAIT"
+# LOCK refuses sequences, materialized views and foreign tables, so changing
+# one of those may still wait; for less than deadlock_timeout (1 s by
+# default), so a session queued behind the attempt is released before
+# PostgreSQL would look for a deadlock and abort it.
+_ATTEMPT_LOCK_TIMEOUT = "200ms"
+_RETRY_FIRST_PAUSE_S, _RETRY_MAX_PAUSE_S = 0.02, 0.25
+
+
+def _provision_attempt(conn: Connection, roles: Roles, passwords: dict[str, str], schema: str) -> dict:
+    conn.execute(sql.SQL("SET LOCAL lock_timeout = {}").format(sql.Literal(_ATTEMPT_LOCK_TIMEOUT)))
+    lockable = [sql.Identifier(name) for (name,) in conn.execute(
+        "SELECT c.relname FROM pg_class c WHERE c.relnamespace = current_schema()::regnamespace"
+        " AND c.relkind IN ('r', 'p', 'v')"
+        " AND c.relowner IS DISTINCT FROM (SELECT oid FROM pg_roles WHERE rolname = %s) AND "
+        + _NOT_EXTENSION_MEMBER.format(oid="c.oid", catalog="'pg_class'") + " ORDER BY 1",
+        (roles.owner,)).fetchall()]
+    if lockable:
+        conn.execute(sql.SQL(_ALL_OR_NOTHING_LOCKS).format(sql.SQL(", ").join(lockable)))
     created = _ensure_roles(conn, roles, passwords)
     _ensure_memberships(conn, roles)
     moved = _take_ownership(conn, roles, schema)

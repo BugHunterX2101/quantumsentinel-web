@@ -152,6 +152,7 @@ fetch() {  # service url: prints wget's own words, returns its exit code
   "${NEW[@]}" exec -T "$1" wget -q -T 5 -O /dev/null "$2" 2>&1 | tr -d '\r'
   return "${PIPESTATUS[0]}"
 }
+"${NEW[@]}" exec -T nginx nginx -v 2>&1 | tr -d '\r'  # deploy/nginx.conf's `resolve` needs 1.27.3+
 fetch nginx http://quantumsentinel:8000/health/ready
 echo "nginx reaches the API"
 if out=$(fetch nginx http://postgres:5432); then

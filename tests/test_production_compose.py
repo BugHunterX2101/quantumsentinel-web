@@ -102,6 +102,15 @@ def test_the_database_has_no_route_out_and_no_route_from_nginx():
         assert services[name]["networks"] == ["data", "edge"], name
 
 
+def test_nginx_follows_the_api_to_a_new_address():
+    """Compose gives a recreated container a new address. nginx resolves an
+    upstream name once at startup unless told to re-resolve it."""
+    conf = (ROOT / "deploy" / "nginx.conf").read_text()
+    assert "resolver 127.0.0.11 " in conf
+    assert "server quantumsentinel:8000 resolve;" in conf
+    assert "zone quantumsentinel_app " in conf
+
+
 def test_external_research_workers_need_a_worker_service(services):
     """With RESEARCH_WORKER_MODE=external the API starts no worker, so research
     jobs are accepted and never run unless some service runs backend.worker."""

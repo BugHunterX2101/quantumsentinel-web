@@ -1,0 +1,499 @@
+{
+ "scheme": "qs-col-sha256-v1",
+ "notation": "float64 values are float.hex() strings, date32 values YYYY-MM-DD, timestamp_ns values integer nanoseconds since the Unix epoch (UTC), utf8 values strings; null is a null. Rows are given unsorted: implementations sort by the key.",
+ "tables": [
+  {
+   "name": "bars_empty",
+   "schema": {
+    "name": "bars",
+    "columns": [
+     {
+      "name": "symbol",
+      "type": "utf8",
+      "nullable": false
+     },
+     {
+      "name": "session_date",
+      "type": "date32",
+      "nullable": false
+     },
+     {
+      "name": "open",
+      "type": "float64",
+      "nullable": true
+     },
+     {
+      "name": "high",
+      "type": "float64",
+      "nullable": true
+     },
+     {
+      "name": "low",
+      "type": "float64",
+      "nullable": true
+     },
+     {
+      "name": "close",
+      "type": "float64",
+      "nullable": false
+     },
+     {
+      "name": "volume",
+      "type": "float64",
+      "nullable": true
+     }
+    ],
+    "key": [
+     "symbol",
+     "session_date"
+    ]
+   },
+   "rows": [],
+   "column_sha256": {
+    "symbol": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "session_date": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "open": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "high": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "low": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "close": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "volume": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   },
+   "table_sha256": "55aecda590cf2219c7540e23ad4325b8c230517a97b50269e474035cdd7e38f4"
+  },
+  {
+   "name": "bars_mixed",
+   "schema": {
+    "name": "bars",
+    "columns": [
+     {
+      "name": "symbol",
+      "type": "utf8",
+      "nullable": false
+     },
+     {
+      "name": "session_date",
+      "type": "date32",
+      "nullable": false
+     },
+     {
+      "name": "open",
+      "type": "float64",
+      "nullable": true
+     },
+     {
+      "name": "high",
+      "type": "float64",
+      "nullable": true
+     },
+     {
+      "name": "low",
+      "type": "float64",
+      "nullable": true
+     },
+     {
+      "name": "close",
+      "type": "float64",
+      "nullable": false
+     },
+     {
+      "name": "volume",
+      "type": "float64",
+      "nullable": true
+     }
+    ],
+    "key": [
+     "symbol",
+     "session_date"
+    ]
+   },
+   "rows": [
+    {
+     "symbol": "MSFT",
+     "session_date": "2024-01-02",
+     "open": "0x1.75dc28f5c28f6p+8",
+     "high": "0x1.77e6666666666p+8",
+     "low": "0x1.6ec51eb851eb8p+8",
+     "close": "0x1.72deb851eb852p+8",
+     "volume": "0x1.816a680000000p+24"
+    },
+    {
+     "symbol": "😀",
+     "session_date": "1969-12-31",
+     "open": null,
+     "high": null,
+     "low": null,
+     "close": "0x1.8000000000000p+0",
+     "volume": "-0x0.0p+0"
+    },
+    {
+     "symbol": "AAPL",
+     "session_date": "2024-01-03",
+     "open": "0x1.7070a3d70a3d7p+7",
+     "high": "0x1.73c28f5c28f5cp+7",
+     "low": "0x1.6edc28f5c28f6p+7",
+     "close": "0x1.7080000000000p+7",
+     "volume": null
+    },
+    {
+     "symbol": "Ａ",
+     "session_date": "2000-02-29",
+     "open": "0x1.999999999999ap-4",
+     "high": "0x1.3333333333334p-2",
+     "low": "0x1.56e1fc2f8f359p-997",
+     "close": "0x0.0000000000001p-1022",
+     "volume": "0x1.fffffffffffffp+1023"
+    },
+    {
+     "symbol": "AAPL",
+     "session_date": "2024-01-02",
+     "open": "0x1.764cccccccccdp+7",
+     "high": "0x1.78e147ae147aep+7",
+     "low": "0x1.6fc7ae147ae14p+7",
+     "close": "0x1.7347ae147ae14p+7",
+     "volume": "0x1.3aab5f0000000p+26"
+    },
+    {
+     "symbol": "ÄLV",
+     "session_date": "2024-01-02",
+     "open": null,
+     "high": "0x1.0000000000000p+1",
+     "low": null,
+     "close": "0x1.0000000000000p+1",
+     "volume": "0x0.0p+0"
+    }
+   ],
+   "column_sha256": {
+    "symbol": "bf5a635782c3f6eb55b8a60da31c4b9c64d1dd9c2e736fdbb43c68b782d430ef",
+    "session_date": "9f20e0d441c29be6e185c132dfa1a62286126989cc027a218aef93c478b9686a",
+    "open": "ea5256f9fa653a4df48099fbc6a05b00c9249dea790c9c9da4a13b373cbc49b3",
+    "high": "35a8b51f7ab91caf52dd5f5de715505139eb086187300c6ece07c7cde1ba9e35",
+    "low": "d7cf6d827ca4d6b1821061039872dc308e6e6ad3d64e34b70ac84609953184d8",
+    "close": "c4882419b75a28af9e618434126318c04e7ddc5b463dd29e9235877327082705",
+    "volume": "10b7fc47b05e7732fbf58e2956c80c77a8e8b852aef850fc809a72000507afcc"
+   },
+   "table_sha256": "6dda7f1dfd0dde4f9bc687ce7d679f37b38a902836cf49f143aee90fc511cdca"
+  },
+  {
+   "name": "nullable_collision_a",
+   "schema": {
+    "name": "t",
+    "columns": [
+     {
+      "name": "d",
+      "type": "date32",
+      "nullable": false
+     },
+     {
+      "name": "x",
+      "type": "float64",
+      "nullable": true
+     }
+    ],
+    "key": [
+     "d"
+    ]
+   },
+   "rows": [
+    {
+     "d": "1970-01-01",
+     "x": null
+    },
+    {
+     "d": "1970-01-02",
+     "x": null
+    },
+    {
+     "d": "1970-01-03",
+     "x": null
+    },
+    {
+     "d": "1970-01-04",
+     "x": null
+    },
+    {
+     "d": "1970-01-05",
+     "x": null
+    },
+    {
+     "d": "1970-01-06",
+     "x": null
+    },
+    {
+     "d": "1970-01-07",
+     "x": null
+    },
+    {
+     "d": "1970-01-08",
+     "x": null
+    },
+    {
+     "d": "1970-01-09",
+     "x": "0x0.0p+0"
+    }
+   ],
+   "column_sha256": {
+    "d": "921c803abfa6ac88f44f7ab19198e5c137d1c7183e8e6912757a6263e8dee0a5",
+    "x": "ab80df4b74deffb11c4a4c2edaa00458f01d78826ff3f92e1090a952b11123af"
+   },
+   "table_sha256": "3abd057be73ce193838c15da2d02b646b3f0da9a521f95897898a44ca2d48679"
+  },
+  {
+   "name": "nullable_collision_b",
+   "schema": {
+    "name": "t",
+    "columns": [
+     {
+      "name": "d",
+      "type": "date32",
+      "nullable": false
+     },
+     {
+      "name": "x",
+      "type": "float64",
+      "nullable": true
+     }
+    ],
+    "key": [
+     "d"
+    ]
+   },
+   "rows": [
+    {
+     "d": "1970-01-01",
+     "x": "0x0.0p+0"
+    },
+    {
+     "d": "1970-01-02",
+     "x": null
+    },
+    {
+     "d": "1970-01-03",
+     "x": null
+    },
+    {
+     "d": "1970-01-04",
+     "x": null
+    },
+    {
+     "d": "1970-01-05",
+     "x": null
+    },
+    {
+     "d": "1970-01-06",
+     "x": null
+    },
+    {
+     "d": "1970-01-07",
+     "x": null
+    },
+    {
+     "d": "1970-01-08",
+     "x": null
+    },
+    {
+     "d": "1970-01-09",
+     "x": null
+    }
+   ],
+   "column_sha256": {
+    "d": "921c803abfa6ac88f44f7ab19198e5c137d1c7183e8e6912757a6263e8dee0a5",
+    "x": "89789b087cc791a2426f8849e818c507dcbc19446aa719419998647393d88882"
+   },
+   "table_sha256": "f8f5296c865bdf9f13b6d23a00a8c134d5d0739ea500de79fb4c0c167bf44524"
+  },
+  {
+   "name": "nullable_utf8",
+   "schema": {
+    "name": "u",
+    "columns": [
+     {
+      "name": "d",
+      "type": "date32",
+      "nullable": false
+     },
+     {
+      "name": "s",
+      "type": "utf8",
+      "nullable": true
+     }
+    ],
+    "key": [
+     "d"
+    ]
+   },
+   "rows": [
+    {
+     "d": "1970-01-03",
+     "s": "a"
+    },
+    {
+     "d": "1970-01-01",
+     "s": null
+    },
+    {
+     "d": "1970-01-02",
+     "s": ""
+    }
+   ],
+   "column_sha256": {
+    "d": "ad5dc1478de06a4c2728ea528bd9361a4b945e92a414bf4d180cedaaeaa5f4cc",
+    "s": "f4914df264b1e6365ac67749e810c29ddc44810810142db654367f1db319197f"
+   },
+   "table_sha256": "85ea6ddde0218563f42bb424a6548f7503e25f24e544bfeef8478304422e1c1c"
+  },
+  {
+   "name": "nullable_utf8_empty",
+   "schema": {
+    "name": "u",
+    "columns": [
+     {
+      "name": "d",
+      "type": "date32",
+      "nullable": false
+     },
+     {
+      "name": "s",
+      "type": "utf8",
+      "nullable": true
+     }
+    ],
+    "key": [
+     "d"
+    ]
+   },
+   "rows": [
+    {
+     "d": "1970-01-03",
+     "s": "a"
+    },
+    {
+     "d": "1970-01-01",
+     "s": ""
+    },
+    {
+     "d": "1970-01-02",
+     "s": ""
+    }
+   ],
+   "column_sha256": {
+    "d": "ad5dc1478de06a4c2728ea528bd9361a4b945e92a414bf4d180cedaaeaa5f4cc",
+    "s": "8b22a021d2fd573742cd1df8ce754656096eae61d9dcd31a678b8ba9238872be"
+   },
+   "table_sha256": "5d9f4cec5accbf17585c0c2af3b4ceb3fa67e2fa0f2f9ad74960ab34bb78c042"
+  },
+  {
+   "name": "corporate_actions",
+   "schema": {
+    "name": "corporate_actions",
+    "columns": [
+     {
+      "name": "symbol",
+      "type": "utf8",
+      "nullable": false
+     },
+     {
+      "name": "ex_date",
+      "type": "date32",
+      "nullable": false
+     },
+     {
+      "name": "action",
+      "type": "utf8",
+      "nullable": false
+     },
+     {
+      "name": "value",
+      "type": "float64",
+      "nullable": false
+     },
+     {
+      "name": "announced_at",
+      "type": "timestamp_ns",
+      "nullable": true
+     },
+     {
+      "name": "source",
+      "type": "utf8",
+      "nullable": false
+     }
+    ],
+    "key": [
+     "symbol",
+     "ex_date",
+     "action"
+    ]
+   },
+   "rows": [
+    {
+     "symbol": "AAPL",
+     "ex_date": "2024-02-09",
+     "action": "dividend",
+     "value": "0x1.eb851eb851eb8p-3",
+     "announced_at": 1706817600123456789,
+     "source": "test"
+    },
+    {
+     "symbol": "AAPL",
+     "ex_date": "2020-08-31",
+     "action": "split",
+     "value": "0x1.0000000000000p+2",
+     "announced_at": null,
+     "source": "test"
+    },
+    {
+     "symbol": "OLD",
+     "ex_date": "1969-07-20",
+     "action": "split",
+     "value": "0x1.0000000000000p-1",
+     "announced_at": -1,
+     "source": "tést"
+    }
+   ],
+   "column_sha256": {
+    "symbol": "ab900f786056457e0de570d19fb0c1dfadf02a053b2b3f3e67246c84b78fe5f6",
+    "ex_date": "0de482f65716c8d695309edbbb923e9e4715274d8d720a7abb697e7cdf218acb",
+    "action": "cbac30834d540325866d474620fc7856bca56c421297ac7b3d7426ed6de410fb",
+    "value": "d4d88f9d3d83231e66b3392b5d2f477b78f0ea3d449d3b135aee7e87723d5722",
+    "announced_at": "70ed7635294ddcb657474dcda41363ee3858fcc77e3e642fd82c8f14407d3cae",
+    "source": "62c59f1a3f5f09bdc945d62cb6382abbc2675acf782c5d82f757bb58a887d7b3"
+   },
+   "table_sha256": "6723576310aaed6a624a9d9468d54c37fc6535d1e34cd838fdde97c1b2bc7098"
+  }
+ ],
+ "datasets": [
+  {
+   "name": "eod_raw",
+   "identity": {
+    "family": "US_EQUITY_EOD",
+    "provider": "yfinance",
+    "licence_id": "yahoo-personal-use",
+    "frequency": "1d",
+    "session_boundary": "exchange-local",
+    "adjustment": "raw",
+    "survivorship": "current_listings"
+   },
+   "tables": {
+    "bars": "bars_mixed",
+    "corporate_actions": "corporate_actions"
+   },
+   "dataset_id": "qs-ds-sha256-v1:23dab26cc23e9fb551669ecd9bb4aaf266d43f610ce007e74e6e735b6481a95c"
+  },
+  {
+   "name": "eod_split_adjusted",
+   "identity": {
+    "family": "US_EQUITY_EOD",
+    "provider": "yfinance",
+    "licence_id": "yahoo-personal-use",
+    "frequency": "1d",
+    "session_boundary": "exchange-local",
+    "adjustment": "split",
+    "survivorship": "current_listings"
+   },
+   "tables": {
+    "bars": "bars_mixed",
+    "corporate_actions": "corporate_actions"
+   },
+   "dataset_id": "qs-ds-sha256-v1:80da14c12cac4da3516064ba7d1cd72919cc5ff4e72f54dd82f1c637ab4291b8"
+  }
+ ]
+}

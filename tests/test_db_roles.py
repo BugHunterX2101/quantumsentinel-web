@@ -301,6 +301,32 @@ def test_the_research_worker_cannot_reach_trading_or_identity(provisioned):
             research_worker.execute(statement)
 
 
+def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(provisioned, tmp_path):
+    from backend.services import dataset_registry
+    from backend.services.dataset_store import DatasetStore
+    from dataset_helpers import NOW, snapshot
+
+    roles = provisioned.roles
+    provisioned.connect().execute("INSERT INTO users (id, email, password_hash) VALUES "
+                                  "('u1', 'u1@example.com', 'h'), ('u2', 'u2@example.com', 'h')")
+    store = DatasetStore(tmp_path)
+    blob = store.put(snapshot(("AAPL",)).datasets[0])
+    dataset = store.get(blob.dataset_id, blob.sha256)
+    for role, user_id in ((roles.app, "u1"), (roles.research_worker, "u2")):
+        with sessionmaker(bind=provisioned.engine_as(role))() as db:
+            dataset_registry.register(db, dataset, blob, user_id=user_id, request={}, provider_client="t",
+                                      retrieved_at=NOW)
+            db.commit()
+            assert [v.dataset_id for v in dataset_registry.list_for_user(db, user_id)] == [blob.dataset_id]
+        conn = provisioned.connect(role)
+        for statement in ("UPDATE dataset_versions SET blob_size = 1", "DELETE FROM dataset_versions",
+                          "TRUNCATE dataset_versions CASCADE", "UPDATE user_datasets SET job_id = 'x'",
+                          "DELETE FROM user_datasets"):
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute(statement)
+    assert provisioned.connect().execute("SELECT count(*) FROM user_datasets").fetchone() == (2,)
+
+
 def test_the_backup_role_reads_everything_and_writes_nothing(provisioned):
     backup = provisioned.connect(provisioned.roles.backup)
     for (table,) in backup.execute(_RELATIONS, (provisioned.schema,)).fetchall():

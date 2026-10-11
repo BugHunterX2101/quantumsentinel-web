@@ -3,8 +3,8 @@ import uuid
 import datetime as dt
 
 from sqlalchemy import (
-    Column, String, Boolean, DateTime, Numeric, Integer, BigInteger, ForeignKey, Text, JSON,
-    UniqueConstraint, Sequence, Index, text,
+    Column, String, Boolean, Date, DateTime, Numeric, Integer, BigInteger, ForeignKey, Text, JSON,
+    LargeBinary, UniqueConstraint, Sequence, Index, text,
 )
 from sqlalchemy.orm import relationship
 
@@ -314,6 +314,53 @@ class ResearchJob(Base):
     result_json = Column(JSON, nullable=True)
     error_status = Column(Integer, nullable=True)   # HTTP-style status of a failure
     error_detail = Column(Text, nullable=True)      # user-safe message, never a traceback
+
+
+class DatasetVersion(Base):
+    """A frozen, content-addressed dataset (services/dataset_registry.py).
+
+    Immutable: migration 0004 adds triggers that refuse UPDATE, DELETE and
+    TRUNCATE, and CHECKs that the id is the hash of ``manifest_canonical``
+    and the identity columns are the identity inside it. Those are
+    PostgreSQL SQL, so they live in the migration only (alembic's schema
+    comparison ignores CHECKs, and the SQLite import tests build this model).
+    """
+    __tablename__ = "dataset_versions"
+
+    dataset_id = Column(String(80), primary_key=True)
+    family = Column(String(64), nullable=False)
+    provider = Column(String(64), nullable=False)
+    licence_id = Column(String(64), nullable=False)
+    frequency = Column(String(64), nullable=False)
+    session_boundary = Column(String(64), nullable=False)
+    adjustment = Column(String(64), nullable=False)
+    survivorship = Column(String(64), nullable=False)
+    personal_use_only = Column(Boolean, nullable=False)
+    redistribution_allowed = Column(Boolean, nullable=False)
+    point_in_time = Column(Boolean, nullable=False)
+    coverage_start = Column(Date, nullable=False)
+    coverage_end = Column(Date, nullable=False)
+    symbols = Column(JSON, nullable=False)
+    manifest_canonical = Column(LargeBinary, nullable=False)
+    tables_json = Column(JSON, nullable=False)
+    blob_format = Column(String(32), nullable=False)
+    blob_sha256 = Column(String(64), nullable=False)
+    blob_size = Column(BigInteger, nullable=False)
+    provider_client = Column(String(64), nullable=False)
+    request_json = Column(JSON, nullable=False)
+    retrieved_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class UserDataset(Base):
+    """A user's claim on a dataset they snapshotted; datasets under a
+    personal-use licence are listed only to the users who fetched them."""
+    __tablename__ = "user_datasets"
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    dataset_id = Column(String(80), ForeignKey("dataset_versions.dataset_id"), primary_key=True)
+    job_id = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class ResearchWorker(Base):

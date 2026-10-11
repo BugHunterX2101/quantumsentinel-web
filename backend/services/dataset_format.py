@@ -4,8 +4,9 @@ A research result can only be reproduced if the data it used is frozen and
 named by its content. This module defines both:
 
 * A ``Table`` is typed, column-oriented data sorted by its primary key.
-  ``BARS_V1`` (raw daily OHLCV keyed by symbol and session date) and
-  ``CORPORATE_ACTIONS_V1`` are the canonical market-data schemas.
+  ``BARS_V1`` (daily OHLCV keyed by symbol and session date),
+  ``CORPORATE_ACTIONS_V1`` and ``INSTRUMENTS_V1`` are the canonical
+  market-data schemas.
 * ``qs-col-sha256-v1`` hashes a table from its values, never from a file, so
   the same data written by another library version, or later by the Rust
   core, keeps its name. tests/fixtures/qs_col_sha256_v1.json holds golden
@@ -149,7 +150,8 @@ class TableSchema:
         return next(c for c in self.columns if c.name == name)
 
 
-# Raw (unadjusted) daily bars. session_date is the exchange-local trading
+# Daily bars, adjusted as the dataset identity's ``adjustment`` says ("raw"
+# for the prints as they traded). session_date is the exchange-local trading
 # day, or for 24/7 markets the day ending at the dataset's declared
 # session_boundary; a bar exists only for a session with a close.
 BARS_V1 = TableSchema("bars", (
@@ -173,6 +175,17 @@ CORPORATE_ACTIONS_V1 = TableSchema("corporate_actions", (
     Column("announced_at", "timestamp_ns", nullable=True),
     Column("source", "utf8"),
 ), key=("symbol", "ex_date", "action"))
+
+# What each symbol is and where it trades: the provider's instrument type,
+# exchange code, IANA timezone (the one session_date is local to) and the
+# currency its prices are quoted in, exactly as quoted (GBp is pence).
+INSTRUMENTS_V1 = TableSchema("instruments", (
+    Column("symbol", "utf8"),
+    Column("instrument_type", "utf8"),
+    Column("exchange", "utf8"),
+    Column("timezone", "utf8"),
+    Column("currency", "utf8"),
+), key=("symbol",))
 
 
 # --------------------------------------------------------------------------

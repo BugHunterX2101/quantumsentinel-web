@@ -378,8 +378,9 @@ feature version, parameters, execution model, random seed, Git commit hash,
 data hash, IS/OOS metrics, and statistical results. Yahoo Finance daily-bar
 data is explicitly labelled as not survivorship-free or point-in-time validated.
 
-`dataset_format.py` names frozen data by its content. Its typed tables are raw
-daily bars keyed by symbol and session date, and corporate actions. The
+`dataset_format.py` names frozen data by its content. Its typed tables are
+daily bars keyed by symbol and session date, corporate actions, and the
+instruments (exchange, timezone, quote currency). The
 `qs-col-sha256-v1` hash covers the values, not a file. The dataset id
 `qs-ds-sha256-v1:<hex>` also covers the provider, licence, adjustment policy and
 session boundary, so snapshots that differ in any of them never share an id.
@@ -387,6 +388,17 @@ session boundary, so snapshots that differ in any of them never share an id.
 `qs-ds-sha256-v1/<2 hex>/<hex>` and rehashes it on every read. Golden vectors
 for other implementations are in
 [`tests/fixtures/qs_col_sha256_v1.json`](tests/fixtures/qs_col_sha256_v1.json).
+
+`dataset_providers.py` turns symbols and a date range into datasets, one per
+family (equities, indices, crypto, FX, continuous futures). Yahoo (yfinance) is
+the only provider and is marked `personal_use_only`. Yahoo serves no raw
+prices: its bars and dividends are split-adjusted as of the fetch, so its
+datasets say `adjustment: split`. Crypto bars are UTC days of CoinMarketCap's
+composite price, and sessions still open at retrieval are left out.
+`dataset_registry.py` records each verified dataset in `dataset_versions`
+(migration 0004). There, CHECKs tie the id to the stored manifest and triggers
+refuse UPDATE, DELETE and TRUNCATE. `user_datasets` lists a dataset only to the
+users who fetched it.
 
 ### Research Engine
 
@@ -451,6 +463,8 @@ quantumsentinel-web/
 │       ├── research_metadata.py         ← experiment manifests · data lineage
 │       ├── dataset_format.py            ← Dataset tables · qs-col-sha256-v1 logical hash · dataset ids · blob format
 │       ├── dataset_store.py             ← Content-addressed, write-once dataset files, verified on every read
+│       ├── dataset_providers.py         ← Provider interface · yfinance (personal use only) · dataset families
+│       ├── dataset_registry.py          ← Immutable dataset_versions rows · who holds which dataset
 │       ├── security_service.py          ← server identity · signed audit hash chain · key health
 │       ├── integration_service.py       ← Scoped API keys · SSRF-guarded signed webhooks
 │       │

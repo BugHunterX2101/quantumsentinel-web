@@ -51,6 +51,8 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "audit_chain_links": DML,
     "audit_logs": DML,
     "backtests": DML,
+    # Immutable once written (migration 0004's triggers): no UPDATE or DELETE.
+    "dataset_versions": ("SELECT", "INSERT"),
     "idempotency_records": DML,
     "key_pairs": DML,
     "order_security_records": DML,
@@ -65,6 +67,7 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "signals": DML,
     "strategies": DML,
     "trades": DML,
+    "user_datasets": ("SELECT", "INSERT"),
     "users": DML,
     "webhooks": DML,
 }
@@ -82,6 +85,10 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # The dashboard backtest's history row. Its id is made client-side, so
     # the insert returns nothing and needs no SELECT; the API reads it back.
     "backtests": ("INSERT",),
+    # The dataset snapshot finalizer registers the datasets it verified and
+    # the user who fetched them; both tables are insert-only.
+    "dataset_versions": ("SELECT", "INSERT"),
+    "user_datasets": ("SELECT", "INSERT"),
     # Experiment finalizers lock the experiment row and record the outcome.
     "research_experiments": ("SELECT", "UPDATE"),
     # Claim, lease, finish, reap and purge jobs; only the API enqueues them.

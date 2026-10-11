@@ -1811,6 +1811,10 @@ def _queue_job(db: Session, user: models.User, kind: str, params: dict,
 
 
 def _queue_research(db: Session, user: models.User, kind: str, req) -> JSONResponse:
+    # A request may name only datasets this user holds (fetched by them).
+    for dataset_id in getattr(req, "dataset_ids", None) or ():
+        if dataset_registry.get_for_user(db, user.id, dataset_id) is None:
+            raise HTTPException(404, f"Dataset not found: {dataset_id}")
     return _queue_job(db, user, kind, req.model_dump())
 
 

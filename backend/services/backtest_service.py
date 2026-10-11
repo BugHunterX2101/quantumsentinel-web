@@ -17,13 +17,12 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 import numpy as np
-import yfinance as yf
 
 from .execution_model import (
     ExecutionConfig, ExecutionSimulator, PositionSizer, SizingMethod,
     zero_cost_config, retail_config, institutional_config, FillResult,
 )
-from . import historical_data
+from . import historical_data, market_data
 # Strategy definitions live in strategy_signals so every engine shares them;
 # re-exported here for existing importers.
 from .strategy_signals import (  # noqa: F401
@@ -150,13 +149,14 @@ class BacktestEngine:
         return max(strategy.slow_window + 5, warmup_bars(strategy) - 1 + self._delay())
 
     def _fetch_data(self, tickers: list[str], period: str):
-        """Download historical data for all tickers."""
+        """Historical data for all tickers (market_data: frozen datasets)."""
         try:
-            data = yf.download(
-                tickers, period=period, interval="1d",
-                progress=False, auto_adjust=True,
-            )
+            data = market_data.download(tickers, period)
             return data if not data.empty else None
+        except market_data.MarketDataError:
+            # Its message is the reason (no data, a dataset that fails its
+            # hash, datasets that disagree); the caller reports it as is.
+            raise
         except Exception as exc:
             log.warning("Data download failed: %s", exc)
             return None

@@ -405,6 +405,20 @@ and stores the blobs under `DATASET_ROOT`. The worker then reads each blob back,
 rehashes it against its id and the reported file hash, and registers only what
 verifies.
 
+Research jobs read prices only through `market_data.py`, never from yfinance
+directly. Backtests, walk-forward, event backtests, alpha, factor, correlation,
+optimisation, regime, neutral, pairs, latency and report requests take optional
+`dataset_ids` (datasets the caller holds); without them the job snapshots its
+symbols first. Either way the result's `market_data` and the audit event name
+the datasets it was computed from, and the worker registers a snapshot before
+it stores the result. Prices keep `yf.download(auto_adjust=True)`'s layout and
+meaning: dividends are added back to the split-adjusted bars with
+prod(1 − dividend / previous close), Yahoo's own Adj Close formula, except that
+pence-quoted London listings get their whole dividend (Yahoo's Adj Close adds
+back a hundredth of it). `period` is a trailing window that ends at the data's
+last completed session, so a rerun on a result's `market_data.datasets`
+computes on the same bars.
+
 ### Research Engine
 
 | Module | Capabilities |
@@ -470,6 +484,7 @@ quantumsentinel-web/
 │       ├── dataset_store.py             ← Content-addressed, write-once dataset files, verified on every read
 │       ├── dataset_providers.py         ← Provider interface · yfinance (personal use only) · dataset families
 │       ├── dataset_registry.py          ← Immutable dataset_versions rows · who holds which dataset
+│       ├── market_data.py               ← Research prices from frozen datasets · total return · trailing windows
 │       ├── security_service.py          ← server identity · signed audit hash chain · key health
 │       ├── integration_service.py       ← Scoped API keys · SSRF-guarded signed webhooks
 │       │

@@ -93,6 +93,28 @@ def test_research_code_cannot_reach_trading_or_identity(root):
     assert {_chain(reached, module) for module in FORBIDDEN & set(reached)} == set()
 
 
+# Research code reads prices only from frozen datasets (services/market_data.py),
+# which only the provider fetches. signal_engine also imports yfinance, for
+# live quotes; research reaches it only for its pure feature extraction
+# (strategy_signals._sba_series).
+YFINANCE_IMPORTERS = {"backend.services.dataset_providers", "backend.services.signal_engine"}
+
+
+def _imports_yfinance(module: str) -> bool:
+    for node in ast.walk(ast.parse(_path(module).read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import) and any(a.name.split(".")[0] == "yfinance" for a in node.names):
+            return True
+        if isinstance(node, ast.ImportFrom) and not node.level and (node.module or "").split(".")[0] == "yfinance":
+            return True
+    return False
+
+
+def test_research_code_fetches_prices_only_through_the_dataset_provider():
+    reached = closure("backend.worker", RESEARCH_TASKS, *sorted(FINALIZERS))
+    assert {module for module in reached if _imports_yfinance(module)} == YFINANCE_IMPORTERS
+    assert _imports_yfinance("backend.main")  # the check sees function-level imports
+
+
 def test_the_check_sees_every_kind_of_import():
     """Without these, the test above could pass by seeing nothing."""
     assert all(_path(module) for module in FORBIDDEN)

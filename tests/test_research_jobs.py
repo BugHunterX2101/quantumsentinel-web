@@ -23,6 +23,7 @@ from sqlalchemy.orm import sessionmaker
 from backend import main, models, schemas, worker
 from backend.services import (backtest_service, research_jobs, research_tasks, research_trials,
                               security_service)
+from market_helpers import fake_market
 from research_job_helpers import InlineJobProcess, result_of
 
 
@@ -243,12 +244,11 @@ class TestWorkerExecution:
         assert security_service.audit_chain_status(db)["valid"]
         db.close()
 
-    def test_advanced_backtest_runs_the_real_engine_as_a_job(self, Session, monkeypatch):
-        import yfinance
+    def test_advanced_backtest_runs_the_real_engine_as_a_job(self, Session, monkeypatch, tmp_path):
         days = pd.bdate_range("2023-01-02", periods=500)
         frame = yf_frame({t: pd.Series(random_walk(i, len(days)), days)
                           for i, t in enumerate(["AAPL", "MSFT", "SPY"])})
-        monkeypatch.setattr(yfinance, "download", lambda *a, **k: frame)
+        fake_market(monkeypatch, tmp_path, frame)
         db = Session()
         user = make_user(db)
         req = schemas.AdvancedBacktestRequest(assets=["AAPL", "MSFT"])
@@ -267,11 +267,10 @@ class TestWorkerExecution:
             models.AuditLog.action == "ADVANCED_BACKTEST")).scalars().one().metadata_json["job_id"] == job_id
         db.close()
 
-    def test_walk_forward_job_records_every_grid_config_as_a_trial(self, Session, monkeypatch):
-        import yfinance
+    def test_walk_forward_job_records_every_grid_config_as_a_trial(self, Session, monkeypatch, tmp_path):
         days = pd.bdate_range("2019-01-01", periods=1300)
         frame = yf_frame({"AAPL": pd.Series(random_walk(3, len(days)), days)})
-        monkeypatch.setattr(yfinance, "download", lambda *a, **k: frame)
+        fake_market(monkeypatch, tmp_path, frame)
         db = Session()
         user = make_user(db)
         req = schemas.WalkForwardRequest(assets=["AAPL"], total_years=5, train_years=2, test_years=1,
@@ -286,9 +285,8 @@ class TestWorkerExecution:
         assert result["trials_in_family"] == 25
         db.close()
 
-    def test_task_error_fails_the_job_with_its_status_and_message(self, Session, monkeypatch):
-        import yfinance
-        monkeypatch.setattr(yfinance, "download", lambda *a, **k: pd.DataFrame())
+    def test_task_error_fails_the_job_with_its_status_and_message(self, Session, monkeypatch, tmp_path):
+        fake_market(monkeypatch, tmp_path, pd.DataFrame())  # the provider has nothing
         db = Session()
         user = make_user(db)
         job_id = body(main.correlation_endpoint(schemas.CorrelationRequest(), user=user, db=db))["job_id"]
@@ -298,7 +296,8 @@ class TestWorkerExecution:
         db.expire_all()
         view = main.get_research_job(job_id, user=user, db=db)
         assert view["status"] == "failed" and "result" not in view
-        assert view["error"] == {"status_code": 422, "detail": "Failed to download market data"}
+        assert view["error"]["status_code"] == 422
+        assert view["error"]["detail"].startswith("no data for any requested symbol: AAPL: no data returned")
         db.close()
 
     def test_worker_heartbeat_is_visible_to_waiting_jobs(self, Session):
@@ -363,7 +362,7 @@ class TestLeases:
     def test_a_replaced_worker_cannot_overwrite_the_new_attempt(self, Session):
         db = Session()
         user = make_user(db)
-        job_id = research_jobs.enqueue(db, user.id, "correlation", {}).id
+        job_id = research_jobs.enqueue(db, user.id, "stat_test", {}).id
         first = research_jobs.claim_next(db, "worker-a", 60)
         # worker-a stops renewing; its lease lapses and the reaper requeues the job.
         db.query(models.ResearchJob).filter_by(id=job_id).update(
@@ -387,7 +386,7 @@ class TestLeases:
     def test_the_lease_is_fenced_by_worker_and_attempt_separately(self, Session):
         db = Session()
         user = make_user(db)
-        job_id = research_jobs.enqueue(db, user.id, "correlation", {}).id
+        job_id = research_jobs.enqueue(db, user.id, "stat_test", {}).id
         first = research_jobs.claim_next(db, "worker-a", 60)
         # Another worker naming the current attempt does not hold the lease.
         assert research_jobs.renew_lease(db, first, "worker-b", 1, 60) == "lost"

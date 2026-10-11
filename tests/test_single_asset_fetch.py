@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from market_helpers import fake_market
+
 
 def _fake_yf_download_single_ticker(n=120, ticker="SPY"):
     """Reproduces the real yfinance shape: a MultiIndex-columned frame where
@@ -47,18 +49,19 @@ def _fake_yf_download_single_ticker(n=120, ticker="SPY"):
 
 
 class TestFetchSingleAsset:
-    def test_returns_and_prices_are_1d(self, monkeypatch):
-        import yfinance
-        from backend.services import research_tasks
+    def test_returns_and_prices_are_1d(self, monkeypatch, tmp_path):
+        from backend.services import market_data, research_tasks
 
         fake_data = _fake_yf_download_single_ticker(n=120)
         assert fake_data["Close"].shape == (120, 1), (
             "fixture must reproduce the real 1-column-DataFrame shape "
             "yfinance returns for a single-ticker download in this version"
         )
-        monkeypatch.setattr(yfinance, "download", lambda *a, **kw: fake_data)
-
-        returns, prices = research_tasks.fetch_single_asset("SPY", "6mo")
+        fake_market(monkeypatch, tmp_path, fake_data)
+        with market_data.session():
+            # market_data keeps that layout for a single ticker
+            assert market_data.download("SPY", "6mo")["Close"].shape == (120, 1)
+            returns, prices = research_tasks.fetch_single_asset("SPY", "6mo")
 
         assert prices.ndim == 1
         assert returns.ndim == 1
@@ -66,17 +69,17 @@ class TestFetchSingleAsset:
         assert returns.shape == (119,)
         assert np.all(np.isfinite(returns))
 
-    def test_does_not_raise_broadcast_error(self, monkeypatch):
+    def test_does_not_raise_broadcast_error(self, monkeypatch, tmp_path):
         """The exact failure mode observed live: a shape-(T,0) vs (T-1,1)
         broadcast error inside np.diff(prices) / prices[:-1]."""
-        import yfinance
-        from backend.services import research_tasks
+        from backend.services import market_data, research_tasks
 
         fake_data = _fake_yf_download_single_ticker(n=753)
-        monkeypatch.setattr(yfinance, "download", lambda *a, **kw: fake_data)
+        fake_market(monkeypatch, tmp_path, fake_data)
 
         try:
-            returns, prices = research_tasks.fetch_single_asset("SPY", "3y")
+            with market_data.session():
+                returns, prices = research_tasks.fetch_single_asset("SPY", "3y")
         except ValueError as exc:
             pytest.fail(f"fetch_single_asset raised unexpectedly: {exc}")
 

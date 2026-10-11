@@ -378,6 +378,16 @@ feature version, parameters, execution model, random seed, Git commit hash,
 data hash, IS/OOS metrics, and statistical results. Yahoo Finance daily-bar
 data is explicitly labelled as not survivorship-free or point-in-time validated.
 
+`dataset_format.py` names frozen data by its content. Its typed tables are raw
+daily bars keyed by symbol and session date, and corporate actions. The
+`qs-col-sha256-v1` hash covers the values, not a file. The dataset id
+`qs-ds-sha256-v1:<hex>` also covers the provider, licence, adjustment policy and
+session boundary, so snapshots that differ in any of them never share an id.
+`dataset_store.py` keeps each dataset as one write-once file at
+`qs-ds-sha256-v1/<2 hex>/<hex>` and rehashes it on every read. Golden vectors
+for other implementations are in
+[`tests/fixtures/qs_col_sha256_v1.json`](tests/fixtures/qs_col_sha256_v1.json).
+
 ### Research Engine
 
 | Module | Capabilities |
@@ -439,6 +449,8 @@ quantumsentinel-web/
 │       ├── portfolio_service.py         ← Positions · mark-to-market · equity curve · Sharpe · VaR
 │       ├── order_security.py            ← canonical orders · nonce/idempotency · risk gate
 │       ├── research_metadata.py         ← experiment manifests · data lineage
+│       ├── dataset_format.py            ← Dataset tables · qs-col-sha256-v1 logical hash · dataset ids · blob format
+│       ├── dataset_store.py             ← Content-addressed, write-once dataset files, verified on every read
 │       ├── security_service.py          ← server identity · signed audit hash chain · key health
 │       ├── integration_service.py       ← Scoped API keys · SSRF-guarded signed webhooks
 │       │

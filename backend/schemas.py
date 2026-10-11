@@ -1,3 +1,4 @@
+import datetime as dt
 from typing import Any, Literal
 from pydantic import BaseModel, EmailStr, Field, FiniteFloat, field_validator, model_validator
 import re
@@ -532,6 +533,44 @@ class ExperimentJob(BaseModel):
     execute: bool
     # Replay only: the input verification the API already did.
     verification: dict | None = None
+
+
+DATASET_EARLIEST_START = dt.date(1950, 1, 1)
+DATASET_MAX_SYMBOLS = 20
+
+
+class DatasetSnapshotRequest(BaseModel):
+    """Freeze daily bars of ``symbols`` from ``start`` (inclusive) to ``end``
+    (exclusive) as content-addressed datasets (services/dataset_providers.py).
+    Sessions still open when the job runs are left out."""
+    symbols: list[str] = Field(min_length=1, max_length=DATASET_MAX_SYMBOLS)
+    start: dt.date
+    end: dt.date
+
+    @field_validator("symbols")
+    @classmethod
+    def valid_symbols(cls, value: list[str]) -> list[str]:
+        from .services.dataset_providers import SYMBOL
+
+        symbols = [v.strip().upper() for v in value]
+        bad = [s for s in symbols if not SYMBOL.fullmatch(s)]
+        if bad:
+            raise ValueError(f"not a ticker symbol: {bad[0][:24]!r}")
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("symbols must be distinct")
+        return symbols
+
+    @model_validator(mode="after")
+    def valid_range(self):
+        if self.start >= self.end:
+            raise ValueError("start must be before end")
+        if self.start < DATASET_EARLIEST_START:
+            raise ValueError(f"start must be on or after {DATASET_EARLIEST_START.isoformat()}")
+        # end is exclusive: tomorrow (UTC) includes every completed session.
+        latest = dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=1)
+        if self.end > latest:
+            raise ValueError(f"end must be on or before {latest.isoformat()}")
+        return self
 
 
 # ---------------------------------------------------------------------------

@@ -176,6 +176,10 @@ services:
       ENVIRONMENT: production
       QS_PROCESS_ROLE: research-worker
       DATABASE_URL: postgresql+psycopg://qs_research_worker:${DB_RESEARCH_WORKER_PASSWORD:?Set DB_RESEARCH_WORKER_PASSWORD}@postgres:5432/quantumsentinel
+    # Frozen dataset blobs (DATASET_ROOT, set in the image). Every replica
+    # shares the volume: blobs are content-addressed and written atomically.
+    volumes:
+      - datasets:/data/datasets
     networks: [data, edge]
     depends_on:
       postgres:
@@ -234,3 +238,4 @@ volumes:
   postgres_data:
   redis_data:
   postgres_backups:
+  datasets:

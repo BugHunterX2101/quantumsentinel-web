@@ -24,3 +24,6 @@ cpp/_qs_fast*.so
 cpp/*.egg-info/
 backend/services/_qs_fast*.pyd
 backend/services/_qs_fast*.so
+
+# Frozen dataset blobs (config.DATASET_ROOT default for local runs)
+/data/

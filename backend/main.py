@@ -59,7 +59,7 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
                      RESEARCH_WORKER_MODE, PROCESS_ROLE)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, integration_service, order_security
-from .services import paper_broker, research_jobs, research_trials
+from .services import dataset_registry, paper_broker, research_jobs, research_trials
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -1967,6 +1967,36 @@ def research_report_endpoint(req: schemas.ReportRequest,
                               db: Session = Depends(get_db)):
     """Queue the full 7-section quant research report."""
     return _queue_research(db, user, "report", req)
+
+
+@app.post("/api/research/datasets", status_code=202)
+def snapshot_dataset(req: schemas.DatasetSnapshotRequest,
+                     user: models.User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    """Queue a snapshot: fetch daily bars for the symbols and freeze them as
+    content-addressed datasets (one per family). The job's result lists the
+    dataset ids; an identical request already queued or running is
+    returned instead of fetching twice."""
+    return _queue_job(db, user, "dataset_snapshot", req.model_dump(mode="json"),
+                      same_as=("symbols", "start", "end"))
+
+
+@app.get("/api/research/datasets")
+def list_datasets(limit: int = Query(50, ge=1, le=200),
+                  user: models.User = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    """The datasets the caller has snapshotted, newest first."""
+    return [dataset_registry.view(v) for v in dataset_registry.list_for_user(db, user.id, limit)]
+
+
+@app.get("/api/research/datasets/{dataset_id}")
+def get_dataset(dataset_id: str, user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    """One of the caller's datasets: identity, licence, coverage and blob hashes."""
+    version = dataset_registry.get_for_user(db, user.id, dataset_id)
+    if version is None:
+        raise HTTPException(404, "Dataset not found")
+    return dataset_registry.view(version)
 
 
 @app.get("/api/research/jobs")

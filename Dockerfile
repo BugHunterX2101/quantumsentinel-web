@@ -19,6 +19,10 @@ COPY backend ./backend
 COPY frontend ./frontend
 # Ensure app user owns only what it needs; root owns the rest (read-only at runtime)
 RUN chown -R app:app /app
+# Dataset blobs (DATASET_ROOT). A named volume mounted here starts as a copy
+# of this directory, so it is created owned by app and stays writable.
+RUN mkdir -p /data/datasets && chown app:app /data/datasets
+ENV DATASET_ROOT=/data/datasets
 EXPOSE 8000
 USER app
 # FORWARDED_ALLOW_IPS controls which immediate peers' X-Forwarded-For/X-Real-IP

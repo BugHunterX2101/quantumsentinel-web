@@ -24,6 +24,10 @@ FORBIDDEN = {
     "backend.services.integration_service", "backend.services.redis_store",
 }
 RESEARCH_TASKS = "backend.services.research_tasks"
+# Modules whose finalizers a worker runs (research_jobs.JobKind.finalize). The
+# worker resolves them by name, so no import statement leads to them: each is
+# a root of the closure below in its own right.
+FINALIZERS = {"backend.services.experiment_registry", "backend.services.dataset_registry"}
 
 
 def _path(module: str) -> Path | None:
@@ -80,10 +84,10 @@ def test_every_job_kind_runs_research_code():
         assert module == RESEARCH_TASKS, name
         assert getattr(importlib.import_module(module), attr).__module__ == RESEARCH_TASKS, name
         if kind.finalize is not None:
-            assert kind.finalize.startswith("backend.services.experiment_registry:"), name
+            assert kind.finalize.partition(":")[0] in FINALIZERS, name
 
 
-@pytest.mark.parametrize("root", ["backend.worker", RESEARCH_TASKS])
+@pytest.mark.parametrize("root", ["backend.worker", RESEARCH_TASKS, *sorted(FINALIZERS)])
 def test_research_code_cannot_reach_trading_or_identity(root):
     reached = closure(root)
     assert {_chain(reached, module) for module in FORBIDDEN & set(reached)} == set()

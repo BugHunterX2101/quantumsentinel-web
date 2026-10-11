@@ -673,3 +673,32 @@ def experiment_execution(params: dict) -> TaskOutput:
     # run hashed it, so replays compare like with like.
     return TaskOutput({"executed": True, "results": results, "result_hash": er.hash_results(results),
                        "inputs": er.input_hashes(req.dataset, req.parameters, req.random_seed)}, {})
+
+
+# --------------------------------------------------------------------------
+# Datasets
+# --------------------------------------------------------------------------
+
+def dataset_snapshot(params: dict) -> TaskOutput:
+    """Fetch daily bars and freeze them as content-addressed datasets under
+    DATASET_ROOT. The worker then reads each blob back, verifies it and
+    registers it (dataset_registry.finalize_snapshot_job); this only fetches
+    and stores."""
+    from ..config import DATASET_ROOT
+    from .dataset_providers import ProviderError, SnapshotRequest, YahooProvider
+    from .dataset_store import DatasetStore
+    req = schemas.DatasetSnapshotRequest.model_validate(params)
+    request = SnapshotRequest(tuple(req.symbols), req.start, req.end)
+    try:
+        snapshot = YahooProvider().snapshot(request)
+    except ProviderError as exc:
+        raise TaskError(422, str(exc)) from exc
+    store = DatasetStore(DATASET_ROOT)
+    stored = [store.put(dataset) for dataset in snapshot.datasets]
+    result = {"provider": snapshot.provider, "provider_client": snapshot.client,
+              "retrieved_at": snapshot.retrieved_at.isoformat(), "request": request.as_dict(),
+              "stored": [{"dataset_id": s.dataset_id, "sha256": s.sha256} for s in stored],
+              "unavailable": dict(snapshot.unavailable)}
+    audit = {"symbols": list(request.symbols), "datasets": [s.dataset_id for s in stored],
+             "unavailable": sorted(snapshot.unavailable)}
+    return TaskOutput(result, audit)

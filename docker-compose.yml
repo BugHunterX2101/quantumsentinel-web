@@ -37,6 +37,9 @@ services:
       - SERVER_DSA_PUBLIC_KEY=${SERVER_DSA_PUBLIC_KEY:-}
       - SERVER_DSA_CREATED_AT=${SERVER_DSA_CREATED_AT:-}
       - ENVIRONMENT=${ENVIRONMENT:-development}
+    # Frozen dataset blobs (DATASET_ROOT, set in the image).
+    volumes:
+      - qs_datasets:/data/datasets
     depends_on:
       postgres:
         condition: service_healthy
@@ -49,3 +52,4 @@ services:
 
 volumes:
   qs_pgdata:
+  qs_datasets:

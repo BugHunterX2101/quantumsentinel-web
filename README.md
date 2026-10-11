@@ -400,6 +400,11 @@ composite price, and sessions still open at retrieval are left out.
 refuse UPDATE, DELETE and TRUNCATE. `user_datasets` lists a dataset only to the
 users who fetched it.
 
+`POST /api/research/datasets` queues a snapshot job. The job process fetches
+and stores the blobs under `DATASET_ROOT`. The worker then reads each blob back,
+rehashes it against its id and the reported file hash, and registers only what
+verifies.
+
 ### Research Engine
 
 | Module | Capabilities |
@@ -646,6 +651,9 @@ Research runs as background jobs, never inside the request. The dashboard backte
 | `POST` | `/api/research/pairs-trading` | Engle-Granger cointegration · Kalman filter hedge ratio · z-score signal · OU half-life |
 | `POST` | `/api/research/event-backtest` | Event-driven backtest with execution costs, leverage, and short-borrow accounting |
 | **`POST`** | **`/api/research/report`** | **Full 7-section research report across all pipeline stages** |
+| `POST` | `/api/research/datasets` | Snapshot daily bars (`symbols`, `start`, `end` exclusive) as frozen, content-addressed datasets, one per family |
+| `GET`  | `/api/research/datasets` | The caller's datasets: identity, licence, coverage, blob hashes (`?limit=`, up to 200) |
+| `GET`  | `/api/research/datasets/{dataset_id}` | One of the caller's datasets |
 | `POST` | `/api/research/latency-benchmark` | Per-stage p50/p99 latency profile + C++ vs Python speedup benchmark |
 | `GET`  | `/api/research/cpp-status` | C++ extension load status · kernel names · active mode |
 | `GET`  | `/api/research/jobs` | The caller's recent research jobs, newest first, without results (`?limit=`, up to 100) |
@@ -823,6 +831,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `RESEARCH_MAX_ACTIVE_JOBS_PER_USER` | No | Queued plus running research jobs one user may have (default 3) |
 | `RESEARCH_JOB_RETENTION_DAYS` | No | Finished jobs and their results are deleted after this many days (default 7) |
 | `RESEARCH_WORKER_POLL_SECONDS` | No | How often an idle worker checks the queue (default 1) |
+| `DATASET_ROOT` | No | Where dataset blobs are stored. The Docker image sets `/data/datasets`; production compose mounts the `datasets` volume there on the research worker. Default outside Docker: `data/datasets` in the repository |
 
 ---
 

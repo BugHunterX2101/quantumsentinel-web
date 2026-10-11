@@ -105,6 +105,10 @@ RESEARCH_MAX_ACTIVE_JOBS_PER_USER = int(os.getenv("RESEARCH_MAX_ACTIVE_JOBS_PER_
 # Finished jobs (and their results) are deleted after this many days.
 RESEARCH_JOB_RETENTION_DAYS = float(os.getenv("RESEARCH_JOB_RETENTION_DAYS", "7"))
 RESEARCH_WORKER_POLL_SECONDS = float(os.getenv("RESEARCH_WORKER_POLL_SECONDS", "1"))
+# Where frozen dataset blobs are stored (services/dataset_store.py). Research
+# workers and their job processes write here; it must outlive containers and
+# be backed up (production compose mounts the `datasets` volume).
+DATASET_ROOT = Path(_setting("DATASET_ROOT", str(Path(__file__).resolve().parent.parent / "data" / "datasets")))
 if RESEARCH_WORKER_MODE not in ("embedded", "external", "off"):
     raise RuntimeError("RESEARCH_WORKER_MODE must be one of: embedded, external, off")
 

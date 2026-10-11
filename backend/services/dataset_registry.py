@@ -13,6 +13,7 @@ and its provenance, and only records that this user holds it.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 
 import numpy as np
 from sqlalchemy import select
@@ -20,9 +21,11 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from .. import models
-from .dataset_format import BLOB_FORMAT, Dataset, DatasetIntegrityError, canonical_json
+from .dataset_format import BLOB_FORMAT, Dataset, DatasetError, DatasetIntegrityError, canonical_json
 from .dataset_providers import LICENCES
-from .dataset_store import StoredDataset
+from .dataset_store import DatasetStore, StoredDataset
+
+log = logging.getLogger(__name__)
 
 IDENTITY_FIELDS = ("family", "provider", "licence_id", "frequency", "session_boundary", "adjustment",
                    "survivorship")
@@ -91,6 +94,33 @@ def register(db: Session, dataset: Dataset, stored: StoredDataset, *, user_id: s
                                                  job_id=job_id, created_at=now)
                .on_conflict_do_nothing(index_elements=["user_id", "dataset_id"]))
     return version
+
+
+def finalize_snapshot_job(db: Session, job: models.ResearchJob, result: dict, audit: dict):
+    """Register what a dataset_snapshot job stored (research_jobs.JobKind).
+
+    The job process fetched and wrote the blobs; it is not trusted to have
+    written what it reports. Each blob is read back here, rehashed against
+    its id and the reported file hash, and only then registered, in the
+    transaction that stores the job's result.
+    """
+    from ..config import DATASET_ROOT
+    from .research_tasks import TaskError
+
+    store = DatasetStore(DATASET_ROOT)
+    retrieved_at = dt.datetime.fromisoformat(result["retrieved_at"])
+    versions = []
+    for item in result["stored"]:
+        try:
+            dataset, blob = store.verified(item["dataset_id"], item["sha256"])
+        except (DatasetError, DatasetIntegrityError) as exc:
+            log.error("dataset snapshot job %s: %s", job.id, exc)
+            raise TaskError(500, "The snapshot could not be verified after it was stored") from exc
+        versions.append(register(db, dataset, blob, user_id=job.user_id, request=result["request"],
+                                 provider_client=result["provider_client"], retrieved_at=retrieved_at,
+                                 job_id=job.id))
+    outcome = {"datasets": [view(v) for v in versions], "unavailable": result["unavailable"]}
+    return outcome, ("dataset", versions[0].dataset_id if versions else None), audit
 
 
 def _held_by(user_id: str):

@@ -169,10 +169,28 @@ for proc in Path("/proc").glob("[0-9]*"):
     leaked = names & {"DATABASE_URL", "SERVER_DSA_PRIVATE_KEY", "JWT_PRIVATE_KEY", "CSRF_SECRET", "REDIS_URL",
                       "PRIVATE_KEY_ENCRYPTION_KEY", "WEBHOOK_ENCRYPTION_KEY", "REFRESH_TOKEN_SECRET"}
     assert not leaked, leaked
+    assert "DATASET_ROOT" in names, "a job process must know where to store dataset snapshots"
     break
 else:
     raise SystemExit("no job process found")
 EOF
+# The research worker stores dataset blobs on the `datasets` volume.
+dataset_id=$("${NEW[@]}" exec -T research-worker python - <<'EOF' | tr -d '\r'
+from backend.config import DATASET_ROOT
+from backend.services.dataset_format import BARS_V1, Dataset, DatasetIdentity, Table
+from backend.services.dataset_store import DatasetStore
+
+assert str(DATASET_ROOT) == "/data/datasets", DATASET_ROOT
+identity = DatasetIdentity("CI_EOD", "ci", "yahoo-personal-use", "1d", "exchange-local", "split",
+                           "current_listings")
+bars = Table.build(BARS_V1, {"symbol": ["CI"], "session_date": ["2024-01-02"], "open": [1.0], "high": [1.0],
+                             "low": [1.0], "close": [1.0], "volume": [1.0]})
+stored = DatasetStore(DATASET_ROOT).put(Dataset(identity, (bars,)))
+assert DatasetStore(DATASET_ROOT).get(stored.dataset_id, stored.sha256).dataset_id == stored.dataset_id
+print(stored.dataset_id)
+EOF
+)
+echo "research-worker stored $dataset_id on the datasets volume"
 # Networks: nginx cannot resolve the database; the database has no route out;
 # the API and the research worker reach the internet (market data). Each
 # negative check has a positive control with the same busybox wget, so a
@@ -221,6 +239,9 @@ echo "::group::F. the API and the research worker restart as their own roles"
 "${NEW[@]}" restart quantumsentinel research-worker
 ready
 both_roles
+"${NEW[@]}" exec -T research-worker python -c \
+  "from backend.config import DATASET_ROOT; from backend.services.dataset_store import DatasetStore; DatasetStore(DATASET_ROOT).get('$dataset_id')"
+echo "the dataset blob survived the restart and still verifies"
 echo "::endgroup::"
 
 echo "::group::G. a fresh install, as the README deploys it"

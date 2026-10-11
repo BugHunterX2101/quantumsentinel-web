@@ -73,11 +73,16 @@ class DatasetStore:
 
     def get(self, dataset_id: str, sha256: str | None = None) -> Dataset:
         """The stored dataset, verified against its id (and file hash, if given)."""
+        return self.verified(dataset_id, sha256)[0]
+
+    def verified(self, dataset_id: str, sha256: str | None = None) -> tuple[Dataset, StoredDataset]:
+        """As get(), with the stored blob's description taken from its bytes."""
         path = self.path_for(dataset_id)
         blob = self._read(path)
-        if sha256 is not None and hashlib.sha256(blob).hexdigest() != sha256:
+        digest = hashlib.sha256(blob).hexdigest()
+        if sha256 is not None and digest != sha256:
             raise DatasetIntegrityError(f"{dataset_id}: stored bytes do not match the recorded hash")
-        return decode_blob(blob, dataset_id, self.max_bytes)
+        return decode_blob(blob, dataset_id, self.max_bytes), StoredDataset(dataset_id, path, digest, len(blob))
 
     def _read(self, path: Path) -> bytes:
         try:

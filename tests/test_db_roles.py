@@ -327,6 +327,39 @@ def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(prov
     assert provisioned.connect().execute("SELECT count(*) FROM user_datasets").fetchone() == (2,)
 
 
+def test_the_research_worker_runs_a_dataset_snapshot_as_its_own_role(provisioned, monkeypatch, tmp_path):
+    """The snapshot finalizer reads the blobs back and registers them as
+    qs_research_worker, with the user's row written by the API as qs_app."""
+    from backend import config
+    from backend.services import dataset_providers
+    from dataset_helpers import FakeYahoo
+
+    monkeypatch.setattr(dataset_providers, "_yahoo_fetch", FakeYahoo())
+    monkeypatch.setattr(dataset_providers, "_yahoo_client", lambda: "yfinance test")
+    monkeypatch.setattr(config, "DATASET_ROOT", tmp_path)
+    monkeypatch.setattr(security_service.server_identity, "_registered", False)
+    roles = provisioned.roles
+    api = sessionmaker(bind=provisioned.engine_as(roles.app))()
+    worker_sessions = sessionmaker(bind=provisioned.engine_as(roles.research_worker))
+    with worker_sessions() as db:
+        security_service.server_identity.ensure_registered(db)
+    user = models.User(email="snapshot-role@example.com", password_hash="x", role="user")
+    api.add(user)
+    api.commit()
+    response = main.snapshot_dataset(schemas.DatasetSnapshotRequest(
+        symbols=["AAPL", "BTC-USD"], start="2024-01-01", end="2024-01-11"), user=user, db=api)
+    job_id = json.loads(response.body)["job_id"]
+    runner = worker.Worker(job_process=InlineJobProcess(), session_factory=worker_sessions,
+                           lease_seconds=60, timeout_seconds=300, poll_seconds=0.1)
+    assert runner.run_once() is True
+    api.expire_all()
+    view = research_jobs.view(api, api.get(models.ResearchJob, job_id))
+    assert view["status"] == "succeeded", view
+    assert len(main.list_datasets(limit=50, user=user, db=api)) == 2
+    assert security_service.audit_chain_status(api, full=True)["valid"]
+    api.close()
+
+
 def test_the_backup_role_reads_everything_and_writes_nothing(provisioned):
     backup = provisioned.connect(provisioned.roles.backup)
     for (table,) in backup.execute(_RELATIONS, (provisioned.schema,)).fetchall():

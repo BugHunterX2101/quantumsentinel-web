@@ -57,6 +57,7 @@ _JOB_ENVIRONMENT = frozenset({
     "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
     "NUMEXPR_MAX_THREADS",
     "ENVIRONMENT",
+    "DATASET_ROOT",  # where a dataset snapshot job writes its blobs (a path, not a secret)
 })
 
 

@@ -89,6 +89,8 @@ KINDS: dict[str, JobKind] = {
                                    "EXPERIMENT_VALIDATED", f"{_EXPERIMENTS}:finalize_validate_job"),
     "experiment_replay": JobKind(schemas.ExperimentJob, f"{_TASKS}:experiment_execution",
                                  "EXPERIMENT_REPLAYED", f"{_EXPERIMENTS}:finalize_replay_job"),
+    "dataset_snapshot": JobKind(schemas.DatasetSnapshotRequest, f"{_TASKS}:dataset_snapshot", "DATASET_SNAPSHOT",
+                                "backend.services.dataset_registry:finalize_snapshot_job"),
 }
 
 

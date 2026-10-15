@@ -96,8 +96,9 @@ def register(db: Session, dataset: Dataset, stored: StoredDataset, *, user_id: s
     return version
 
 
-def finalize_snapshot_job(db: Session, job: models.ResearchJob, result: dict, audit: dict):
-    """Register what a dataset_snapshot job stored (research_jobs.JobKind).
+def _register_snapshot(db: Session, job: models.ResearchJob, snapshot: dict) -> list[models.DatasetVersion]:
+    """Verify and register every blob a job process says it stored for one
+    snapshot (provider, provider_client, retrieved_at, request, stored).
 
     The job process fetched and wrote the blobs; it is not trusted to have
     written what it reports. Each blob is read back here, rehashed against
@@ -108,19 +109,50 @@ def finalize_snapshot_job(db: Session, job: models.ResearchJob, result: dict, au
     from .research_tasks import TaskError
 
     store = DatasetStore(DATASET_ROOT)
-    retrieved_at = dt.datetime.fromisoformat(result["retrieved_at"])
+    retrieved_at = dt.datetime.fromisoformat(snapshot["retrieved_at"])
     versions = []
-    for item in result["stored"]:
+    for item in snapshot["stored"]:
         try:
             dataset, blob = store.verified(item["dataset_id"], item["sha256"])
         except (DatasetError, DatasetIntegrityError) as exc:
-            log.error("dataset snapshot job %s: %s", job.id, exc)
+            log.error("research job %s: %s", job.id, exc)
             raise TaskError(500, "The snapshot could not be verified after it was stored") from exc
-        versions.append(register(db, dataset, blob, user_id=job.user_id, request=result["request"],
-                                 provider_client=result["provider_client"], retrieved_at=retrieved_at,
+        versions.append(register(db, dataset, blob, user_id=job.user_id, request=snapshot["request"],
+                                 provider_client=snapshot["provider_client"], retrieved_at=retrieved_at,
                                  job_id=job.id))
+    return versions
+
+
+def finalize_snapshot_job(db: Session, job: models.ResearchJob, result: dict, audit: dict):
+    """Register what a dataset_snapshot job stored (research_jobs.JobKind)."""
+    versions = _register_snapshot(db, job, result)
     outcome = {"datasets": [view(v) for v in versions], "unavailable": result["unavailable"]}
     return outcome, ("dataset", versions[0].dataset_id if versions else None), audit
+
+
+def record_market_data(db: Session, job: models.ResearchJob, result: dict, audit: dict):
+    """Account for the prices a research task read (research_tasks.uses_market_data).
+
+    Registers the snapshots the task took, then requires every dataset its
+    result was computed from to be one the job's user holds: a snapshot just
+    registered, or one the request named (which the API checked). The result
+    and the audit event name those datasets. Returns (result, audit).
+    """
+    from .research_tasks import TaskError
+
+    report = result.get("market_data")
+    if not isinstance(report, dict):
+        raise TaskError(500, "The research job did not report the market data it used")
+    for snapshot in report.get("snapshots", ()):
+        _register_snapshot(db, job, snapshot)
+    used = list(report.get("datasets", ()))
+    held = set(db.execute(select(models.UserDataset.dataset_id).where(
+        models.UserDataset.user_id == job.user_id, models.UserDataset.dataset_id.in_(used))).scalars())
+    if held != set(used):
+        log.error("research job %s used datasets its user does not hold: %s", job.id, sorted(set(used) - held))
+        raise TaskError(500, "The research job used market data that is not registered")
+    market = {"source": report.get("source"), "datasets": used, "unavailable": report.get("unavailable", {})}
+    return {**result, "market_data": market}, {**audit, "datasets": used}
 
 
 def _held_by(user_id: str):

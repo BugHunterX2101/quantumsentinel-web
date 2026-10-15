@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..config import (RESEARCH_JOB_MAX_ATTEMPTS, RESEARCH_JOB_RETENTION_DAYS,
                       RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
-from . import research_trials, security_service
+from . import dataset_registry, research_trials, security_service
 from .research_tasks import TaskError
 
 QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED = "queued", "running", "succeeded", "failed", "cancelled"
@@ -61,27 +61,41 @@ class JobKind:
     # it may write rows and returns (result, (resource_type, resource_id),
     # audit); a TaskError fails the job instead, recording nothing.
     finalize: str | None = None
+    # The task reads prices (research_tasks.uses_market_data): the worker
+    # registers the snapshot it took and names the datasets in the result
+    # and audit event (dataset_registry.record_market_data).
+    market_data: bool = False
 
 
 _TASKS = "backend.services.research_tasks"
 _EXPERIMENTS = "backend.services.experiment_registry"
 KINDS: dict[str, JobKind] = {
-    "ma_backtest": JobKind(schemas.BacktestRequest, f"{_TASKS}:ma_backtest", "BACKTEST_COMPLETED"),
+    "ma_backtest": JobKind(schemas.BacktestRequest, f"{_TASKS}:ma_backtest", "BACKTEST_COMPLETED",
+                           market_data=True),
     "advanced_backtest": JobKind(schemas.AdvancedBacktestRequest, f"{_TASKS}:advanced_backtest",
-                                 "ADVANCED_BACKTEST"),
-    "walk_forward": JobKind(schemas.WalkForwardRequest, f"{_TASKS}:walk_forward", "WALK_FORWARD"),
-    "event_backtest": JobKind(schemas.EventBacktestRequest, f"{_TASKS}:event_backtest", "EVENT_BACKTEST"),
-    "alpha": JobKind(schemas.AlphaResearchRequest, f"{_TASKS}:alpha_research", "ALPHA_RESEARCH"),
-    "factor_model": JobKind(schemas.FactorModelRequest, f"{_TASKS}:factor_model", "FACTOR_MODEL"),
-    "correlation": JobKind(schemas.CorrelationRequest, f"{_TASKS}:correlation", "CORRELATION_ANALYSIS"),
-    "optimize": JobKind(schemas.PortfolioOptRequest, f"{_TASKS}:portfolio_optimization", "PORTFOLIO_OPT"),
-    "regime": JobKind(schemas.RegimeDetectionRequest, f"{_TASKS}:regime_detection", "REGIME_DETECTION"),
+                                 "ADVANCED_BACKTEST", market_data=True),
+    "walk_forward": JobKind(schemas.WalkForwardRequest, f"{_TASKS}:walk_forward", "WALK_FORWARD",
+                            market_data=True),
+    "event_backtest": JobKind(schemas.EventBacktestRequest, f"{_TASKS}:event_backtest", "EVENT_BACKTEST",
+                              market_data=True),
+    "alpha": JobKind(schemas.AlphaResearchRequest, f"{_TASKS}:alpha_research", "ALPHA_RESEARCH",
+                     market_data=True),
+    "factor_model": JobKind(schemas.FactorModelRequest, f"{_TASKS}:factor_model", "FACTOR_MODEL",
+                            market_data=True),
+    "correlation": JobKind(schemas.CorrelationRequest, f"{_TASKS}:correlation", "CORRELATION_ANALYSIS",
+                           market_data=True),
+    "optimize": JobKind(schemas.PortfolioOptRequest, f"{_TASKS}:portfolio_optimization", "PORTFOLIO_OPT",
+                        market_data=True),
+    "regime": JobKind(schemas.RegimeDetectionRequest, f"{_TASKS}:regime_detection", "REGIME_DETECTION",
+                      market_data=True),
     "neutral_strategy": JobKind(schemas.NeutralStrategyRequest, f"{_TASKS}:neutral_strategy",
-                                "NEUTRAL_STRATEGY"),
-    "pairs_trading": JobKind(schemas.PairsTradingRequest, f"{_TASKS}:pairs_trading", "PAIRS_TRADING"),
+                                "NEUTRAL_STRATEGY", market_data=True),
+    "pairs_trading": JobKind(schemas.PairsTradingRequest, f"{_TASKS}:pairs_trading", "PAIRS_TRADING",
+                             market_data=True),
     "latency_benchmark": JobKind(schemas.LatencyBenchmarkRequest, f"{_TASKS}:latency_benchmark",
-                                 "LATENCY_BENCHMARK"),
-    "report": JobKind(schemas.ReportRequest, f"{_TASKS}:research_report", "RESEARCH_REPORT"),
+                                 "LATENCY_BENCHMARK", market_data=True),
+    "report": JobKind(schemas.ReportRequest, f"{_TASKS}:research_report", "RESEARCH_REPORT",
+                      market_data=True),
     "stat_test": JobKind(schemas.StatTestJob, f"{_TASKS}:statistical_tests", "STAT_TEST"),
     "experiment_run": JobKind(schemas.ExperimentJob, f"{_TASKS}:experiment_execution", "EXPERIMENT_RUN",
                               f"{_EXPERIMENTS}:finalize_run_job"),
@@ -368,6 +382,8 @@ def complete(db: Session, job: models.ResearchJob, worker_id: str, attempt: int,
             db, job.user_id, trials["family"], trials["configs"], trials["source"])
     resource_type, resource_id = "research", None
     try:
+        if kind.market_data:
+            result, audit = dataset_registry.record_market_data(db, job, result, audit)
         if kind.finalize is not None:
             result, (resource_type, resource_id), audit = _resolve(kind.finalize)(db, job, result, audit)
         if job.kind == "ma_backtest":

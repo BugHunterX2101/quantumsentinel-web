@@ -19,9 +19,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
-import yfinance as yf
 
-from . import historical_data
+from . import historical_data, market_data
 from .backtest_service import (
     BacktestConfig, BacktestEngine, StrategyConfig, StrategyType,
     _sharpe, _sortino, _max_drawdown, _var_cvar, _calmar,
@@ -188,12 +187,9 @@ class WalkForwardEngine:
         # ── Fetch all data upfront, aligned on one calendar ──
         period_map = {3: "3y", 4: "4y", 5: "5y", 6: "6y", 7: "7y",
                       8: "8y", 10: "10y"}
-        yf_period = period_map.get(cfg.total_years, f"{cfg.total_years}y")
+        period = period_map.get(cfg.total_years, f"{cfg.total_years}y")
         try:
-            data = yf.download(
-                list(dict.fromkeys(cfg.assets)), period=yf_period, interval="1d",
-                progress=False, auto_adjust=True,
-            )
+            data = market_data.download(list(dict.fromkeys(cfg.assets)), period)
         except Exception as exc:
             raise ValueError(f"Data download failed: {exc}")
 

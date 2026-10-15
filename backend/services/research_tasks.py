@@ -12,13 +12,14 @@ exception becomes a generic failure, so internal details never reach users.
 """
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass
 
 import numpy as np
 
 from .. import schemas
-from . import research_trials
+from . import market_data, research_trials
 
 log = logging.getLogger(__name__)
 
@@ -50,16 +51,28 @@ class TaskOutput:
 # Market data
 # --------------------------------------------------------------------------
 
+def uses_market_data(task):
+    """Run ``task`` in a market-data session (market_data.session): prices come
+    from the datasets the request names, or else from a snapshot taken now.
+    The result's ``market_data`` says which; the worker registers the snapshot
+    and names its datasets (dataset_registry.record_market_data)."""
+    @functools.wraps(task)
+    def run(params: dict) -> TaskOutput:
+        with market_data.session(params.get("dataset_ids")) as data:
+            output = task(params)
+        return TaskOutput({**output.result, "market_data": data.record()}, output.audit, output.trials)
+    run.uses_market_data = True
+    return run
+
+
 def fetch_return_matrix(assets: list[str], period: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Fetch and align multi-asset return and price matrices.
 
     Returns (return_matrix T×N, price_matrix T×N, valid_asset_names).
     """
-    import yfinance as yf
     import pandas as pd
 
-    data = yf.download(assets, period=period, interval="1d",
-                       progress=False, auto_adjust=True)
+    data = market_data.download(assets, period)
     if data is None or data.empty:
         raise ValueError("Failed to download market data")
 
@@ -92,16 +105,14 @@ def fetch_return_matrix(assets: list[str], period: str) -> tuple[np.ndarray, np.
 
 def fetch_single_asset(asset: str, period: str) -> tuple[np.ndarray, np.ndarray]:
     """Fetch returns and prices for a single asset."""
-    import yfinance as yf
-    data = yf.download(asset, period=period, interval="1d",
-                       progress=False, auto_adjust=True)
+    data = market_data.download(asset, period)
     if data is None or data.empty:
         raise ValueError(f"Could not fetch data for {asset}")
     close = data["Close"].dropna()
     if len(close) < 60:
         raise ValueError(f"Only {len(close)} trading days for {asset}")
-    # For a single-ticker yf.download() call, data["Close"] is a 1-column
-    # DataFrame in this yfinance version, not a Series — to_numpy() on it
+    # For a single-ticker download, data["Close"] is a 1-column DataFrame
+    # (yf.download's layout, which market_data keeps), not a Series — to_numpy() on it
     # yields shape (T, 1). np.diff() on that diffs along the trivial size-1
     # axis instead of along time, producing a shape that can never broadcast
     # against prices[:-1]. reshape(-1) is a no-op for an already-1-D Series
@@ -115,6 +126,7 @@ def fetch_single_asset(asset: str, period: str) -> tuple[np.ndarray, np.ndarray]
 # Backtests and validation
 # --------------------------------------------------------------------------
 
+@uses_market_data
 def ma_backtest(params: dict) -> TaskOutput:
     """The dashboard's moving-average backtest (persisted as a Backtest row)."""
     from . import backtest_service
@@ -134,6 +146,7 @@ def ma_backtest(params: dict) -> TaskOutput:
     return TaskOutput(result, audit, trials)
 
 
+@uses_market_data
 def advanced_backtest(params: dict) -> TaskOutput:
     """Advanced backtester with realistic execution costs, multiple strategies,
     and comprehensive risk metrics."""
@@ -195,11 +208,12 @@ def advanced_backtest(params: dict) -> TaskOutput:
         raise TaskError(500, "Backtest failed") from exc
 
     trials = TrialRecord(research_trials.family_hash(config.strategy.strategy_type, req.assets),
-                         [req.model_dump()], "backtest")
+                         [req.model_dump(exclude={"dataset_ids"})], "backtest")
     audit = {"assets": req.assets, "strategy": req.strategy_type, "period": req.period}
     return TaskOutput(result, audit, trials)
 
 
+@uses_market_data
 def walk_forward(params: dict) -> TaskOutput:
     """Walk-forward validation with rolling/expanding windows and
     out-of-sample performance aggregation."""
@@ -244,17 +258,16 @@ def walk_forward(params: dict) -> TaskOutput:
     return TaskOutput(result, audit, trials)
 
 
+@uses_market_data
 def event_backtest(params: dict) -> TaskOutput:
     """Event-driven backtest with 1-bar execution delay, realistic commissions,
     bid/ask spread, slippage, and borrow costs."""
-    import yfinance as yf
     from . import historical_data
     from .event_simulator import run_event_backtest
     req = schemas.EventBacktestRequest.model_validate(params)
 
     try:
-        raw = yf.download(req.assets, period=req.period, interval="1d",
-                          progress=False, auto_adjust=True)
+        raw = market_data.download(req.assets, req.period)
         if raw is None or raw.empty:
             raise TaskError(422, "Failed to download market data")
 
@@ -292,7 +305,7 @@ def event_backtest(params: dict) -> TaskOutput:
         raise TaskError(500, "Event backtest failed") from exc
 
     trials = TrialRecord(research_trials.family_hash(f"event:{req.strategy}", req.assets),
-                         [req.model_dump()], "event_backtest")
+                         [req.model_dump(exclude={"dataset_ids"})], "event_backtest")
     audit = {"n_assets": len(price_data), "strategy": req.strategy, "cost_model": req.cost_model}
     return TaskOutput(result, audit, trials)
 
@@ -301,6 +314,7 @@ def event_backtest(params: dict) -> TaskOutput:
 # Cross-sectional research
 # --------------------------------------------------------------------------
 
+@uses_market_data
 def alpha_research(params: dict) -> TaskOutput:
     """Alpha research: IC, Rank IC, IC decay, hit rate, quintile analysis,
     factor turnover — measures signal predictive quality before backtesting."""
@@ -339,6 +353,7 @@ def alpha_research(params: dict) -> TaskOutput:
     return TaskOutput(result, audit)
 
 
+@uses_market_data
 def factor_model(params: dict) -> TaskOutput:
     """Fama-MacBeth cross-sectional factor model with Newey-West inference."""
     from .factor_model import compute_factors, fama_macbeth, barra_risk_decomposition
@@ -372,6 +387,7 @@ def factor_model(params: dict) -> TaskOutput:
     return TaskOutput(result, audit)
 
 
+@uses_market_data
 def correlation(params: dict) -> TaskOutput:
     """Multi-method correlation analysis: Pearson, Spearman, EWMA,
     Ledoit-Wolf shrinkage, OAS, PCA factor decomposition with diagnostics."""
@@ -397,6 +413,7 @@ def correlation(params: dict) -> TaskOutput:
     return TaskOutput(result, audit)
 
 
+@uses_market_data
 def portfolio_optimization(params: dict) -> TaskOutput:
     """Min-Variance, Max-Sharpe, Risk Parity, Max-Diversification,
     Equal-Weight and SBA signal-weighted portfolios with efficient frontier."""
@@ -446,6 +463,7 @@ def portfolio_optimization(params: dict) -> TaskOutput:
 # Regimes, market-neutral strategies, benchmarks and reports
 # --------------------------------------------------------------------------
 
+@uses_market_data
 def regime_detection(params: dict) -> TaskOutput:
     """Gaussian HMM, volatility-percentile and SMA-trend regimes."""
     from .regime_detection import run_regime_detection
@@ -469,6 +487,7 @@ def regime_detection(params: dict) -> TaskOutput:
     return TaskOutput(result, audit)
 
 
+@uses_market_data
 def neutral_strategy(params: dict) -> TaskOutput:
     """Cross-sectional dollar-neutral long/short strategy with optional
     factor neutralisation."""
@@ -525,9 +544,9 @@ def neutral_strategy(params: dict) -> TaskOutput:
     return TaskOutput(result, audit)
 
 
+@uses_market_data
 def pairs_trading(params: dict) -> TaskOutput:
     """Engle-Granger cointegration, Kalman hedge ratio and Z-score signals."""
-    import yfinance as yf
     from . import historical_data
     from .neutral_strategies import pairs_trading_signals
     req = schemas.PairsTradingRequest.model_validate(params)
@@ -536,8 +555,7 @@ def pairs_trading(params: dict) -> TaskOutput:
         raise TaskError(422, "asset_y and asset_x must be different")
 
     try:
-        raw = yf.download([req.asset_y, req.asset_x], period=req.period,
-                          interval="1d", progress=False, auto_adjust=True)
+        raw = market_data.download([req.asset_y, req.asset_x], req.period)
         if raw is None or raw.empty:
             raise TaskError(422, "Failed to download pair data")
 
@@ -575,6 +593,7 @@ def pairs_trading(params: dict) -> TaskOutput:
     return TaskOutput(result, audit)
 
 
+@uses_market_data
 def latency_benchmark(params: dict) -> TaskOutput:
     """End-to-end research pipeline latency, optionally as percentiles and
     C++-versus-NumPy comparisons."""
@@ -613,6 +632,7 @@ def latency_benchmark(params: dict) -> TaskOutput:
     return TaskOutput(results, audit)
 
 
+@uses_market_data
 def research_report(params: dict) -> TaskOutput:
     """The 7-section quant research report pipeline."""
     from .report_generator import run_full_report_pipeline

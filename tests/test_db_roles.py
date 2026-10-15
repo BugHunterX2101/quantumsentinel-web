@@ -360,6 +360,46 @@ def test_the_research_worker_runs_a_dataset_snapshot_as_its_own_role(provisioned
     api.close()
 
 
+def test_a_research_job_registers_and_reuses_its_market_data_as_the_least_privileged_roles(
+        provisioned, monkeypatch, tmp_path):
+    """The worker registers a task's snapshot as qs_research_worker; the API
+    checks, as qs_app, that a rerun names only datasets its user holds."""
+    import numpy as np
+    import pandas as pd
+
+    from market_helpers import fake_market
+
+    days = pd.bdate_range("2023-01-02", periods=300)
+    rng = np.random.default_rng(3)
+    fake_market(monkeypatch, tmp_path, pd.DataFrame(
+        {("Close", t): 100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(days)))) for t in "ABCD"}, index=days))
+    monkeypatch.setattr(security_service.server_identity, "_registered", False)
+    roles = provisioned.roles
+    api = sessionmaker(bind=provisioned.engine_as(roles.app))()
+    worker_sessions = sessionmaker(bind=provisioned.engine_as(roles.research_worker))
+    with worker_sessions() as db:
+        security_service.server_identity.ensure_registered(db)
+    user = models.User(email="market-role@example.com", password_hash="x", role="user")
+    api.add(user)
+    api.commit()
+    runner = worker.Worker(job_process=InlineJobProcess(), session_factory=worker_sessions,
+                           lease_seconds=60, timeout_seconds=300, poll_seconds=0.1)
+    results = []
+    for rerun in (False, True):
+        dataset_ids = results[0]["market_data"]["datasets"] if rerun else None
+        response = main.correlation_endpoint(schemas.CorrelationRequest(
+            assets=list("ABCD"), period="1y", dataset_ids=dataset_ids), user=user, db=api)
+        assert runner.run_once() is True
+        api.expire_all()
+        view = research_jobs.view(api, api.get(models.ResearchJob, json.loads(response.body)["job_id"]))
+        assert view["status"] == "succeeded", view
+        results.append(view["result"])
+    assert results[1]["market_data"] == {**results[0]["market_data"], "source": "datasets"}
+    assert len(main.list_datasets(limit=50, user=user, db=api)) == 1
+    assert security_service.audit_chain_status(api, full=True)["valid"]
+    api.close()
+
+
 def test_the_backup_role_reads_everything_and_writes_nothing(provisioned):
     backup = provisioned.connect(provisioned.roles.backup)
     for (table,) in backup.execute(_RELATIONS, (provisioned.schema,)).fetchall():

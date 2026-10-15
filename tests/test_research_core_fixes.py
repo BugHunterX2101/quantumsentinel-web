@@ -16,10 +16,11 @@ from sqlalchemy.orm import sessionmaker
 
 from backend import main, models, schemas
 from backend.crypto import pqc
-from backend.services import (backtest_service, event_simulator, historical_data, paper_broker,
-                              research_trials, security_service, stat_tests, strategy_signals,
-                              trading_service, walk_forward)
+from backend.services import (backtest_service, event_simulator, historical_data, market_data,
+                              paper_broker, research_trials, security_service, stat_tests,
+                              strategy_signals, trading_service, walk_forward)
 from backend.services.execution_model import zero_cost_config
+from market_helpers import fake_market
 from research_job_helpers import result_of
 
 
@@ -96,10 +97,10 @@ class TestAlignment:
         panel = historical_data.aligned_panel(flat, ["ABC"])
         assert panel.tickers == ["ABC"] and len(panel) == 30
 
-    def test_backtest_prices_both_calendars_on_the_same_date(self, monkeypatch):
+    def test_backtest_prices_both_calendars_on_the_same_date(self, monkeypatch, tmp_path):
         days, coin, equity = mixed_calendar()
-        monkeypatch.setattr(backtest_service.yf, "download",
-                            lambda *a, **k: yf_frame({"COIN": coin, "EQ": equity, "SPY": equity}))
+        fake_market(monkeypatch, tmp_path, yf_frame({"COIN": coin, "EQ": equity, "SPY": equity}),
+                    crypto=("COIN",))
         seen = {}
         original = backtest_service.BacktestEngine._run_strategy
 
@@ -108,9 +109,10 @@ class TestAlignment:
             return original(self, asset_data, start_bar, n_bars, dates)
 
         monkeypatch.setattr(backtest_service.BacktestEngine, "_run_strategy", spy)
-        result = backtest_service.BacktestEngine(backtest_service.BacktestConfig(
-            assets=["COIN", "EQ"], strategy=backtest_service.StrategyConfig(strategy_type="momentum"),
-            execution=zero_cost_config())).run()
+        with market_data.session():
+            result = backtest_service.BacktestEngine(backtest_service.BacktestConfig(
+                assets=["COIN", "EQ"], strategy=backtest_service.StrategyConfig(strategy_type="momentum"),
+                execution=zero_cost_config())).run()
         last = seen["n_bars"] - 1
         coin_day = days[int(seen["asset_data"]["COIN"]["close"][last] - 1000)]
         eq_day = days[int(seen["asset_data"]["EQ"]["close"][last] - 2000)]
@@ -189,15 +191,16 @@ class TestStrategySignals:
 # ── 3. Walk-forward covers every asset through the same engine ──────────────
 
 @pytest.fixture
-def wf_market(monkeypatch):
+def wf_market(monkeypatch, tmp_path):
     idx = pd.bdate_range("2019-01-01", periods=5 * 252 + 20)
     frame = yf_frame({t: pd.Series(random_walk(i, len(idx)), idx) for i, t in enumerate(["AAA", "BBB"])})
-    monkeypatch.setattr(walk_forward.yf, "download", lambda *a, **k: frame)
+    fake_market(monkeypatch, tmp_path, frame)
 
 
 def run_wf(assets, optimize=True):
-    return walk_forward.WalkForwardEngine(walk_forward.WalkForwardConfig(
-        assets=assets, execution=zero_cost_config(), optimize_parameters=optimize)).run()
+    with market_data.session():
+        return walk_forward.WalkForwardEngine(walk_forward.WalkForwardConfig(
+            assets=assets, execution=zero_cost_config(), optimize_parameters=optimize)).run()
 
 
 class TestWalkForward:
@@ -277,16 +280,16 @@ class TestDeflatedSharpe:
 
 
 class TestResearchReport:
-    def test_report_pipeline_runs_on_aligned_prices(self, monkeypatch):
-        import yfinance
+    def test_report_pipeline_runs_on_aligned_prices(self, monkeypatch, tmp_path):
         from backend.services import report_generator
 
         idx = pd.bdate_range("2019-01-01", periods=5 * 252 + 20)
         names = ["AAA", "BBB", "CCC", "DDD"]
         series = {t: pd.Series(random_walk(i + 10, len(idx)), idx) for i, t in enumerate(names)}
         series["DDD"].iloc[:300] = np.nan                     # listed later than the others
-        monkeypatch.setattr(yfinance, "download", lambda *a, **k: yf_frame(series))
-        report = report_generator.run_full_report_pipeline(names, period="5y")
+        fake_market(monkeypatch, tmp_path, yf_frame(series))
+        with market_data.session():
+            report = report_generator.run_full_report_pipeline(names, period="5y")
         assert "error" not in report
         assert report["metadata"]["tickers_used"] == names
         assert report["metadata"]["n_bars"] == len(idx) - 300 - 1   # common days, no back-filled history

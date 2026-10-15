@@ -396,7 +396,32 @@ class StrategyRequest(BaseModel):
         return value
 
 
-class BacktestRequest(BaseModel):
+DATASET_MAX_INPUTS = 10
+
+
+class MarketDataRequest(BaseModel):
+    """A research request that reads prices. With ``dataset_ids`` it runs on
+    those frozen datasets (ones the user holds); without, on a snapshot taken
+    when it runs (services/market_data.py). Either way the result names the
+    datasets it used."""
+    dataset_ids: list[str] | None = Field(default=None, min_length=1, max_length=DATASET_MAX_INPUTS)
+
+    @field_validator("dataset_ids")
+    @classmethod
+    def valid_dataset_ids(cls, value: list[str] | None) -> list[str] | None:
+        from .services.dataset_format import DATASET_ID
+
+        if value is None:
+            return None
+        bad = [v for v in value if not DATASET_ID.fullmatch(v)]
+        if bad:
+            raise ValueError(f"not a dataset id: {bad[0][:80]!r}")
+        if len(set(value)) != len(value):
+            raise ValueError("dataset_ids must be distinct")
+        return value
+
+
+class BacktestRequest(MarketDataRequest):
     asset: str = Field(min_length=1, max_length=20)
     fast_window: int = Field(default=20, ge=2, le=100)
     slow_window: int = Field(default=50, ge=5, le=250)
@@ -427,7 +452,7 @@ class BacktestRequest(BaseModel):
 # Advanced Research Schemas (Phase 1)
 # ---------------------------------------------------------------------------
 
-class AdvancedBacktestRequest(BaseModel):
+class AdvancedBacktestRequest(MarketDataRequest):
     """Request for the advanced backtesting engine with execution costs."""
     assets: list[str] = Field(default=["AAPL"], min_length=1, max_length=10)
     period: str = Field(default="2y")
@@ -474,7 +499,7 @@ class AdvancedBacktestRequest(BaseModel):
         return value
 
 
-class WalkForwardRequest(BaseModel):
+class WalkForwardRequest(MarketDataRequest):
     """Request for walk-forward validation."""
     assets: list[str] = Field(default=["AAPL"], min_length=1, max_length=5)
     window_type: Literal["rolling", "expanding"] = "rolling"
@@ -577,7 +602,7 @@ class DatasetSnapshotRequest(BaseModel):
 # Phase 2: Alpha Research & Factor Modeling Schemas
 # ---------------------------------------------------------------------------
 
-class AlphaResearchRequest(BaseModel):
+class AlphaResearchRequest(MarketDataRequest):
     """Request for the alpha research pipeline."""
     assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM"],
                                min_length=4, max_length=50)
@@ -605,7 +630,7 @@ class AlphaResearchRequest(BaseModel):
         return v
 
 
-class FactorModelRequest(BaseModel):
+class FactorModelRequest(MarketDataRequest):
     """Request for Fama-MacBeth factor model."""
     assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
                                         "BAC", "XOM", "JNJ", "AMZN", "META"],
@@ -628,7 +653,7 @@ class FactorModelRequest(BaseModel):
         return v
 
 
-class CorrelationRequest(BaseModel):
+class CorrelationRequest(MarketDataRequest):
     """Request for multi-method correlation analysis."""
     assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
                                         "BAC", "XOM", "JNJ", "AMZN", "META"],
@@ -650,7 +675,7 @@ class CorrelationRequest(BaseModel):
         return v
 
 
-class PortfolioOptRequest(BaseModel):
+class PortfolioOptRequest(MarketDataRequest):
     """Request for multi-method portfolio optimisation."""
     assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
                                         "BAC", "XOM", "JNJ", "AMZN", "META"],
@@ -717,7 +742,7 @@ class WebhookRequest(BaseModel):
 # Phase 3: Trading Engine & Microstructure Schemas
 # ---------------------------------------------------------------------------
 
-class EventBacktestRequest(BaseModel):
+class EventBacktestRequest(MarketDataRequest):
     """Event-driven backtest with realistic execution."""
     assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL"], min_length=1, max_length=10)
     period: str = Field(default="2y")
@@ -742,7 +767,7 @@ class EventBacktestRequest(BaseModel):
         return v
 
 
-class RegimeDetectionRequest(BaseModel):
+class RegimeDetectionRequest(MarketDataRequest):
     """Market regime detection (HMM + vol + trend)."""
     asset: str = Field(default="SPY", min_length=1, max_length=10)
     period: str = Field(default="3y")
@@ -761,7 +786,7 @@ class RegimeDetectionRequest(BaseModel):
         return v
 
 
-class NeutralStrategyRequest(BaseModel):
+class NeutralStrategyRequest(MarketDataRequest):
     """Long/short equity and factor-neutral strategy."""
     assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
                                         "BAC", "XOM", "JNJ", "AMZN", "META"],
@@ -787,7 +812,7 @@ class NeutralStrategyRequest(BaseModel):
         return v
 
 
-class PairsTradingRequest(BaseModel):
+class PairsTradingRequest(MarketDataRequest):
     """Statistical arbitrage — pairs trading with cointegration."""
     asset_y: str = Field(default="GS", min_length=1, max_length=10)
     asset_x: str = Field(default="MS", min_length=1, max_length=10)
@@ -809,7 +834,7 @@ class PairsTradingRequest(BaseModel):
         return v
 
 
-class LatencyBenchmarkRequest(BaseModel):
+class LatencyBenchmarkRequest(MarketDataRequest):
     """Pipeline latency benchmark."""
     assets: list[str] = Field(default=["AAPL", "MSFT", "GOOGL", "NVDA", "JPM",
                                         "BAC", "XOM", "JNJ", "AMZN", "META"],
@@ -837,7 +862,7 @@ class LatencyBenchmarkRequest(BaseModel):
                                 description="If True, include C++ vs Python kernel speedup comparison")
 
 
-class ReportRequest(BaseModel):
+class ReportRequest(MarketDataRequest):
     """Phase 4D: Full research report generator.
 
     Runs the entire quant research pipeline and returns a structured

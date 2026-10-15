@@ -88,6 +88,26 @@ def _forget_quote_failures():
     trading_service._quote_failures.clear()
 
 
+@pytest.fixture(autouse=True)
+def _research_data_stays_offline():
+    """A research task's snapshot never reaches the network in a test: a test
+    serves its data with market_helpers.fake_market, or the snapshot fails.
+
+    It patches with a MonkeyPatch of its own: requesting the shared
+    ``monkeypatch`` from an autouse fixture would set it up before ``db``, so
+    a test's patches (such as a fake resolver) would outlive the database
+    teardown."""
+    from backend.services import dataset_providers, market_data
+
+    def refuse(symbol, start, end):
+        raise RuntimeError("a test fetched market data from the network; use market_helpers.fake_market")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(market_data, "default_provider",
+                      lambda: dataset_providers.YahooProvider(fetch=refuse, client="offline"))
+        yield
+
+
 @pytest.fixture
 def make_engine():
     """Factory for engines on a fresh, fully created schema of their own.

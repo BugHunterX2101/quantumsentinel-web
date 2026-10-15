@@ -393,8 +393,7 @@ def run_full_report_pipeline(
     Each sub-pipeline catches exceptions independently so partial failures
     do not abort the whole report.
     """
-    import yfinance as yf
-    from . import historical_data
+    from . import historical_data, market_data
     from .factor_model import compute_factors, fama_macbeth
     from .regime_detection import run_regime_detection
     from .walk_forward import WalkForwardConfig, WalkForwardEngine
@@ -411,7 +410,7 @@ def run_full_report_pipeline(
 
     # ── Fetch data ──
     try:
-        raw = yf.download(tickers, period=period, auto_adjust=True, progress=False)
+        raw = market_data.download(tickers, period)
         # Common trading days only: filling gaps backwards would copy a
         # ticker's first future price into dates before it had any.
         panel = historical_data.aligned_panel(raw, tickers)

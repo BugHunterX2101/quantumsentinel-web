@@ -1,0 +1,101 @@
+{
+  "scheme": "qs-sv-sha256-v1",
+  "note": "id = scheme + ':' + sha256(canonical); canonical is the RFC 8785 form of the parsed spec (symbols upper-cased and sorted)",
+  "vectors": [
+    {
+      "spec": {
+        "dsl": "qs-strategy-v1",
+        "cost_model": "retail",
+        "allow_short": false,
+        "leverage_limit_bps": 10000,
+        "execution": "next_bar_close",
+        "risk_limits": {
+          "max_drawdown_bps": 2000,
+          "max_position_bps": 5000
+        },
+        "sizing": {
+          "method": "fixed_fractional",
+          "fraction_bps": 200
+        },
+        "signal": {
+          "template": "ma_crossover",
+          "fast": 20,
+          "slow": 50
+        },
+        "universe": {
+          "family": "EQUITY_EOD",
+          "symbols": [
+            "AAPL"
+          ]
+        }
+      },
+      "canonical": "{\"allow_short\":false,\"cost_model\":\"retail\",\"dsl\":\"qs-strategy-v1\",\"execution\":\"next_bar_close\",\"leverage_limit_bps\":10000,\"risk_limits\":{\"max_drawdown_bps\":2000,\"max_position_bps\":5000},\"signal\":{\"fast\":20,\"slow\":50,\"template\":\"ma_crossover\"},\"sizing\":{\"fraction_bps\":200,\"method\":\"fixed_fractional\"},\"universe\":{\"family\":\"EQUITY_EOD\",\"symbols\":[\"AAPL\"]}}",
+      "id": "qs-sv-sha256-v1:a0a6d3605038035651303ebc8ecbce55d18a1cb138f184152f64bcf18aa4a29e"
+    },
+    {
+      "spec": {
+        "dsl": "qs-strategy-v1",
+        "cost_model": "institutional",
+        "allow_short": true,
+        "leverage_limit_bps": 20000,
+        "execution": "next_bar_close",
+        "risk_limits": {
+          "max_drawdown_bps": 2000,
+          "max_position_bps": 5000
+        },
+        "sizing": {
+          "method": "fixed_fractional",
+          "fraction_bps": 200
+        },
+        "signal": {
+          "template": "momentum",
+          "lookback": 60,
+          "n_long": 1,
+          "n_short": 1
+        },
+        "universe": {
+          "family": "EQUITY_EOD",
+          "symbols": [
+            "msft",
+            "AAPL",
+            " googl ",
+            "AMZN"
+          ]
+        }
+      },
+      "canonical": "{\"allow_short\":true,\"cost_model\":\"institutional\",\"dsl\":\"qs-strategy-v1\",\"execution\":\"next_bar_close\",\"leverage_limit_bps\":20000,\"risk_limits\":{\"max_drawdown_bps\":2000,\"max_position_bps\":5000},\"signal\":{\"lookback\":60,\"n_long\":1,\"n_short\":1,\"template\":\"momentum\"},\"sizing\":{\"fraction_bps\":200,\"method\":\"fixed_fractional\"},\"universe\":{\"family\":\"EQUITY_EOD\",\"symbols\":[\"AAPL\",\"AMZN\",\"GOOGL\",\"MSFT\"]}}",
+      "id": "qs-sv-sha256-v1:8a80eeababc38f540a2835529be41308762b8afdc10d5ec280a827c8817a19f6"
+    },
+    {
+      "spec": {
+        "dsl": "qs-strategy-v1",
+        "cost_model": "zero_cost",
+        "allow_short": false,
+        "leverage_limit_bps": 10000,
+        "execution": "next_bar_close",
+        "risk_limits": {
+          "max_drawdown_bps": 2000,
+          "max_position_bps": 5000
+        },
+        "sizing": {
+          "method": "volatility_target",
+          "target_vol_bps": 1500
+        },
+        "signal": {
+          "template": "mean_reversion",
+          "window": 20,
+          "n_std_centi": 250
+        },
+        "universe": {
+          "family": "CRYPTO_SPOT_EOD",
+          "symbols": [
+            "BTC-USD",
+            "ETH-USD"
+          ]
+        }
+      },
+      "canonical": "{\"allow_short\":false,\"cost_model\":\"zero_cost\",\"dsl\":\"qs-strategy-v1\",\"execution\":\"next_bar_close\",\"leverage_limit_bps\":10000,\"risk_limits\":{\"max_drawdown_bps\":2000,\"max_position_bps\":5000},\"signal\":{\"n_std_centi\":250,\"template\":\"mean_reversion\",\"window\":20},\"sizing\":{\"method\":\"volatility_target\",\"target_vol_bps\":1500},\"universe\":{\"family\":\"CRYPTO_SPOT_EOD\",\"symbols\":[\"BTC-USD\",\"ETH-USD\"]}}",
+      "id": "qs-sv-sha256-v1:f17e013d585c1fc514882c085acdd6cc3d45eeed14008893045812dc210ea76d"
+    }
+  ]
+}

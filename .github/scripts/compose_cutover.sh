@@ -5,9 +5,10 @@
 #   B. `up` with the current file before provisioning: migrate cannot log in
 #   C. provision (while the API runs), then `up`: migrate as qs_migrator, API as qs_app
 #   D. who is connected, what the API's environment holds, data from era A, research jobs
-#   E. the backup service dumps as qs_backup
+#   E. the backup service dumps as qs_backup and copies the dataset blobs;
+#      the blobs are restored onto an empty datasets volume
 #   F. the API restarts as qs_app
-#   G. a fresh install: provision, then up
+#   G. a fresh install: provision, the backup service first, then up
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -32,6 +33,37 @@ both_roles() {
     sleep 2
   done
   echo "sessions: $(sessions)"
+  return 1
+}
+# The research worker stores a dataset blob on the `datasets` volume and
+# prints "<dataset id> <sha256 of the blob>".
+store_blob() {
+  "${NEW[@]}" exec -T research-worker python - <<'EOF' | tr -d '\r'
+from backend.config import DATASET_ROOT
+from backend.services.dataset_format import BARS_V1, Dataset, DatasetIdentity, Table
+from backend.services.dataset_store import DatasetStore
+
+assert str(DATASET_ROOT) == "/data/datasets", DATASET_ROOT
+identity = DatasetIdentity("CI_EOD", "ci", "yahoo-personal-use", "1d", "exchange-local", "split",
+                           "current_listings")
+bars = Table.build(BARS_V1, {"symbol": ["CI"], "session_date": ["2024-01-02"], "open": [1.0], "high": [1.0],
+                             "low": [1.0], "close": [1.0], "volume": [1.0]})
+stored = DatasetStore(DATASET_ROOT).put(Dataset(identity, (bars,)))
+assert DatasetStore(DATASET_ROOT).get(stored.dataset_id, stored.sha256).dataset_id == stored.dataset_id
+print(stored.dataset_id, stored.sha256)
+EOF
+}
+# Waits for the backup service's first pass and prints its summary line.
+backup_pass() {
+  for _ in $(seq 1 60); do
+    line=$("${NEW[@]}" logs --no-log-prefix backup 2>&1 | grep -E 'backup (ok|failed)' | tail -1 || true)
+    case "$line" in
+      *"backup ok"*) echo "$line"; return 0 ;;
+      *"backup failed"*) "${NEW[@]}" logs --no-log-prefix backup 2>&1 | tail -20; return 1 ;;
+    esac
+    sleep 2
+  done
+  "${NEW[@]}" logs --no-log-prefix backup 2>&1 | tail -20
   return 1
 }
 
@@ -175,22 +207,22 @@ else:
     raise SystemExit("no job process found")
 EOF
 # The research worker stores dataset blobs on the `datasets` volume.
-dataset_id=$("${NEW[@]}" exec -T research-worker python - <<'EOF' | tr -d '\r'
+read -r dataset_id dataset_sha < <(store_blob)
+test -n "$dataset_sha"
+echo "research-worker stored $dataset_id ($dataset_sha) on the datasets volume"
+# A blob the worker is still writing: a 0600 .tmp-* file the backup service
+# cannot read. Its backup pass must skip it, not fail on it.
+"${NEW[@]}" exec -T -e DATASET_ID="$dataset_id" research-worker python - <<'EOF'
+import os
 from backend.config import DATASET_ROOT
-from backend.services.dataset_format import BARS_V1, Dataset, DatasetIdentity, Table
 from backend.services.dataset_store import DatasetStore
 
-assert str(DATASET_ROOT) == "/data/datasets", DATASET_ROOT
-identity = DatasetIdentity("CI_EOD", "ci", "yahoo-personal-use", "1d", "exchange-local", "split",
-                           "current_listings")
-bars = Table.build(BARS_V1, {"symbol": ["CI"], "session_date": ["2024-01-02"], "open": [1.0], "high": [1.0],
-                             "low": [1.0], "close": [1.0], "volume": [1.0]})
-stored = DatasetStore(DATASET_ROOT).put(Dataset(identity, (bars,)))
-assert DatasetStore(DATASET_ROOT).get(stored.dataset_id, stored.sha256).dataset_id == stored.dataset_id
-print(stored.dataset_id)
+shard = DatasetStore(DATASET_ROOT).path_for(os.environ["DATASET_ID"]).parent
+fd = os.open(shard / ".tmp-ci-planted", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(fd, b"unfinished")
+os.close(fd)
 EOF
-)
-echo "research-worker stored $dataset_id on the datasets volume"
+echo "planted an unfinished 0600 blob write next to it"
 # Networks: nginx cannot resolve the database; the database has no route out;
 # the API and the research worker reach the internet (market data). Each
 # negative check has a positive control with the same busybox wget, so a
@@ -222,17 +254,52 @@ for service in quantumsentinel research-worker; do
 done
 echo "::endgroup::"
 
-echo "::group::E. backup as qs_backup"
+echo "::group::E. backup as qs_backup, with the dataset blobs, and a dataset restore"
 "${NEW[@]}" --profile backup up -d backup
-for _ in $(seq 1 60); do
-  "${NEW[@]}" exec -T backup sh -c 'pg_restore -l /backups/*.dump > /tmp/toc' 2> /dev/null && break
-  sleep 2
-done
+backup_pass
+"${NEW[@]}" exec -T backup sh -c 'pg_restore -l /backups/quantumsentinel-*.dump > /tmp/toc'
 tables=$("${NEW[@]}" exec -T backup sh -c 'grep -c " TABLE DATA " /tmp/toc')
 owners=$("${NEW[@]}" exec -T backup sh -c 'grep " TABLE public " /tmp/toc | awk "{print \$NF}" | sort -u | tr "\n" " "')
 echo "dump: $tables tables, owned by: $owners"
 test "$tables" -ge 21
 test "$owners" = "qs_owner "
+# The backed-up blob verifies with the application's own store; the
+# unfinished write was left out.
+"${NEW[@]}" --profile restore run --rm -T --entrypoint python \
+  -e DATASET_ID="$dataset_id" -e DATASET_SHA="$dataset_sha" restore-datasets - <<'EOF'
+import os
+from backend.services.dataset_store import DatasetStore
+
+store = DatasetStore("/backups/datasets")
+store.get(os.environ["DATASET_ID"], os.environ["DATASET_SHA"])
+shard = store.path_for(os.environ["DATASET_ID"]).parent
+assert not (shard / ".tmp-ci-planted").exists(), "the unfinished write was backed up"
+EOF
+echo "the backup holds $dataset_id, verified against its hash, and not the unfinished write"
+# Restore drill: lose the datasets volume, restore it from the backup, and
+# the worker reads the blob and can still write next to it.
+"${NEW[@]}" --profile backup rm -sf research-worker backup
+docker volume rm qsci_datasets
+"${NEW[@]}" --profile restore run --rm restore-datasets 2>&1 | tr -d '\r' | tee "$RUNNER_TEMP/restore.log"
+grep -qE 'restore ok: [1-9][0-9]* dataset blobs copied' "$RUNNER_TEMP/restore.log"
+"${NEW[@]}" up -d --no-deps research-worker
+"${NEW[@]}" exec -T -e DATASET_ID="$dataset_id" -e DATASET_SHA="$dataset_sha" research-worker python - <<'EOF'
+import os
+import tempfile
+from backend.config import DATASET_ROOT
+from backend.services.dataset_store import DatasetStore
+
+store = DatasetStore(DATASET_ROOT)
+store.get(os.environ["DATASET_ID"], os.environ["DATASET_SHA"])
+shard = store.path_for(os.environ["DATASET_ID"]).parent
+for directory in (DATASET_ROOT, shard.parent, shard):
+    assert directory.stat().st_uid == os.getuid(), (str(directory), directory.stat().st_uid, os.getuid())
+fd, name = tempfile.mkstemp(prefix=".tmp-", dir=shard)
+os.close(fd)
+os.unlink(name)
+EOF
+echo "restored $dataset_id onto an empty datasets volume; the worker owns every directory and can write in them"
+"${NEW[@]}" --profile backup up -d backup
 echo "::endgroup::"
 
 echo "::group::F. the API and the research worker restart as their own roles"
@@ -247,9 +314,16 @@ echo "::endgroup::"
 echo "::group::G. a fresh install, as the README deploys it"
 "${NEW[@]}" --profile provision --profile backup down -v
 "${NEW[@]}" --profile provision run --rm provision
+# The backup service mounts the new datasets volume (read-only) before the
+# research worker does; the worker must still own it and store blobs in it.
+"${NEW[@]}" --profile backup up -d backup
+backup_pass
 "${NEW[@]}" up -d
 ready
 both_roles
+read -r fresh_id fresh_sha < <(store_blob)
+test -n "$fresh_sha"
+echo "research-worker stored $fresh_id in a datasets volume the backup service mounted first"
 python3 .github/scripts/compose_smoke.py seed fresh@example.com
 echo "::endgroup::"
 echo "cutover verified"

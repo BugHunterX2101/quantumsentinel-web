@@ -210,24 +210,49 @@ services:
     # nginx user (CHOWN) and starts its workers as that user (SETUID/SETGID).
     cap_add: ["NET_BIND_SERVICE", "CHOWN", "SETUID", "SETGID"]
 
+  # Every 6 hours: dumps the database as qs_backup, then copies the dataset
+  # blobs the backup lacks to postgres_backups/datasets (deploy/backup.sh).
+  # Dumps older than 7 days are deleted; the dataset backup only grows.
   backup:
     image: postgres:16-alpine
     profiles: ["backup"]
     restart: unless-stopped
     environment:
+      PGHOST: postgres
+      PGUSER: qs_backup
+      PGDATABASE: quantumsentinel
       PGPASSWORD: ${DB_BACKUP_PASSWORD:?Set DB_BACKUP_PASSWORD}
     volumes:
       - postgres_backups:/backups
+      - datasets:/data/datasets:ro
+      - ./deploy/backup.sh:/backup.sh:ro
     networks: [data]
     depends_on:
       postgres:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-c"]
     # The dump names qs_owner as the owner of everything: create the roles
     # before restoring it, or restore with --no-owner.
-    command: ["while true; do pg_dump -h postgres -U qs_backup -d quantumsentinel -Fc > /backups/quantumsentinel-$$(date +%Y%m%d%H%M%S).dump && find /backups -type f -mtime +7 -delete; sleep 21600; done"]
+    entrypoint: ["/bin/sh", "/backup.sh", "backup"]
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
+
+  # One-off, under its own profile: copies the dataset blobs the datasets
+  # volume lacks back from the backup. It runs as the image's app user, so the
+  # research worker can still write into the directories it creates.
+  restore-datasets:
+    build: .
+    image: quantumsentinel-web:production
+    profiles: ["restore"]
+    restart: "no"
+    volumes:
+      - datasets:/data/datasets
+      - postgres_backups:/backups:ro
+      - ./deploy/backup.sh:/backup.sh:ro
+    network_mode: none
+    entrypoint: ["/bin/sh", "/backup.sh", "restore-datasets"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
 
 networks:
   data:

@@ -846,7 +846,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `RESEARCH_MAX_ACTIVE_JOBS_PER_USER` | No | Queued plus running research jobs one user may have (default 3) |
 | `RESEARCH_JOB_RETENTION_DAYS` | No | Finished jobs and their results are deleted after this many days (default 7) |
 | `RESEARCH_WORKER_POLL_SECONDS` | No | How often an idle worker checks the queue (default 1) |
-| `DATASET_ROOT` | No | Where dataset blobs are stored. The Docker image sets `/data/datasets`; production compose mounts the `datasets` volume there on the research worker. Default outside Docker: `data/datasets` in the repository |
+| `DATASET_ROOT` | No | Where dataset blobs are stored. The Docker image sets `/data/datasets`; production compose mounts the `datasets` volume there on the research worker (read-only on the `backup` service). Default outside Docker: `data/datasets` in the repository |
 
 ---
 
@@ -881,7 +881,7 @@ To move a deployment over:
 1. As the superuser (`DATABASE_URL` naming it), with `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` set, run `python -m backend.manage provision-roles`. It migrates the schema to the latest revision first, then creates the roles and hands them the schema in one transaction. Only SCRAM verifiers reach the server, so no password appears in its logs. It can run while the application serves requests. Changing a table's owner needs the table's exclusive lock, and taking those one at a time deadlocked with order traffic in a rehearsal (provisioning held `positions` and waited for `users`, while an order held `users` and waited for `positions`). So the command takes every lock it needs in one `LOCK ... NOWAIT`. If any table is in use, it lets go of everything and tries again moments later; queries wait at most a moment. If the tables stay busy for 10 s, it exits 1 without changing anything. It is safe to run again, and a second run takes no table locks.
 2. Point `DATABASE_URL` for the API and workers at `qs_app`. With `DB_MIGRATE_ON_STARTUP=true` they start normally while the schema is current, and refuse to start if a migration is pending.
 3. Run each release's migrations as `qs_migrator`: `DATABASE_URL=<qs_migrator URL> python -m backend.manage migrate`.
-4. Take backups as `qs_backup`: `pg_dump -U qs_backup`. A dump made this way records `qs_owner` as the owner of everything; create the roles before restoring it, or restore with `--no-owner`.
+4. Take backups as `qs_backup`: `pg_dump -U qs_backup`. A dump made this way records `qs_owner` as the owner of everything; create the roles before restoring it, or restore with `--no-owner`. A dump holds only dataset metadata, so back up the blobs under `DATASET_ROOT` too, after each dump (see [Backups](#backups)).
 
 Running `provision-roles` again restores the intended role attributes, memberships, ownership and grants and removes anything extra. On a schema that has not been provisioned, migrations run as whoever connects, as before.
 
@@ -891,7 +891,7 @@ Running `provision-roles` again restores the intended role attributes, membershi
 - The `research-worker` service runs research jobs as `qs_research_worker`, limited to 1 CPU and 1 GB. Run more with `--scale research-worker=N`.
 - The worker holds only the secrets it uses (`QS_PROCESS_ROLE=research-worker`): its database URL and the server signing key. The API's other secrets, and their `*_FILE` forms, are blanked for it. Its job processes start with no secret at all.
 - A one-off `migrate` service applies migrations as `qs_migrator`; the API and the worker start only once it has succeeded.
-- The `backup` service dumps as `qs_backup`.
+- The `backup` service, under its own profile, dumps as `qs_backup` every 6 hours and then copies the new dataset blobs (see [Backups](#backups)).
 - A `provision` service, under its own profile, runs `provision-roles` as the superuser.
 - Only `postgres` and `provision` receive the superuser's password. Every service that loads `.env.production` blanks every database password variable, so that file cannot leak one into the API or the worker.
 - `postgres` and `redis` are only on the `data` network, which has no route out. So the database cannot reach the internet, and nginx (only on `edge`) cannot reach the database. The API and the research worker join both networks, because they need the internet for market data.
@@ -907,16 +907,45 @@ The first command runs while the API keeps serving. The second replaces the API 
 
 A deployment that already runs on these roles, provisioned before `qs_research_worker` existed, takes the same two commands after `DB_RESEARCH_WORKER_PASSWORD` is added. Without that variable Compose refuses to start; with it but before `provision`, the `research-worker` service cannot log in. It retries every 2 s (`database not reachable yet` in its log), so research jobs wait in the queue and start once `provision` has run.
 
-The CI job `deploy-compose` checks this end to end on every push. It deploys the stack with Docker and writes data as the superuser. It then provisions while the API runs and brings the stack up again. It checks six things:
+The CI job `deploy-compose` checks this end to end on every push. It deploys the stack with Docker and writes data as the superuser. It then provisions while the API runs and brings the stack up again. It checks seven things:
 
 - only `qs_app` and `qs_research_worker` sessions reach the database, and none of the API, the worker and `migrate` holds the superuser password;
 - the earlier data is intact, and research jobs run in the `research-worker` container;
 - the worker holds none of the API's secrets, and its live job process has no database URL or key in its environment;
 - nginx cannot resolve `postgres`, and `postgres` cannot reach the internet, while the API and the worker can;
-- the backup is a full dump made as `qs_backup`;
+- the backup is a full dump made as `qs_backup`, and it holds a dataset blob the worker stored, which verifies against its hash, but not a blob the worker was still writing;
+- after the `datasets` volume is deleted, `restore-datasets` brings that blob back, and the worker reads it and can write into every restored directory;
 - the API and the worker restart as their own roles.
 
-It also deploys a fresh install the same way (`provision`, then `up`).
+It also deploys a fresh install the same way (`provision`, then `up`), starting the `backup` service before the worker, and checks that the worker can still store a blob.
+
+### Backups
+
+The `backup` service ([`deploy/backup.sh`](deploy/backup.sh)) runs a pass every 6 hours. Start it with:
+
+```bash
+docker compose -f docker-compose.production.yml --env-file .env.production --profile backup up -d backup
+```
+
+Each pass dumps the database as `qs_backup` into the `postgres_backups` volume (`quantumsentinel-<UTC time>.dump`), then copies each dataset blob that the backup lacks into `postgres_backups` under `datasets/`. A copy is checked against its source's SHA-256 before it takes the blob's name. Dumps older than 7 days are deleted once a new dump has succeeded. Blobs are never deleted.
+
+The order is what makes a dump restorable. A dataset is registered in the database only after its blob is stored and read back, and nothing deletes a blob, so blobs copied after a dump include every blob that dump refers to. Every dump, old or new, restores with the current `datasets/` backup. A pass whose dump or copies fail logs `backup failed` and tries again at the next interval.
+
+The service mounts the `datasets` volume read-only. The worker writes each blob to a `.tmp-*` file that only the worker can read, then renames it, and a pass skips those files.
+
+Both volumes are on the Docker host, so a lost host takes the backups with it. Copying `postgres_backups` off the host is the operator's job.
+
+To restore:
+
+1. Restore a dump with `pg_restore`. Any dump will do. It records `qs_owner` as the owner of everything, so create the roles first, or restore with `--no-owner` (see [Database roles](#database-roles)).
+2. Bring the blobs back:
+
+   ```bash
+   docker compose -f docker-compose.production.yml --env-file .env.production --profile restore run --rm restore-datasets
+   ```
+
+   This copies each blob that the `datasets` volume lacks from the backup, checking each copy the same way. It never replaces a blob that is already there. It runs as the image's `app` user with no network, so the worker can write into every directory it creates.
+3. Start the stack with `up -d`.
 
 ### Measured capacity
 

@@ -48,8 +48,9 @@ def test_each_service_connects_as_its_own_role(services):
         "postgresql+psycopg://qs_research_worker:${DB_RESEARCH_WORKER_PASSWORD")
     assert url("migrate").startswith("postgresql+psycopg://qs_migrator:${DB_MIGRATOR_PASSWORD")
     assert url("provision").startswith("postgresql+psycopg://quantumsentinel:${POSTGRES_PASSWORD")
-    assert "-U qs_backup" in _text(services["backup"])
-    assert services["backup"]["environment"]["PGPASSWORD"].startswith("${DB_BACKUP_PASSWORD")
+    backup = services["backup"]["environment"]
+    assert (backup["PGHOST"], backup["PGUSER"], backup["PGDATABASE"]) == ("postgres", "qs_backup", "quantumsentinel")
+    assert backup["PGPASSWORD"].startswith("${DB_BACKUP_PASSWORD")
 
 
 def test_each_password_reaches_only_its_holders(services):
@@ -114,6 +115,34 @@ def test_the_database_has_no_route_out_and_no_route_from_nginx():
         assert services[name]["networks"] == ["data", "edge"], name
 
 
+def test_backups_include_the_dataset_blobs_and_cannot_change_them(services):
+    """deploy/backup.sh dumps the database, then copies the blobs; the API
+    reads no blob, so only the worker and a restore write the volume."""
+    assert services["backup"]["entrypoint"] == ["/bin/sh", "/backup.sh", "backup"]
+    assert "command" not in services["backup"]
+    assert set(services["backup"]["volumes"]) == {
+        "postgres_backups:/backups", "datasets:/data/datasets:ro", "./deploy/backup.sh:/backup.sh:ro"}
+    mounting = {name: volume for name, service in services.items() for volume in service.get("volumes", [])
+                if volume.startswith("datasets:")}
+    assert mounting == {"research-worker": "datasets:/data/datasets", "backup": "datasets:/data/datasets:ro",
+                        "restore-datasets": "datasets:/data/datasets"}
+
+
+def test_a_restore_writes_blobs_as_the_workers_user_with_nothing_else(services):
+    """As the image's app user, so the research worker can write into every
+    directory the restore creates; no secret, no network, read-only root."""
+    restore = services["restore-datasets"]
+    assert restore["profiles"] == ["restore"]
+    assert restore["restart"] == "no"
+    assert restore["image"] == services["research-worker"]["image"]
+    assert "user" not in restore and "env_file" not in restore and "environment" not in restore
+    assert restore["network_mode"] == "none"
+    assert restore["read_only"] is True
+    assert restore["entrypoint"] == ["/bin/sh", "/backup.sh", "restore-datasets"]
+    assert set(restore["volumes"]) == {
+        "datasets:/data/datasets", "postgres_backups:/backups:ro", "./deploy/backup.sh:/backup.sh:ro"}
+
+
 def test_nginx_follows_the_api_to_a_new_address():
     """Compose gives a recreated container a new address. nginx resolves an
     upstream name once at startup unless told to re-resolve it."""
@@ -151,7 +180,7 @@ def test_resolved_configuration_confines_each_password(tmp_path):
                      "@postgres:5432/quantumsentinel\n")
     resolved = subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE), "--project-directory", str(ROOT), "--env-file", str(env),
-         "--profile", "provision", "--profile", "backup", "config", "--format", "json"],
+         "--profile", "provision", "--profile", "backup", "--profile", "restore", "config", "--format", "json"],
         capture_output=True, text=True, check=True,
         env={**{key: value for key, value in os.environ.items() if key not in PASSWORDS},
              "PRODUCTION_ENV_FILE": str(env)})

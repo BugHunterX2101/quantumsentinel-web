@@ -138,12 +138,14 @@ services:
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
       # Research jobs run in the research-worker service, not in this one.
       RESEARCH_WORKER_MODE: external
-      # Safe as "*" only because this service uses `expose` (below), not `ports`:
-      # it is unreachable from outside the compose network, so every peer that
-      # can connect to it at all is a container on this stack, and nginx is the
-      # sole proxy_pass target that forwards real client IPs. If this service is
-      # ever given a published port or a different network topology, replace "*"
-      # with the reverse proxy's actual container IP/CIDR.
+      # Trusts X-Forwarded-For from any peer, and uvicorn takes the header's
+      # leftmost entry as the client. Safe only because both hold:
+      #   - this service uses `expose` (below), not `ports`, so only containers
+      #     on this stack can connect to it, and nginx is the one that proxies;
+      #   - nginx replaces the header with the connection's address
+      #     (deploy/nginx.conf) instead of appending to the client's own.
+      # If this service is ever given a published port or a different network
+      # topology, replace "*" with the reverse proxy's container IP/CIDR.
       FORWARDED_ALLOW_IPS: "*"
     expose: ["8000"]
     networks: [data, edge]

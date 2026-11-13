@@ -252,6 +252,23 @@ for service in quantumsentinel research-worker; do
     "import urllib.request; urllib.request.urlopen('https://example.com', timeout=15)"
   echo "$service reaches the internet"
 done
+# The API keys the /api/auth/* rate limit, login lockout and audit records on
+# the client's address, which it takes from X-Forwarded-For. Through nginx a
+# client must not be able to choose it: 11 requests to one /api/auth/ path,
+# each claiming a different address, and the 11th is over the limit of 10 per
+# address. The path is new, so no earlier request counts against it.
+probe="/api/auth/ci-xff-$RANDOM$RANDOM"
+codes=()
+for i in $(seq 1 11); do
+  codes+=("$(curl -sk -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -H "X-Forwarded-For: 203.0.113.$i" -d '{}' "https://localhost$probe")")
+done
+echo "11 requests to $probe, each with its own X-Forwarded-For: ${codes[*]}"
+for code in "${codes[@]:0:10}"; do
+  case "$code" in 429|5??|000) echo "unexpected $code before the limit"; exit 1 ;; esac
+done
+test "${codes[10]}" = 429
+echo "a client-supplied X-Forwarded-For does not change the address the API limits"
 echo "::endgroup::"
 
 echo "::group::E. backup as qs_backup, with the dataset blobs, and a dataset restore"

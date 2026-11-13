@@ -7,6 +7,7 @@ database password variable, so the file cannot leak one into them.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -150,6 +151,23 @@ def test_nginx_follows_the_api_to_a_new_address():
     assert "resolver 127.0.0.11 " in conf
     assert "server quantumsentinel:8000 resolve;" in conf
     assert "zone quantumsentinel_app " in conf
+
+
+def test_nginx_replaces_a_client_supplied_x_forwarded_for(services):
+    """The API trusts X-Forwarded-For from any peer and uvicorn takes its
+    leftmost entry as the client. nginx must replace the header, not append to
+    it, or a client picks the address its rate limit and login lockout are
+    keyed on (deploy-compose checks this through the running stack)."""
+    assert services["quantumsentinel"]["environment"]["FORWARDED_ALLOW_IPS"] == "*"
+    assert "ports" not in services["quantumsentinel"]
+    conf = (ROOT / "deploy" / "nginx.conf").read_text()
+    code = "\n".join(line.split("#", 1)[0] for line in conf.splitlines())
+    assert "$proxy_add_x_forwarded_for" not in code
+    assert re.findall(r"proxy_set_header\s+X-Forwarded-For\s+([^;]+);", code, re.I) == ["$remote_addr"]
+    # A location that sets any proxy_set_header of its own inherits none of
+    # the server's, the X-Forwarded-For one included.
+    for block in re.findall(r"location[^{]*\{([^}]*)\}", code):
+        assert "proxy_set_header" not in block, block
 
 
 def test_external_research_workers_need_a_worker_service(services):

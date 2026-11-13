@@ -18,6 +18,18 @@ session the data has for the requested tickers, so a rerun on the dataset ids
 a snapshot produced sees exactly the bars the first run saw. Sessions on or
 after the day a snapshot is taken are never included (dataset_providers).
 
+Holdouts. A dataset family with a holdout start (dataset_holdouts) is read as
+if its data ended the day before: bars from the start on and dividends going
+ex from it on are dropped before anything else, so the trailing window ends at
+the last session before the start and no later dividend rescales an earlier
+price. A task therefore computes exactly what it would on datasets cut at the
+start. The research worker passes the starts in (``holdouts()``) and the
+result names those that applied to the datasets it used. Splits are
+different: the provider serves prices already adjusted for every split up to
+the day of the snapshot, so a split after the start still scales earlier
+price levels (returns are unchanged). Only point-in-time data (adjustment
+"raw") would avoid that.
+
 Total return. The provider's bars are split-adjusted only (identity
 adjustment "split"). Dividends are added back with the backward factor
 prod(1 - dividend / previous close) over later ex-dates, which is how Yahoo
@@ -108,11 +120,16 @@ class _Series:
     dividends: dict     # ex_date (datetime.date) -> amount
 
 
-def _series(dataset: Dataset, symbol: str) -> _Series | None:
+def _series(dataset: Dataset, symbol: str, before: dt.date | None = None) -> _Series | None:
+    """``symbol``'s bars and dividends in ``dataset``, or None if it has none.
+    With ``before`` (a holdout start), only the bars of sessions and the
+    dividends going ex before it; the bars may then be empty."""
     bars = dataset.table("bars").columns
     rows = bars["symbol"] == symbol
     if not rows.any():
         return None
+    if before is not None:
+        rows = rows & (bars["session_date"] < np.datetime64(before, "D"))
     sessions = pd.DatetimeIndex(bars["session_date"][rows].astype("datetime64[ns]"))
     frame = pd.DataFrame({name: bars[name][rows] for name in ("open", "high", "low", "close", "volume")},
                          index=sessions)
@@ -123,6 +140,8 @@ def _series(dataset: Dataset, symbol: str) -> _Series | None:
         actions = None
     if actions is not None:
         mine = (actions["symbol"] == symbol) & (actions["action"] == "dividend")
+        if before is not None:
+            mine = mine & (actions["ex_date"] < np.datetime64(before, "D"))
         dividends = dict(zip(actions["ex_date"][mine].tolist(), actions["value"][mine].tolist()))
     return _Series(dataset.identity.as_dict(), frame, dividends)
 
@@ -164,20 +183,26 @@ def _adjusted(symbol: str, series: _Series) -> pd.DataFrame:
     return pd.DataFrame(out, index=bars.index)
 
 
-def frame_from(datasets: Iterable[tuple[str, Dataset]], tickers: list[str],
-               period: str) -> tuple[pd.DataFrame, list[str], dict[str, str]]:
+def frame_from(datasets: Iterable[tuple[str, Dataset]], tickers: list[str], period: str,
+               holdouts: dict[str, dt.date] | None = None) -> tuple[pd.DataFrame, list[str], dict[str, str]]:
     """``tickers`` from ``datasets`` ((id, dataset) pairs) over the trailing
-    ``period``, in yf.download's layout. Returns the frame, the ids of the
-    datasets that supplied it and the tickers it could not supply, with why."""
+    ``period``, in yf.download's layout, each dataset cut at its family's
+    holdout start in ``holdouts``. Returns the frame, the ids of the datasets
+    that supplied it and the tickers it could not supply, with why."""
     datasets = list(datasets)
+    holdouts = holdouts or {}
     found, missing = {}, {}
     for ticker in tickers:
         parts = [(dataset_id, s) for dataset_id, dataset in datasets
-                 if (s := _series(dataset, ticker)) is not None]
-        if parts:
-            found[ticker] = (_merged(ticker, [s for _, s in parts]), {i for i, _ in parts})
-        else:
+                 if (s := _series(dataset, ticker, holdouts.get(dataset.identity.family))) is not None]
+        if not parts:
             missing[ticker] = "no data"
+            continue
+        series = _merged(ticker, [s for _, s in parts])
+        if series.bars.empty:
+            missing[ticker] = "only data from the holdout start on"
+        else:
+            found[ticker] = (series, {i for i, s in parts if not s.bars.empty})
     columns, used = {}, set()
     if found:
         anchor = max(series.bars.index.max() for series, _ in found.values()) + pd.Timedelta(days=1)
@@ -201,18 +226,34 @@ def frame_from(datasets: Iterable[tuple[str, Dataset]], tickers: list[str],
     return frame, sorted(used), missing
 
 
+def _checked_holdouts(holdouts) -> dict[str, dt.date]:
+    """``holdouts`` as {family: date}; anything else is refused, since a
+    boundary that silently fails to apply would unseal the holdout."""
+    if holdouts is None:
+        return {}
+    if not isinstance(holdouts, dict):
+        raise TypeError("holdouts must map a dataset family to a date")
+    for family, start in holdouts.items():
+        if not isinstance(family, str) or not isinstance(start, dt.date) or isinstance(start, dt.datetime):
+            raise TypeError("holdouts must map a dataset family to a date")
+    return dict(holdouts)
+
+
 class MarketData:
     """The market data one research task used (see the module docstring)."""
 
     def __init__(self, dataset_ids: list[str] | None = None, *, provider=None,
-                 store: DatasetStore | None = None, clock: Callable[[], dt.datetime] | None = None):
+                 store: DatasetStore | None = None, clock: Callable[[], dt.datetime] | None = None,
+                 holdouts: dict[str, dt.date] | None = None):
         from ..config import DATASET_ROOT
 
         self.dataset_ids = list(dataset_ids) if dataset_ids else None
         self._provider = provider
         self._store = store or DatasetStore(DATASET_ROOT)
         self._clock = clock or utcnow
+        self.holdouts = _checked_holdouts(holdouts)
         self._loaded: dict[str, Dataset] = {}
+        self._families: dict[str, str] = {}  # dataset id -> its family
         self.snapshots: list[dict] = []
         self.used: set[str] = set()
         self.unavailable: dict[str, str] = {}
@@ -225,7 +266,9 @@ class MarketData:
             sources = [(dataset_id, self._load(dataset_id)) for dataset_id in self.dataset_ids]
         else:
             sources = self._snapshot(symbols, period)
-        frame, used, missing = frame_from(sources, symbols, period)
+        for dataset_id, dataset in sources:
+            self._families[dataset_id] = dataset.identity.family
+        frame, used, missing = frame_from(sources, symbols, period, self.holdouts)
         self.used.update(used)
         for symbol, why in missing.items():
             self.unavailable.setdefault(symbol, why)
@@ -251,8 +294,13 @@ class MarketData:
             raise MarketDataError(f"at most {MAX_SYMBOLS} symbols can be fetched at once")
         end = self._clock().astimezone(dt.timezone.utc).date() + dt.timedelta(days=1)
         # A week more than the period, so the trailing window (which ends at
-        # the data's last session, not at today) is always covered.
-        start = period_start(end, period) - dt.timedelta(days=_FETCH_MARGIN_DAYS)
+        # the data's last session, not at today) is always covered. The window
+        # ends at a holdout start if one comes first: the provider's families
+        # are only known once it answers, so the earliest start is used, and the
+        # snapshot still reaches today so that it stays reusable once the
+        # holdout is rolled forward.
+        horizon = min([end, *self.holdouts.values()])
+        start = period_start(horizon, period) - dt.timedelta(days=_FETCH_MARGIN_DAYS)
         request = SnapshotRequest(tuple(valid), start, end)
         try:
             snapshot = (self._provider or default_provider()).snapshot(request)
@@ -270,18 +318,35 @@ class MarketData:
 
     def record(self) -> dict:
         """What the task's result says about its data, before the worker
-        registers ``snapshots`` (dataset_registry.record_market_data)."""
+        registers ``snapshots`` (dataset_registry.record_market_data).
+        ``holdouts`` names the start of each holdout that cut a dataset used."""
+        families = {self._families[dataset_id] for dataset_id in self.used}
         return {"source": "datasets" if self.dataset_ids is not None else "snapshot",
                 "datasets": sorted(self.used), "unavailable": dict(sorted(self.unavailable.items())),
-                "snapshots": self.snapshots}
+                "snapshots": self.snapshots,
+                "holdouts": {family: start.isoformat() for family, start in sorted(self.holdouts.items())
+                             if family in families}}
 
 
 _active: contextvars.ContextVar[MarketData | None] = contextvars.ContextVar("qs_market_data", default=None)
+_sealed: contextvars.ContextVar[dict | None] = contextvars.ContextVar("qs_holdouts", default=None)
+
+
+@contextlib.contextmanager
+def holdouts(starts: dict[str, dt.date] | None):
+    """Apply the holdout ``starts`` ({family: date}) to every ``session()``
+    opened inside; the research worker wraps each job in this."""
+    token = _sealed.set(_checked_holdouts(starts))
+    try:
+        yield
+    finally:
+        _sealed.reset(token)
 
 
 @contextlib.contextmanager
 def session(dataset_ids: list[str] | None = None, **options):
     """Make ``download`` serve one research task; yields its MarketData."""
+    options.setdefault("holdouts", _sealed.get())
     data = MarketData(dataset_ids, **options)
     token = _active.set(data)
     try:

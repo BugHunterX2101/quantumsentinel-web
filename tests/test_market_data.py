@@ -166,7 +166,7 @@ def test_a_rerun_on_the_snapshots_datasets_sees_the_same_frame(monkeypatch, tmp_
     pd.testing.assert_frame_equal(rerun, original)
     assert len(yahoo.calls) == calls                       # read from the store, not fetched
     assert again.record() == {"source": "datasets", "datasets": record["datasets"], "unavailable": {},
-                              "snapshots": []}
+                              "snapshots": [], "holdouts": {}}
 
 
 def test_a_dataset_missing_from_the_store_is_an_error(tmp_path, monkeypatch):

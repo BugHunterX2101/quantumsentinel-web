@@ -10,9 +10,9 @@ from backend.services.research_tasks import TaskOutput
 class InlineJobProcess:
     """Runs tasks in this process (so monkeypatches apply); no time limit."""
 
-    def run(self, target, params, timeout, on_tick, tick_seconds=1.0):
+    def run(self, target, params, timeout, on_tick, tick_seconds=1.0, *, holdouts=None):
         from backend import worker
-        return worker._run_target(target, params)
+        return worker._run_target(target, params, holdouts)
 
     def stop(self):
         pass

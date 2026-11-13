@@ -7,8 +7,8 @@ its parameters, and the compiler turns it into the arguments of
 
 * ``StrategySpec`` is DSL v1: a flat object of required fields. A spec has no
   defaults, so its canonical form is exactly what was given (after symbols
-  are upper-cased and sorted), and two specs that run the same strategy have
-  the same bytes.
+  are upper-cased and sorted). Values the engine would clamp or ignore are
+  refused rather than stored, so every field in the bytes is what runs.
 * Numbers are integers: fractions are basis points (``*_bps``, 1/10,000) and
   the mean-reversion band width is in hundredths (``n_std_centi``). Floats
   are refused, so the id never depends on how a language prints a float.
@@ -16,7 +16,8 @@ its parameters, and the compiler turns it into the arguments of
   JSON (RFC 8785 on the restricted domain of
   ``dataset_format.canonical_json``). tests/fixtures/qs_sv_sha256_v1.json
   holds golden vectors for other implementations.
-* Every field changes what the engine runs, except ``risk_limits``. Those are
+* Every field changes what the engine runs, except ``universe.family``, which
+  selects the data (and its holdout), and ``risk_limits``. Those are
   declared limits that the validation gate checks a backtest never breached
   (R3); nothing here enforces them. ``execution`` has one value,
   ``next_bar_close``: the engine fills an order at the close of the bar after
@@ -165,10 +166,20 @@ class StrategySpec(_Model):
     risk_limits: RiskLimits
 
     @model_validator(mode="after")
-    def _momentum_ranks_three(self):
-        # The engine trades at most a third of the ranked universe.
-        if isinstance(self.signal, Momentum) and len(self.universe.symbols) < 3:
+    def _momentum_fits_the_universe(self):
+        # The engine trades at most a third of the ranked universe on each
+        # side and silently lowers larger counts, so a spec asking for more
+        # would claim positions it never takes. Without shorting, a sell can
+        # only flatten, so a long-only momentum spec needs a long side.
+        if not isinstance(self.signal, Momentum):
+            return self
+        third = len(self.universe.symbols) // 3
+        if third == 0:
             raise ValueError("momentum needs at least 3 symbols")
+        if self.signal.n_long > third or self.signal.n_short > third:
+            raise ValueError(f"n_long and n_short can be at most a third of the universe ({third})")
+        if self.signal.n_long == 0 and not self.allow_short:
+            raise ValueError("long-only momentum needs n_long of at least 1")
         return self
 
 

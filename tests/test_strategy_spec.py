@@ -91,6 +91,7 @@ LEAVES = {
 # checked against a backtest by the validation gate.
 NOT_RUN = {"universe.family", "risk_limits.max_drawdown_bps", "risk_limits.max_position_bps"}
 
+SIX = ["AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA"]
 VARIANTS = {
     "signal": [{"template": "momentum", "lookback": 60, "n_long": 1, "n_short": 1},
                {"template": "momentum", "lookback": 30, "n_long": 1, "n_short": 1},
@@ -128,10 +129,18 @@ def test_every_field_is_part_of_the_id_and_only_declared_ones_skip_the_engine(pa
 
 @pytest.mark.parametrize("field", sorted(VARIANTS))
 def test_every_template_and_sizing_parameter_reaches_the_engine(field):
-    variants = VARIANTS[field]
-    compiled = {_compiled(spec(**{field: v})) for v in variants}
-    ids = {ss.version_id(ss.parse(spec(**{field: v}))) for v in variants}
+    # Six symbols, so momentum may trade two on a side.
+    variants = [spec(**{field: v, "universe.symbols": SIX}) for v in VARIANTS[field]]
+    compiled = {_compiled(v) for v in variants}
+    ids = {ss.version_id(ss.parse(v)) for v in variants}
     assert len(compiled) == len(ids) == len(variants)
+
+
+def test_momentum_counts_up_to_a_third_and_a_short_only_side_when_shorting():
+    momentum = {"template": "momentum", "lookback": 60, "n_long": 2, "n_short": 2}
+    assert ss.parse(spec(**{"signal": momentum, "universe.symbols": SIX})).signal.n_long == 2
+    short_only = {"template": "momentum", "lookback": 60, "n_long": 0, "n_short": 1}
+    assert ss.parse(spec(**{"signal": short_only, "allow_short": True})).signal.n_short == 1
 
 
 # --------------------------------------------------------------------------
@@ -194,9 +203,14 @@ def test_run_uses_only_the_universe_and_refuses_missing_prices():
     {"signal.slow": 20},                        # slow not above fast
     {"signal.fast": 1},                         # fast below range
     {"signal.slow": 501},                       # slow above range
-    {"signal": {"template": "momentum", "lookback": 60, "n_long": 0, "n_short": 0}},
+    {"signal": {"template": "momentum", "lookback": 60, "n_long": 0, "n_short": 0},
+     "allow_short": True},                      # trades nothing even when shorting
     {"signal": {"template": "momentum", "lookback": 60, "n_long": 1, "n_short": 1},
      "universe.symbols": ["AAPL", "MSFT"]},     # momentum on 2 symbols
+    {"signal": {"template": "momentum", "lookback": 60, "n_long": 2, "n_short": 1}},
+    {"signal": {"template": "momentum", "lookback": 60, "n_long": 1, "n_short": 2},
+     "allow_short": True},                      # more than a third on either side
+    {"signal": {"template": "momentum", "lookback": 60, "n_long": 0, "n_short": 1}},  # long-only, no long side
     {"signal": {"template": "mean_reversion", "window": 20, "n_std": 2}},
     {"signal": {"template": "obi_momentum", "threshold": 1}},
     {"signal.extra": 1},

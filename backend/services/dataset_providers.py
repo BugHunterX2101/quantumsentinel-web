@@ -132,6 +132,9 @@ _YAHOO_TYPES = {
     "CURRENCY": ("fx", "FX_SPOT_EOD"),
     "FUTURE": ("future", "FUTURES_CONTINUOUS_EOD"),
 }
+# Every dataset family a provider here produces (dataset_holdouts checks
+# operator input against it).
+FAMILIES = frozenset(family for _, family in _YAHOO_TYPES.values())
 _ACTIONS = (("Dividends", "dividend"), ("Stock Splits", "split"), ("Capital Gains", "capital_gain"))
 
 Fetch = Callable[[str, dt.date, dt.date], tuple[object, Mapping]]

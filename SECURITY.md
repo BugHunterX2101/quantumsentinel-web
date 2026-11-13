@@ -152,7 +152,9 @@
     closed with 4401;
   - at most 3 connections per user across all workers, counted in Redis
     (`qs:ws:conn:<user>`, expiring after 120 seconds unless a live connection
-    refreshes it); a fourth is closed with 4429;
+    refreshes it; a slot is taken in one atomic script); a fourth is closed
+    with 4429, and in production so is any connection while Redis is
+    unreachable;
   - the socket is closed with 4401 when the access token expires or the
     account is deactivated, and the client reconnects with its refreshed
     cookie;

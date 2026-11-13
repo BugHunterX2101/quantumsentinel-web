@@ -8,7 +8,8 @@
 #   E. the backup service dumps as qs_backup and copies the dataset blobs;
 #      the blobs are restored onto an empty datasets volume
 #   F. the API restarts as qs_app
-#   G. a fresh install: provision, the backup service first, then up
+#   G. a sealed dataset holdout: research jobs on live market data stop before its start
+#   H. a fresh install: provision, the backup service first, then up
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -371,7 +372,45 @@ asyncio.run(run())
 EOF
 echo "::endgroup::"
 
-echo "::group::G. a fresh install, as the README deploys it"
+echo "::group::G. a sealed dataset holdout"
+# An operator holds a dataset family's recent data back from research with
+# manage.py (in the API container, as qs_app). Jobs in the research worker
+# then see that family's data only from before the start, also when rerun on
+# datasets taken before it was set. The start can only move later, and a
+# recorded start cannot be changed, not even by the superuser.
+manage() { "${NEW[@]}" exec -T quantumsentinel python -m backend.manage "$@" 2>&1 | tr -d '\r'; return "${PIPESTATUS[0]}"; }
+psql_su() { "${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -v ON_ERROR_STOP=1 -Atc "$1" 2>&1 | tr -d '\r'; return "${PIPESTATUS[0]}"; }
+out=$(manage holdouts)
+echo "holdouts: $out"
+test "$out" = "no dataset family has a holdout"
+python3 .github/scripts/compose_smoke.py holdout-before holdout@example.com | tee "$RUNNER_TEMP/holdout_before.log"
+read -r last_session before_ids < <(tail -1 "$RUNNER_TEMP/holdout_before.log")
+start=$(date -u -d '120 days ago' +%F)
+test -n "$before_ids"
+[[ "$last_session" > "$start" ]]
+manage set-holdout EQUITY_EOD "$start" --by ci --reason "holdout e2e"
+if out=$(manage set-holdout EQUITY_EOD "$(date -u -d '200 days ago' +%F)" --by ci --reason "earlier"); then
+  echo "an earlier start was accepted: $out"; exit 1
+fi
+echo "an earlier start: $out"
+case "$out" in *"it can only move later"*) ;; *) exit 1 ;; esac
+out=$(manage holdouts)
+echo "holdouts: $out"
+test "$(echo "$out" | tr -s ' ')" = "EQUITY_EOD $start"
+for statement in "UPDATE dataset_holdouts SET holdout_start = holdout_start - 365" \
+                 "DELETE FROM dataset_holdouts" "TRUNCATE dataset_holdouts"; do
+  if out=$(psql_su "$statement"); then
+    echo "the superuser ran: $statement"; exit 1
+  fi
+  echo "$statement: $out"
+  case "$out" in *immutable*) ;; *) exit 1 ;; esac
+done
+python3 .github/scripts/compose_smoke.py holdout-after holdout@example.com "$start" "$before_ids"
+test "$(psql_su "SELECT count(*) FROM audit_logs WHERE action = 'DATASET_HOLDOUT_SET' AND resource_id = 'EQUITY_EOD'")" = 1
+echo "one audit event for the one start that was set"
+echo "::endgroup::"
+
+echo "::group::H. a fresh install, as the README deploys it"
 "${NEW[@]}" --profile provision --profile backup down -v
 "${NEW[@]}" --profile provision run --rm provision
 # The backup service mounts the new datasets volume (read-only) before the

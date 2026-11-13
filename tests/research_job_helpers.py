@@ -54,6 +54,13 @@ def crash_task(params: dict) -> TaskOutput:
     os._exit(3)
 
 
+def holdouts_task(params: dict) -> TaskOutput:
+    """The holdout starts a market-data session opened by the task would apply."""
+    from backend.services import market_data
+    with market_data.session() as data:
+        return TaskOutput({"holdouts": {f: d.isoformat() for f, d in data.holdouts.items()}}, {})
+
+
 def environment_task(params: dict) -> TaskOutput:
     """What the job process can see: its environment and the secrets its config holds."""
     from backend import config

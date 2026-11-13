@@ -3,6 +3,8 @@ family's data from its holdout start on never reaches a research task, a task
 computes exactly what it would on datasets physically cut at the start, the
 start can only move later, and a start set while a job runs fails the job."""
 import datetime as dt
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -102,6 +104,18 @@ def test_a_ticker_with_only_held_back_data_is_reported_missing():
         frame_from(full, ["AAPL"], "1y", early)
 
 
+def test_a_dataset_whose_data_is_all_held_back_is_not_named_as_used():
+    """The result names the datasets it was computed from: a later snapshot
+    that holds only sessions from the start on contributed nothing."""
+    early = datasets({"AAPL": equity(before(EQUITY_DAYS))})
+    late = datasets({"AAPL": equity([d for d in EQUITY_DAYS if d >= START.isoformat()])})
+    sealed, used, missing = frame_from(early + late, ["AAPL"], "1y", {"EQUITY_EOD": START})
+    assert used == [early[0][0]] and missing == {}
+    assert sealed.index[-1] == pd.Timestamp("2024-01-12")
+    _, unsealed_used, _ = frame_from(early + late, ["AAPL"], "1y")
+    assert sorted(unsealed_used) == sorted([early[0][0], late[0][0]])
+
+
 @pytest.mark.parametrize("holdouts", [
     {"EQUITY_EOD": "2024-01-15"},
     {"EQUITY_EOD": dt.datetime(2024, 1, 15)},
@@ -193,6 +207,20 @@ def test_a_start_is_set_audited_and_only_moves_later(db):
         "holdout_start": "2025-01-15", "previous_start": "2024-01-15", "set_by": "ops", "reason": "rolled forward"}
 
 
+def test_a_start_another_writer_overtook_is_refused_by_the_trigger(db, monkeypatch):
+    """set_start's own check read the starts before a concurrent writer
+    committed a later one; the trigger then refuses, and set_start says why."""
+    dataset_holdouts.set_start(db, "EQUITY_EOD", dt.date(2025, 1, 15), set_by="ops", reason="first")
+    monkeypatch.setattr(dataset_holdouts, "current", lambda db: {})  # the stale read
+    with pytest.raises(HoldoutError, match="the holdout of EQUITY_EOD can only move later"):
+        dataset_holdouts.set_start(db, "EQUITY_EOD", dt.date(2024, 6, 1), set_by="ops", reason="stale")
+    monkeypatch.undo()
+    assert dataset_holdouts.current(db) == {"EQUITY_EOD": dt.date(2025, 1, 15)}
+    assert db.execute(select(models.AuditLog).where(models.AuditLog.action == dataset_holdouts.AUDIT_ACTION,
+                                                    models.AuditLog.metadata_json["reason"].as_string() == "stale")
+                      ).first() is None
+
+
 @pytest.mark.parametrize("family, start, set_by, reason, message", [
     ("NOT_A_FAMILY", dt.date(2024, 1, 1), "ops", "x", "unknown dataset family"),
     ("EQUITY_EOD", "2024-01-01", "ops", "x", "must be a date"),
@@ -241,6 +269,53 @@ def test_recorded_starts_never_change_even_for_the_owner(db, statement):
     assert caught.value.orig.sqlstate == "23001"
     db.rollback()
     assert db.execute(text("SELECT count(*) FROM dataset_holdouts")).scalar() == 1
+
+
+def test_concurrent_inserts_cannot_both_pass_the_check(Session):
+    """Two writers insert different starts for one family at once. Without the
+    trigger's lock both would read the same latest start and both pass, so an
+    earlier start could land after a later one; with it the second waits for
+    the first to commit, then sees its start and is refused."""
+    first, second, watcher = Session(), Session(), Session()
+    try:
+        # Connect all three first, so that only the insert can keep the thread waiting.
+        app, = {s.execute(text("SELECT current_setting('application_name')")).scalar()
+                for s in (first, second, watcher)}
+        second.commit()
+        _insert(first, dt.date(2025, 6, 1))  # uncommitted: holds the family's lock
+        outcome = {}
+
+        def insert_earlier():
+            try:
+                _insert(second, dt.date(2025, 3, 1))
+                second.commit()
+                outcome["inserted"] = True
+            except DBAPIError as exc:
+                second.rollback()
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=insert_earlier)
+        thread.start()
+        deadline = time.monotonic() + 30
+        while not watcher.execute(text(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = :app "
+                "AND wait_event_type = 'Lock' AND wait_event = 'advisory'"), {"app": app}).scalar():
+            watcher.commit()  # pg_stat_activity is a snapshot taken once per transaction
+            assert thread.is_alive(), f"the second insert did not wait for the first: {outcome}"
+            assert time.monotonic() < deadline, "the second insert never waited on the family's lock"
+            time.sleep(0.05)
+        first.commit()
+        thread.join(30)
+        assert not thread.is_alive()
+        assert "error" in outcome, outcome
+        assert outcome["error"].orig.sqlstate == "23001"
+        assert "starts on 2025-06-01; it can only move later" in str(outcome["error"])
+    finally:
+        for s in (first, second, watcher):
+            s.close()
+    with Session() as check:
+        assert check.execute(text("SELECT holdout_start FROM dataset_holdouts")).scalars().all() == \
+            [dt.date(2025, 6, 1)]
 
 
 def test_the_family_must_look_like_one(db):
@@ -296,6 +371,32 @@ def test_a_job_sees_only_data_before_the_start_and_its_result_and_audit_name_it(
     assert again["status"] == "succeeded", again
     assert {k: v for k, v in again["result"].items() if k != "market_data"} == \
         {k: v for k, v in view["result"].items() if k != "market_data"}
+
+
+def test_a_holdout_of_a_family_the_job_did_not_use_is_not_required_of_it(db, market):
+    user = make_user(db)
+    dataset_holdouts.set_start(db, "EQUITY_EOD", dt.date(2024, 1, 2), set_by="ops", reason="final test")
+    dataset_holdouts.set_start(db, "CRYPTO_SPOT_EOD", dt.date(2023, 6, 1), set_by="ops", reason="crypto")
+    view = correlation(db, user)
+    assert view["status"] == "succeeded", view
+    assert view["result"]["market_data"]["holdouts"] == {"EQUITY_EOD": "2024-01-02"}
+
+
+def test_the_real_job_process_applies_the_starts_it_is_given():
+    """The worker hands the starts to a separate child process over a pipe."""
+    from backend import worker
+    process = worker.JobProcess()
+    try:
+        starts = {"EQUITY_EOD": dt.date(2024, 1, 2), "CRYPTO_SPOT_EOD": dt.date(2023, 6, 1)}
+        status, result, _, _ = process.run("research_job_helpers:holdouts_task", {}, 120, lambda: None,
+                                           holdouts=starts)
+        assert status == "ok" and result["holdouts"] == {"EQUITY_EOD": "2024-01-02",
+                                                         "CRYPTO_SPOT_EOD": "2023-06-01"}
+        # The next job in the same child gets only its own starts.
+        status, result, _, _ = process.run("research_job_helpers:holdouts_task", {}, 120, lambda: None)
+        assert status == "ok" and result["holdouts"] == {}
+    finally:
+        process.stop()
 
 
 def test_without_a_holdout_a_job_is_unchanged(db, market, monkeypatch):

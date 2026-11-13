@@ -2,6 +2,12 @@
 
     compose_smoke.py seed <email>      register a user and write data as them
     compose_smoke.py verify <email>    that user still works; a new user runs research jobs
+    compose_smoke.py holdout-before <email>
+        register a user; a backtest on live market data, with no holdout, sees
+        data to the last few days; prints "<last session> <dataset ids, comma-separated>"
+    compose_smoke.py holdout-after <email> <start> <dataset ids>
+        with EQUITY_EOD held out from <start>: a fresh backtest and a rerun on
+        the datasets taken before the holdout both end before it and name it
 """
 import http.cookiejar
 import json
@@ -93,5 +99,33 @@ def verify(email):
           "audit events written as qs_app are signed and verify", status, events)
 
 
+BACKTEST = {"asset": "AAPL", "fast_window": 10, "slow_window": 30, "period": "1y"}
+
+
+def holdout_before(email):
+    client = Client()
+    client.login(email, register=True)
+    result = client.settle("/api/backtests", BACKTEST)
+    market = result["market_data"]
+    recent = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 10 * 86400))
+    check(market["holdouts"] == {} and result["data_end"] >= recent,
+          f"without a holdout the backtest sees data to {result['data_end']}", market, result["data_end"])
+    print(result["data_end"], ",".join(market["datasets"]))
+
+
+def holdout_after(email, start, dataset_ids):
+    client = Client()
+    client.login(email, register=False)
+    for what, body in (("a fresh backtest", BACKTEST),
+                       ("a rerun on the datasets taken before the holdout",
+                        {**BACKTEST, "dataset_ids": dataset_ids.split(",")})):
+        result = client.settle("/api/backtests", body)
+        market = result["market_data"]
+        check(market["holdouts"] == {"EQUITY_EOD": start} and result["data_end"] < start,
+              f"{what} ends on {result['data_end']}, before the holdout start {start}, and names it",
+              market, result["data_end"])
+
+
 if __name__ == "__main__":
-    {"seed": seed, "verify": verify}[sys.argv[1]](sys.argv[2])
+    {"seed": seed, "verify": verify, "holdout-before": holdout_before,
+     "holdout-after": holdout_after}[sys.argv[1]](*sys.argv[2:])

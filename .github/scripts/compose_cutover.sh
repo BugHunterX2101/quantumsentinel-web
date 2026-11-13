@@ -326,6 +326,49 @@ both_roles
 "${NEW[@]}" exec -T research-worker python -c \
   "from backend.config import DATASET_ROOT; from backend.services.dataset_store import DatasetStore; DatasetStore(DATASET_ROOT).get('$dataset_id')"
 echo "the dataset blob survived the restart and still verifies"
+# The rate-limit counter expires in the real Redis even when an earlier
+# request left it without an expiry (PERSIST stands in for a failure between
+# INCR and EXPIRE): the next request gives it one back, so it cannot count
+# forever and limit its principal and path for good.
+rcli() { "${NEW[@]}" exec -T redis sh -c 'redis-cli -a "$REDIS_PASSWORD" --no-auth-warning "$@"' rcli "$@" | tr -d '\r'; }
+rpath="/api/ci-rate-$RANDOM$RANDOM"
+curl -sk -o /dev/null "https://localhost$rpath"
+rkey=$(rcli --scan --pattern "qs:rate:*:$rpath")
+test -n "$rkey"
+echo "$rkey: count $(rcli get "$rkey"), ttl $(rcli ttl "$rkey")"
+test "$(rcli ttl "$rkey")" -gt 0
+rcli persist "$rkey" > /dev/null
+test "$(rcli ttl "$rkey")" = -1
+curl -sk -o /dev/null "https://localhost$rpath"
+count=$(rcli get "$rkey")
+ttl=$(rcli ttl "$rkey")
+echo "after PERSIST and one more request: count $count, ttl $ttl"
+test "$count" = 2
+test "$ttl" -gt 0
+# WebSocket slots, through the API's own code against the real Redis: three
+# per user, the fourth refused, the counter always with an expiry.
+"${NEW[@]}" exec -T quantumsentinel python - <<'EOF'
+import asyncio
+import os
+
+from backend import main
+
+
+async def run():
+    user = "ci-ws-" + os.urandom(4).hex()
+    key = f"qs:ws:conn:{user}"
+    got = [await main._ws_acquire(user) for _ in range(4)]
+    count, ttl = int(await main._redis_client.get(key)), await main._redis_client.ttl(key)
+    for _ in range(3):
+        await main._ws_release(user, True)
+    left = int(await main._redis_client.get(key))
+    print(f"websocket slots: {got}, counter {count}, ttl {ttl}, after release {left}")
+    assert got == [(True, True)] * 3 + [(False, False)], got
+    assert count == 3 and 0 < ttl <= main._WS_COUNTER_TTL, (count, ttl)
+    assert left == 0, left
+
+asyncio.run(run())
+EOF
 echo "::endgroup::"
 
 echo "::group::G. a fresh install, as the README deploys it"

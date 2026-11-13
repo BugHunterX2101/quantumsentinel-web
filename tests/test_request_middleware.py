@@ -1,5 +1,6 @@
 """The outermost request middleware: security headers, per-principal rate
 limiting and request metrics, on every kind of HTTP response."""
+import asyncio
 import time
 import uuid
 from collections import OrderedDict
@@ -201,44 +202,114 @@ class TestRateLimit:
         assert client.get(path).headers["x-ratelimit-remaining"] == "238"
 
     def test_shared_counter_in_redis(self, client, monkeypatch):
-        class FakeRedis:
+        # Only eval: the counter must be one atomic script, never INCR then
+        # EXPIRE (a failure between those left a key that never expires). The
+        # script itself runs against a real Redis in the deploy-compose job.
+        class ScriptRedis:
             def __init__(self):
-                self.counts, self.expiries = {}, []
+                self.counts, self.calls = {}, []
 
-            async def incr(self, key):
+            async def eval(self, script, numkeys, key, *args):
+                self.calls.append((script, numkeys, key, args))
                 self.counts[key] = self.counts.get(key, 0) + 1
                 return self.counts[key]
 
-            async def expire(self, key, seconds):
-                self.expiries.append((key, seconds))
-
-        fake = FakeRedis()
+        fake = ScriptRedis()
         monkeypatch.setattr(main, "_redis_client", fake)
         path = unmatched_api_path()
         assert [client.get(path).headers["x-ratelimit-remaining"] for _ in range(3)] == ["239", "238", "237"]
         (key, count), = fake.counts.items()
         assert key.startswith("qs:rate:") and key.endswith(":" + path) and count == 3
-        assert fake.expiries == [(key, 60)]
+        assert fake.calls == [(main._RATE_INCR_SCRIPT, 1, key, (60,))] * 3
 
-    def test_redis_outage_fails_closed_in_production(self, client, monkeypatch):
+    def test_redis_count_over_the_limit_is_rejected(self, client, monkeypatch):
+        class FullRedis:
+            async def eval(self, script, numkeys, key, *args):
+                return 11
+
+        monkeypatch.setattr(main, "_redis_client", FullRedis())
+        response = client.get(f"/api/auth/no-such-{uuid.uuid4().hex}")
+        assert response.status_code == 429
+
+    def test_rate_script_sets_an_expiry_whenever_the_key_has_none(self):
+        # Text-level pin of the repair rule; behaviour is checked on real Redis.
+        script = " ".join(main._RATE_INCR_SCRIPT.split())
+        assert "redis.call('INCR', KEYS[1])" in script
+        assert "if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end" in script
+
+    @staticmethod
+    def _down_redis():
         class DownRedis:
-            async def incr(self, key):
+            calls = 0
+
+            async def eval(self, *args):
+                DownRedis.calls += 1
                 raise ConnectionError("redis down")
 
-        monkeypatch.setattr(main, "_redis_client", DownRedis())
+        return DownRedis()
+
+    def test_redis_outage_fails_closed_in_production(self, client, monkeypatch):
+        down = self._down_redis()
+        monkeypatch.setattr(main, "_redis_client", down)
         monkeypatch.setattr(main, "ENVIRONMENT", "production")
         response = client.get("/health/live")
         assert response.status_code == 503
         assert response.json() == {"detail": "Rate-limit service unavailable"}
+        assert down.calls == 1  # the outage came from Redis, not a missing method
 
     def test_redis_outage_falls_back_to_memory_outside_production(self, client, monkeypatch):
+        down = self._down_redis()
+        monkeypatch.setattr(main, "_redis_client", down)
+        path = unmatched_api_path()
+        assert client.get(path).headers["x-ratelimit-remaining"] == "239"
+        assert down.calls == 1
+
+
+class TestWebSocketSlots:
+    """The per-user WebSocket slot counter in Redis (one atomic script)."""
+
+    @staticmethod
+    def _acquire(user_id="u1"):
+        return asyncio.run(main._ws_acquire(user_id))
+
+    def test_slot_within_the_limit_is_counted_in_redis(self, monkeypatch):
+        calls = []
+
+        class SlotRedis:
+            async def eval(self, script, numkeys, key, *args):
+                calls.append((script, numkeys, key, args))
+                return 3
+
+        monkeypatch.setattr(main, "_redis_client", SlotRedis())
+        assert self._acquire() == (True, True)
+        assert calls == [(main._WS_ACQUIRE_SCRIPT, 1, "qs:ws:conn:u1", (120, 3))]
+
+    def test_slot_over_the_limit_is_refused(self, monkeypatch):
+        class FullRedis:
+            async def eval(self, *args):
+                return 4  # the script has already given the slot back
+
+        monkeypatch.setattr(main, "_redis_client", FullRedis())
+        assert self._acquire() == (False, False)
+
+    def test_outage_refuses_in_production_and_falls_back_elsewhere(self, monkeypatch):
         class DownRedis:
-            async def incr(self, key):
+            async def eval(self, *args):
                 raise ConnectionError("redis down")
 
         monkeypatch.setattr(main, "_redis_client", DownRedis())
-        path = unmatched_api_path()
-        assert client.get(path).headers["x-ratelimit-remaining"] == "239"
+        monkeypatch.setattr(main, "_ws_connections", main.defaultdict(int))
+        monkeypatch.setattr(main, "ENVIRONMENT", "production")
+        assert self._acquire() == (False, False)
+        monkeypatch.setattr(main, "ENVIRONMENT", "development")
+        assert self._acquire() == (True, False)
+        assert main._ws_connections["u1"] == 1
+
+    def test_acquire_script_gives_back_an_over_limit_slot_atomically(self):
+        script = " ".join(main._WS_ACQUIRE_SCRIPT.split())
+        assert script.startswith("local count = redis.call('INCR', KEYS[1])")
+        assert "if count > tonumber(ARGV[2]) then redis.call('DECR', KEYS[1]) end" in script
+        assert "redis.call('EXPIRE', KEYS[1], ARGV[1])" in script
 
 
 class TestMetrics:

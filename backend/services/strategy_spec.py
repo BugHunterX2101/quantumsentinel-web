@@ -7,8 +7,10 @@ its parameters, and the compiler turns it into the arguments of
 
 * ``StrategySpec`` is DSL v1: a flat object of required fields. A spec has no
   defaults, so its canonical form is exactly what was given (after symbols
-  are upper-cased and sorted). Values the engine would clamp or ignore are
-  refused rather than stored, so every field in the bytes is what runs.
+  are upper-cased and sorted). Values the engine would clamp or ignore on
+  any data are refused rather than stored. Caps that depend on the prices
+  (volatility-target sizing limits, orders skipped at ``leverage_limit``)
+  still apply at run time.
 * Numbers are integers: fractions are basis points (``*_bps``, 1/10,000) and
   the mean-reversion band width is in hundredths (``n_std_centi``). Floats
   are refused, so the id never depends on how a language prints a float.

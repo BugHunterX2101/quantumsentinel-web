@@ -7,6 +7,11 @@ RUN pip install --no-cache-dir "pybind11>=2.12" setuptools wheel \
     && pip wheel --no-build-isolation --no-cache-dir --no-deps --wheel-dir /wheels ./cpp
 
 FROM python:3.12-slim
+# Security: install the Debian security updates published since the base
+# image was built (the image is rebuilt less often than fixes land).
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 # Security: run as non-root, no new privileges
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /sbin/nologin app

@@ -397,6 +397,20 @@ _request_windows: OrderedDict[str, deque[float]] = OrderedDict()
 _RATE_WINDOW_SECONDS = 60
 _RATE_MAX_KEYS = 20_000
 
+# The shared (Redis) counter: increment and give the key its expiry in one
+# atomic step. As two commands, INCR then EXPIRE only when the count was 1, a
+# failure between them (a dropped connection, a killed worker) left a key that
+# never expires: its count only grows, and once past the limit that principal
+# got 429 on that path for good. Setting the expiry whenever the key has none
+# (TTL -1) also repairs any key an earlier release left in that state.
+_RATE_INCR_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+"""
+
 
 def _rate_window(key: str, now: float) -> deque[float]:
     """The bucket for ``key``, after dropping buckets whose window has fully expired."""
@@ -498,10 +512,8 @@ class SecurityHeadersAndRateLimit:
         current = 0
         if _redis_client:
             try:
-                redis_key = f"qs:rate:{key}"
-                current = int(await _redis_client.incr(redis_key))
-                if current == 1:
-                    await _redis_client.expire(redis_key, 60)
+                current = int(await _redis_client.eval(
+                    _RATE_INCR_SCRIPT, 1, f"qs:rate:{key}", _RATE_WINDOW_SECONDS))
             except Exception:
                 if ENVIRONMENT == "production":
                     await JSONResponse({"detail": "Rate-limit service unavailable"},
@@ -1112,6 +1124,18 @@ _WS_COUNTER_TTL = 120         # refreshed while connected; bounds leaks from cra
 # asyncio timers can fire up to one clock resolution early (~15.6 ms on
 # Windows); close this close to expiry rather than push once more.
 _WS_EXPIRY_GRACE = 0.25
+# Take a slot, refresh the counter's expiry, and give the slot back if it was
+# over the limit, in one atomic step: as separate commands, a failure after
+# INCR returned "not acquired" while keeping the slot, and the user's other
+# open sockets kept refreshing its expiry, so the slot stayed taken.
+_WS_ACQUIRE_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if count > tonumber(ARGV[2]) then
+  redis.call('DECR', KEYS[1])
+end
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return count
+"""
 
 
 async def _ws_acquire(user_id: str) -> tuple[bool, bool]:
@@ -1119,10 +1143,9 @@ async def _ws_acquire(user_id: str) -> tuple[bool, bool]:
     if _redis_client:
         key = f"qs:ws:conn:{user_id}"
         try:
-            count = int(await _redis_client.incr(key))
-            await _redis_client.expire(key, _WS_COUNTER_TTL)
+            count = int(await _redis_client.eval(
+                _WS_ACQUIRE_SCRIPT, 1, key, _WS_COUNTER_TTL, _WS_MAX_PER_USER))
             if count > _WS_MAX_PER_USER:
-                await _redis_client.decr(key)
                 return False, False
             return True, True
         except Exception:

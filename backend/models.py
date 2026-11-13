@@ -363,6 +363,24 @@ class UserDataset(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class DatasetHoldout(Base):
+    """Where a dataset family's sealed final holdout starts
+    (services/dataset_holdouts.py): research sees the family's data only
+    before the latest row's ``holdout_start``.
+
+    Append-only: migration 0005 adds triggers that refuse UPDATE, DELETE and
+    TRUNCATE, and an insert whose start is not later than the family's
+    current one. Those are PostgreSQL SQL, so they live in the migration only.
+    """
+    __tablename__ = "dataset_holdouts"
+
+    family = Column(String(64), primary_key=True)
+    holdout_start = Column(Date, primary_key=True)
+    set_by = Column(String(320), nullable=False)
+    reason = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 class ResearchWorker(Base):
     """Liveness record of a research worker process (heartbeat)."""
     __tablename__ = "research_workers"

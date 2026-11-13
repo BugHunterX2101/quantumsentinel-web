@@ -135,9 +135,14 @@ def record_market_data(db: Session, job: models.ResearchJob, result: dict, audit
 
     Registers the snapshots the task took, then requires every dataset its
     result was computed from to be one the job's user holds: a snapshot just
-    registered, or one the request named (which the API checked). The result
-    and the audit event name those datasets. Returns (result, audit).
+    registered, or one the request named (which the API checked). Then
+    requires the task to have cut those datasets at the holdout starts their
+    families have now (dataset_holdouts): the worker read the starts before
+    the task ran, so a difference means one was set while it ran, and the
+    result, computed on data now held out, is refused. The result and the
+    audit event name the datasets and the starts. Returns (result, audit).
     """
+    from . import dataset_holdouts
     from .research_tasks import TaskError
 
     report = result.get("market_data")
@@ -151,8 +156,17 @@ def record_market_data(db: Session, job: models.ResearchJob, result: dict, audit
     if held != set(used):
         log.error("research job %s used datasets its user does not hold: %s", job.id, sorted(set(used) - held))
         raise TaskError(500, "The research job used market data that is not registered")
-    market = {"source": report.get("source"), "datasets": used, "unavailable": report.get("unavailable", {})}
-    return {**result, "market_data": market}, {**audit, "datasets": used}
+    families = set(db.execute(select(models.DatasetVersion.family).where(
+        models.DatasetVersion.dataset_id.in_(used))).scalars())
+    expected = {family: start.isoformat() for family, start in sorted(dataset_holdouts.current(db).items())
+                if family in families}
+    reported = report.get("holdouts")
+    if reported != expected:
+        log.warning("research job %s: holdouts applied %s, now %s", job.id, reported, expected)
+        raise TaskError(409, "A dataset holdout was set while the research job ran; run it again")
+    market = {"source": report.get("source"), "datasets": used, "unavailable": report.get("unavailable", {}),
+              "holdouts": expected}
+    return {**result, "market_data": market}, {**audit, "datasets": used, "holdouts": expected}
 
 
 def _held_by(user_id: str):

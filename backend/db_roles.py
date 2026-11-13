@@ -51,6 +51,9 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "audit_chain_links": DML,
     "audit_logs": DML,
     "backtests": DML,
+    # Append-only (migration 0005's triggers). Operators add a holdout start
+    # with ``manage.py set-holdout``, which connects as this role.
+    "dataset_holdouts": ("SELECT", "INSERT"),
     # Immutable once written (migration 0004's triggers): no UPDATE or DELETE.
     "dataset_versions": ("SELECT", "INSERT"),
     "idempotency_records": DML,
@@ -85,6 +88,9 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # The dashboard backtest's history row. Its id is made client-side, so
     # the insert returns nothing and needs no SELECT; the API reads it back.
     "backtests": ("INSERT",),
+    # The worker reads the holdout starts it seals a job's market data at,
+    # and checks the result against them; it never sets one.
+    "dataset_holdouts": ("SELECT",),
     # The dataset snapshot finalizer registers the datasets it verified and
     # the user who fetched them; both tables are insert-only.
     "dataset_versions": ("SELECT", "INSERT"),

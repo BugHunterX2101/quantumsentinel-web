@@ -60,6 +60,8 @@ class TestMigrations:
             conn.execute(text("DROP INDEX ix_webhooks_user_id"))
             # Revision 0004 added these after the releases simulated here.
             conn.execute(text("DROP TABLE user_datasets, dataset_versions"))
+            # And revision 0005 this one.
+            conn.execute(text("DROP TABLE dataset_holdouts"))
             conn.execute(text("INSERT INTO users (id, email, password_hash) VALUES ('u1', 'old@example.com', 'h')"))
             conn.execute(text("INSERT INTO trades (id, user_id, asset, side, quantity, status) "
                               "VALUES ('t1', 'u1', 'AAPL', 'buy', 2.5, 'FILLED')"))

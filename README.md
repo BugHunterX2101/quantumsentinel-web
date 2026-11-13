@@ -419,6 +419,20 @@ back a hundredth of it). `period` is a trailing window that ends at the data's
 last completed session, so a rerun on a result's `market_data.datasets`
 computes on the same bars.
 
+A dataset family can have a sealed holdout (`dataset_holdouts`, migration
+0005), set by an operator with `python -m backend.manage set-holdout`. Research
+jobs then see that family's bars and dividends only from before the holdout
+start: `market_data.py` drops the rest before it computes the trailing window,
+so a job computes what it would on datasets cut at the start. The worker reads
+the starts before each job, and refuses the result (409) if a start changed
+while the job ran; the result's `market_data.holdouts` and the audit event name
+the starts that applied. A start can only move later, which releases the old
+holdout to research; triggers refuse earlier starts and any UPDATE, DELETE or
+TRUNCATE. Limits: the held-back rows are still in the blobs the worker can read,
+and are kept from jobs by this code path, not by storage permissions; and since
+Yahoo's prices are split-adjusted when fetched, a split after the start still
+scales earlier price levels (returns are unchanged).
+
 ### Research Engine
 
 | Module | Capabilities |
@@ -484,6 +498,7 @@ quantumsentinel-web/
 │       ├── dataset_store.py             ← Content-addressed, write-once dataset files, verified on every read
 │       ├── dataset_providers.py         ← Provider interface · yfinance (personal use only) · dataset families
 │       ├── dataset_registry.py          ← Immutable dataset_versions rows · who holds which dataset
+│       ├── dataset_holdouts.py          ← Sealed holdout start per dataset family · only moves later
 │       ├── market_data.py               ← Research prices from frozen datasets · total return · trailing windows
 │       ├── security_service.py          ← server identity · signed audit hash chain · key health
 │       ├── integration_service.py       ← Scoped API keys · SSRF-guarded signed webhooks
@@ -858,6 +873,7 @@ PostgreSQL 16 or newer is the only supported database; any other `DATABASE_URL` 
 - **Moving from SQLite** (releases before 1.3): `python -m backend.manage import-sqlite path/to/quantumsentinel.db` copies every row into the configured, empty PostgreSQL database in one transaction, then verifies the row counts and the audit hash chain before committing. It refuses a database that already has rows.
 - **Duplicate positions** (deployments upgraded from earlier releases): two fills for one user at the same moment could leave the `positions` table with more than one row per asset, overstating holdings and equity. Fills now rebuild positions inside their own transaction, and each user's next fill corrects their rows; `python -m backend.manage repair-positions` corrects every affected user at once and is safe to run while the API serves orders.
 - **Audit chain verification.** `GET /api/security/audit-chain` checks only the links added since that API process last verified the chain, which took under a second at 1M links on the laptop below; nearly all of that is counting events that have no link. A process's first check, and any check after the chain failed one, verifies every link. A full check verifies an ML-DSA signature per link (about 11 s per 50,000 links on the same laptop), and it is the only check that sees rows edited behind the newest verified link, so run `python -m backend.manage verify-audit-chain` on a schedule; it exits 1 if any link fails. `?full=true` runs a full check from the API.
+- **Dataset holdouts.** `python -m backend.manage set-holdout EQUITY_EOD 2025-01-01 --by <who> --reason <why>` keeps a dataset family's data from that date on away from research jobs (families: `EQUITY_EOD`, `FUND_NAV_EOD`, `INDEX_EOD`, `CRYPTO_SPOT_EOD`, `FX_SPOT_EOD`, `FUTURES_CONTINUOUS_EOD`). The date can only move later; moving it later releases the old holdout to research. Each change is an audit event (`DATASET_HOLDOUT_SET`). `python -m backend.manage holdouts` prints the current starts. A job that is running when a start is set fails with 409 and can be run again.
 - **Connection budget.** Every API process and research worker has its own pool: keep (processes) × (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`) below the server's `max_connections` (100 by default), leaving room for maintenance sessions. The default of 20 per process fits four API processes plus their workers.
 - **Large tables.** The indexes added by migration `0002` are created `IF NOT EXISTS`; on a large `trades` or `audit_logs` table, build them first with `CREATE INDEX CONCURRENTLY` under the same names to avoid blocking writes during the upgrade.
 - **Connection poolers.** Each session is configured when it connects (UTC, statement/lock/idle timeouts) and the order sweeper uses a session-level advisory lock, so a PgBouncer in front of the database must use session pooling, not transaction pooling.

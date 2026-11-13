@@ -95,12 +95,16 @@ def _resolve(target: str):
     return getattr(importlib.import_module(module_name), attr)
 
 
-def _run_target(target: str, params: dict) -> tuple:
-    """Run a task; return ("ok", result, audit, trials) or ("error", status, detail)."""
+def _run_target(target: str, params: dict, holdouts: dict | None = None) -> tuple:
+    """Run a task, with the dataset holdout starts ``holdouts`` ({family:
+    date}) applied to the market data it reads; return ("ok", result, audit,
+    trials) or ("error", status, detail)."""
+    from .services import market_data
     from .services.research_jobs import json_safe
     from .services.research_tasks import TaskError
     try:
-        output = _resolve(target)(params)
+        with market_data.holdouts(holdouts):
+            output = _resolve(target)(params)
     except TaskError as exc:
         return ("error", exc.status_code, exc.detail)
     except Exception:
@@ -129,8 +133,8 @@ def _child_main(conn) -> None:
             return
         if message is None:
             return
-        target, params = message
-        conn.send(_run_target(target, params))
+        target, params, holdouts = message
+        conn.send(_run_target(target, params, holdouts))
 
 
 class JobProcess:
@@ -171,8 +175,10 @@ class JobProcess:
             self._conn.close()
         self._proc = self._conn = None
 
-    def run(self, target: str, params: dict, timeout: float, on_tick, tick_seconds: float = 1.0):
-        """Run ``target(params)`` in the child.
+    def run(self, target: str, params: dict, timeout: float, on_tick, tick_seconds: float = 1.0,
+            *, holdouts: dict | None = None):
+        """Run ``target(params)`` in the child, with the dataset holdout
+        starts ``holdouts`` applied (see _run_target).
 
         ``on_tick()`` is called about every ``tick_seconds`` while it runs; if
         it returns a string, the child is killed and that string returned
@@ -186,7 +192,7 @@ class JobProcess:
             boot_deadline = time.monotonic() + CHILD_BOOT_SECONDS
         else:
             deadline = time.monotonic() + timeout
-        self._conn.send((target, params))
+        self._conn.send((target, params, holdouts))
         while True:
             if self._conn.poll(tick_seconds):
                 try:
@@ -308,8 +314,17 @@ class Worker:
                 return "lost"
             return None
 
+        holdouts = {}
+        if kind.market_data:
+            # Read now, not in the child (which has no database): the task
+            # sees data before these starts, and complete() checks that the
+            # starts still hold (dataset_registry.record_market_data).
+            from .services import dataset_holdouts
+            holdouts = dataset_holdouts.current(db)
+            db.commit()
         started = time.monotonic()
-        outcome = self.job_process.run(kind.target, job.params_json, self.timeout_seconds, on_tick)
+        outcome = self.job_process.run(kind.target, job.params_json, self.timeout_seconds, on_tick,
+                                       holdouts=holdouts)
         elapsed = time.monotonic() - started
         status = outcome[0]
         if status == "ok":

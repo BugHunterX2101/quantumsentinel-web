@@ -7,6 +7,8 @@
     python -m backend.manage repair-positions
     python -m backend.manage verify-audit-chain
     python -m backend.manage provision-roles
+    python -m backend.manage set-holdout <FAMILY> <YYYY-MM-DD> --by <who> --reason <why>
+    python -m backend.manage holdouts
 
 Roles are granted only here — out of band, by someone with shell access to
 the deployment — never through the web API, so no self-registered account
@@ -35,6 +37,11 @@ drift from the intended privileges. It is safe while the application runs:
 it takes the table locks it needs all at once or not at all, so it cannot
 deadlock with a request, and if tables stay in use for 10 s it exits 1
 without changing anything.
+
+``set-holdout`` holds back a dataset family's data from a date on: research
+jobs see only what came before it (backend/services/dataset_holdouts.py). The
+date can only move later; moving it releases the old holdout to research.
+``holdouts`` prints each family's current start.
 """
 import argparse
 import sys
@@ -65,6 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("provision-roles",
                         help="create the least-privilege database roles and hand them the schema "
                              "(run as the database superuser)")
+    set_holdout = commands.add_parser(
+        "set-holdout", help="hold back a dataset family's data from a date on (the date can only move later)")
+    set_holdout.add_argument("family")
+    set_holdout.add_argument("start", type=_date, help="first held-back session, YYYY-MM-DD")
+    set_holdout.add_argument("--by", required=True, help="who sets it")
+    set_holdout.add_argument("--reason", required=True, help="why")
+    commands.add_parser("holdouts", help="print each dataset family's holdout start")
     args = parser.parse_args(argv)
 
     if args.command == "generate-server-key":
@@ -83,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "import-sqlite":
         return _import_sqlite(args.path)
+    if args.command == "set-holdout":
+        init_db()
+        return _set_holdout(SessionLocal, args.family, args.start, args.by, args.reason)
+    if args.command == "holdouts":
+        init_db()
+        return _print_holdouts(SessionLocal)
 
     init_db()
     db = SessionLocal()
@@ -101,6 +121,39 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         db.close()
+
+
+def _date(text: str):
+    import datetime as dt
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a date (YYYY-MM-DD): {text!r}") from None
+
+
+def _set_holdout(session_factory, family: str, start, set_by: str, reason: str) -> int:
+    from .services import dataset_holdouts
+
+    with session_factory() as db:
+        try:
+            row = dataset_holdouts.set_start(db, family, start, set_by=set_by, reason=reason)
+        except dataset_holdouts.HoldoutError as exc:
+            print(f"set-holdout: {exc}", file=sys.stderr)
+            return 1
+        print(f"{row.family}: research sees data before {row.holdout_start.isoformat()}")
+    return 0
+
+
+def _print_holdouts(session_factory) -> int:
+    from .services import dataset_holdouts
+
+    with session_factory() as db:
+        starts = dataset_holdouts.current(db)
+    for family, start in sorted(starts.items()):
+        print(f"{family:28s} {start.isoformat()}")
+    if not starts:
+        print("no dataset family has a holdout")
+    return 0
 
 
 def _generate_server_key() -> int:

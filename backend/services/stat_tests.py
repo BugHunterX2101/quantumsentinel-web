@@ -5,7 +5,7 @@ Proper hypothesis testing for strategy evaluation:
   - Bootstrap confidence intervals for Sharpe
   - Permutation tests for strategy significance
   - Autocorrelation analysis (Ljung-Box)
-  - Multiple-testing corrections (Bonferroni, BH, Deflated Sharpe Ratio)
+  - Multiple-testing corrections (Bonferroni, BH, BHY, Deflated Sharpe Ratio)
 """
 from __future__ import annotations
 
@@ -315,6 +315,34 @@ def benjamini_hochberg(p_values: list[float],
     }
 
 
+def benjamini_yekutieli(p_values: list[float],
+                        alpha: float = 0.05) -> dict:
+    """Benjamini-Hochberg-Yekutieli FDR control.
+
+    Benjamini-Hochberg's procedure with every p-value scaled by
+    c(m) = 1 + 1/2 + ... + 1/m, which keeps the false discovery rate
+    controlled whatever the dependence between the tests (BH needs them
+    independent or positively dependent). Strategy variants tried on the
+    same data are dependent, so this is the one to trust beside BH.
+    """
+    m = len(p_values)
+    if m == 0:
+        return {"significant": [], "n_tests": 0}
+    from .validation_stats import adjusted_p_values
+
+    adjusted = adjusted_p_values(p_values, "bhy")
+    significant = [i for i, p in enumerate(adjusted) if p < alpha]
+    return {
+        "method": "benjamini_yekutieli",
+        "alpha": alpha,
+        "n_tests": m,
+        "n_significant": len(significant),
+        "significant_indices": significant,
+        "adjusted_p_values": [round(p, 6) for p in adjusted],
+        "fdr_controlled": True,
+    }
+
+
 _EULER_GAMMA = 0.5772156649015329
 
 
@@ -438,6 +466,7 @@ def run_full_stat_tests(returns: np.ndarray,
     if strategy_p_values and len(strategy_p_values) > 1:
         results["bonferroni"] = bonferroni_correction(strategy_p_values)
         results["benjamini_hochberg"] = benjamini_hochberg(strategy_p_values)
+        results["benjamini_yekutieli"] = benjamini_yekutieli(strategy_p_values)
 
     # Summary
     results["summary"] = {

@@ -76,7 +76,8 @@ def _reference(closes, fast, slow, fraction, capital):
     long-only, zero-cost crossover on each ticker: a signal at bar s fills at
     bar s + 1's close; a long entry is sized at ``fraction`` of the equity
     marked at bar s - 1 (the last mark when bar s's signals are sized) at
-    bar s's price, and a cross down closes it."""
+    bar s's price, and a cross down closes it. Shares are taken both before
+    and after each bar's fills."""
     tickers = sorted(closes)
     signals = {t: ma_crossover_series(closes[t], fast, slow) for t in tickers}
     cash, held, staged = capital, dict.fromkeys(tickers, 0.0), {}
@@ -84,6 +85,8 @@ def _reference(closes, fast, slow, fraction, capital):
     equity, largest, gross = [], [], []
     for bar in range(len(closes[tickers[0]])):
         price = {t: closes[t][bar] for t in tickers}
+        before = cash + sum(held[t] * price[t] for t in tickers)
+        largest.append(max(abs(held[t]) * price[t] for t in tickers) / before)
         for t, qty in staged.items():
             cash -= qty * price[t]
             held[t] += qty
@@ -101,28 +104,34 @@ def _reference(closes, fast, slow, fraction, capital):
     return np.array(equity), np.array(largest), np.array(gross)
 
 
-CASES = {
-    "one ticker": {"X": [100.0] * 8 + [110, 120, 130, 125, 90, 80, 85, 95, 100, 70]},
-    "one ticker, re-entered": {
-        "X": [100.0] * 8 + [104, 112, 121, 133, 128, 140, 101, 97, 99, 108, 117, 126, 90, 70, 75]},
-    "one ticker, a new high after the deepest fall": {
-        "X": [100.0] * 8 + [110, 120, 130, 100, 85, 95, 110, 130, 150, 170, 190, 210, 230, 250]},
-    "two tickers held together": {
+GAP_UP_EXIT = [100.0] * 8 + [110, 120, 130, 125, 90, 160, 150]
+CASES = {  # label: (closes, fraction)
+    "one ticker": ({"X": [100.0] * 8 + [110, 120, 130, 125, 90, 80, 85, 95, 100, 70]}, 0.5),
+    "one ticker, re-entered": (
+        {"X": [100.0] * 8 + [104, 112, 121, 133, 128, 140, 101, 97, 99, 108, 117, 126, 90, 70, 75]}, 0.5),
+    "one ticker, a new high after the deepest fall": (
+        {"X": [100.0] * 8 + [110, 120, 130, 100, 85, 95, 110, 130, 150, 170, 190, 210, 230, 250]}, 0.5),
+    "one ticker, sold on a gap up": ({"X": GAP_UP_EXIT}, 0.3),
+    "one ticker, falling from the bar it is bought": ({"X": [100.0] * 8 + [110, 120, 115, 105, 95, 90, 85]}, 0.5),
+    "two tickers held together": ({
         "X": [100.0] * 8 + [110, 120, 130, 125, 90, 80, 85, 95, 100, 70],
-        "Y": [100.0] * 8 + [105, 115, 140, 150, 145, 130, 100, 90, 95, 99]},
+        "Y": [100.0] * 8 + [105, 115, 140, 150, 145, 130, 100, 90, 95, 99]}, 0.3),
 }
 
 
 @pytest.mark.parametrize("label", CASES)
 def test_the_measurements_match_an_independent_reference(label):
-    closes = {t: np.array(c, dtype=float) for t, c in CASES[label].items()}
-    fraction = 0.5 if len(closes) == 1 else 0.3
+    closes = {t: np.array(c, dtype=float) for t, c in CASES[label][0].items()}
+    fraction = CASES[label][1]
     result = run_event_backtest(sorted(closes), closes, "ma_crossover", {"fast": 2, "slow": 5, "fraction": fraction},
                                 initial_capital=100_000.0, cost_model_name="zero_cost", risk_metrics=True)
     equity, largest, gross = _reference(closes, 2, 5, fraction, 100_000.0)
     assert result["n_trades"] >= 2 * len(closes)  # every ticker entered and left
     expected_drawdown = float(np.max(1 - equity / np.maximum.accumulate(equity)))
     assert expected_drawdown > 0
+    if "falling from the bar" in label:  # largest the moment it is bought, at 120
+        qty = 0.5 * 100_000 / 110
+        assert result["risk"]["max_position_share"] == pytest.approx(qty * 120 / 100_000, rel=1e-12)
     if "new high" in label:
         # A later, higher peak: measuring from it would overstate the fall.
         assert equity.argmax() > np.argmax(1 - equity / np.maximum.accumulate(equity))
@@ -146,6 +155,21 @@ def test_the_first_case_by_hand():
     qty = 0.5 * 100_000 / 110
     cash = 100_000 - qty * 120
     assert result["risk"]["max_position_share"] == pytest.approx(qty * 130 / (cash + qty * 130), rel=1e-12)
+
+
+def test_a_position_is_measured_at_the_price_it_is_sold_at():
+    """Orders fill at their bar's price: the cross down signalled at 90 sells
+    at the gap up to 160, so for that moment the position, 0.3 * 100,000 /
+    110 shares, is 39.3% of equity, more than at any bar's close (34.5%,
+    at 130)."""
+    close = np.array(GAP_UP_EXIT)
+    result = run_event_backtest(["X"], {"X": close}, "ma_crossover", {"fast": 2, "slow": 5, "fraction": 0.3},
+                                initial_capital=100_000.0, cost_model_name="zero_cost", risk_metrics=True)
+    qty = 0.3 * 100_000 / 110
+    cash = 100_000 - qty * 120
+    assert result["n_trades"] == 2  # bought at 120, sold at 160
+    assert result["risk"]["max_position_share"] == pytest.approx(qty * 160 / (cash + qty * 160), rel=1e-12)
+    assert result["risk"]["max_position_share"] > qty * 130 / (cash + qty * 130) + 0.04
 
 
 def test_a_short_that_loses_everything_is_reported_as_exhausting_equity():

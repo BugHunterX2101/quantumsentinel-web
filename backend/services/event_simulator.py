@@ -325,18 +325,24 @@ class MACrossoverStrategy(BaseStrategy):
 
 
 class MomentumStrategy(BaseStrategy):
-    """Cross-sectional momentum: long top tercile, short bottom (if allowed)."""
+    """Cross-sectional momentum: long top tercile, short bottom (if allowed).
+    Rebalances every 5th bar."""
 
     def __init__(self, lookback: int = 60, n_long: int = 3, n_short: int = 3):
         self.lookback = lookback
         self.n_long = n_long
         self.n_short = n_short
-        self._last_signals: dict[str, float] = {}
         self._bar = 0
+        self._last_timestamp: int | None = None
 
     def on_market(self, event: MarketEvent, portfolio: Portfolio,
                   history: dict[str, list[float]]) -> list[SignalEvent]:
-        # Collect momentum for all tickers (rebalance weekly)
+        # The engine calls this once per ticker per bar, and each call sees
+        # the same history. Count bars, not calls, and decide once per bar;
+        # counting calls made the cadence depend on the universe size.
+        if event.timestamp == self._last_timestamp:
+            return []
+        self._last_timestamp = event.timestamp
         self._bar += 1
         if self._bar % 5 != 0:
             return []
@@ -599,30 +605,46 @@ def run_event_backtest(
             signals.extend(strategy.on_market(mkt_event, portfolio, history))
 
         # ── 4. Convert signals to orders (staged for next bar) ──
+        # A signal names a target position, not an increment:
+        #   direction 0                → close the position;
+        #   same direction as held     → hold (no top-up, so a target that
+        #                                drifts with price never churns);
+        #   otherwise                  → trade to the sized target, which
+        #                                enters, or flips (or, long-only,
+        #                                only closes) an opposite position;
+        #                                an unsizable target only closes.
+        # Orders staged earlier this bar count as held.
         equity = portfolio.equity_curve[-1] if portfolio.equity_curve else initial_capital
         for signal in signals:
             price = current_prices.get(signal.ticker, 0.0)
             if price <= 0:
                 continue
 
-            if isinstance(sizer, VolatilityTargetSizer):
-                ticker_returns = []
-                h = history.get(signal.ticker, [])
-                if len(h) > 2:
-                    arr = np.array(h)
-                    ticker_returns = list(np.diff(arr) / np.maximum(arr[:-1], 1e-9))
-                qty = sizer.size(signal, price, equity, ticker_returns)
+            held = portfolio.positions.get(signal.ticker, 0.0) + sum(
+                o.quantity for o in pending_orders if o.ticker == signal.ticker)
+            direction = signal.suggested_direction
+
+            if direction == 0:
+                qty = -held
+            elif abs(held) >= 1e-4 and (held > 0) == (direction > 0):
+                continue
             else:
-                qty = sizer.size(signal, price, equity)
+                if isinstance(sizer, VolatilityTargetSizer):
+                    ticker_returns = []
+                    h = history.get(signal.ticker, [])
+                    if len(h) > 2:
+                        arr = np.array(h)
+                        ticker_returns = list(np.diff(arr) / np.maximum(arr[:-1], 1e-9))
+                    target = sizer.size(signal, price, equity, ticker_returns)
+                else:
+                    target = sizer.size(signal, price, equity)
+                # A target the sizer cannot size yet (vol-target warm-up, a
+                # flat price history) is 0: that still closes an opposite
+                # position, and opens nothing.
+                qty = target - held
 
             if abs(qty) < 1e-4:
                 continue
-
-            # Flat signal: liquidate position
-            if signal.suggested_direction == 0:
-                qty = -portfolio.positions.get(signal.ticker, 0.0)
-                if abs(qty) < 1e-4:
-                    continue
 
             pending_orders.append(OrderEvent(
                 timestamp=bar, ticker=signal.ticker,

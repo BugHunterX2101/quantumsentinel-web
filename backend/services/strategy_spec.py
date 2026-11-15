@@ -25,6 +25,10 @@ its parameters, and the compiler turns it into the arguments of
   ``next_bar_close``: the engine fills an order at the close of the bar after
   its signal. ``momentum`` rebalances every fifth bar; the other templates
   act on every bar.
+* A signal sets a target position, it does not add to one. A flat signal
+  closes the position; a signal in the direction already held keeps it as it
+  is; any other signal trades to the sized target, entering or flipping (or,
+  without shorting, only closing) the position.
 """
 from __future__ import annotations
 
@@ -63,7 +67,8 @@ class _Model(BaseModel):
 # --------------------------------------------------------------------------
 
 class MACrossover(_Model):
-    """Long while the fast moving average is above the slow one."""
+    """Long from the bar the fast moving average crosses above the slow one;
+    short (without shorting, flat) from the reverse cross."""
     template: Literal["ma_crossover"]
     fast: int = Field(ge=2, le=200)
     slow: int = Field(ge=5, le=500)
@@ -78,7 +83,7 @@ class MACrossover(_Model):
 class Momentum(_Model):
     """Cross-sectional momentum over ``lookback`` bars, every fifth bar: long
     the top ``n_long``, sell the bottom ``n_short``, each at most a third of
-    the universe."""
+    the universe, and close every other position."""
     template: Literal["momentum"]
     lookback: int = Field(ge=2, le=500)
     n_long: int = Field(ge=0, le=MAX_SYMBOLS)
@@ -93,7 +98,8 @@ class Momentum(_Model):
 
 class MeanReversion(_Model):
     """Bollinger-band mean reversion: buy below and sell above the mean by
-    ``n_std_centi / 100`` population standard deviations of ``window`` bars."""
+    ``n_std_centi / 100`` population standard deviations of ``window`` bars,
+    and close within half a standard deviation of it."""
     template: Literal["mean_reversion"]
     window: int = Field(ge=2, le=500)
     n_std_centi: int = Field(ge=1, le=1_000)
@@ -107,14 +113,16 @@ Signal = Annotated[Union[MACrossover, Momentum, MeanReversion], Field(discrimina
 # --------------------------------------------------------------------------
 
 class FixedFractional(_Model):
-    """Each order is ``fraction_bps`` of equity, scaled by signal strength."""
+    """A position is ``fraction_bps`` of equity, scaled by signal strength,
+    sized when it is entered."""
     method: Literal["fixed_fractional"]
     fraction_bps: int = Field(ge=1, le=_BPS)
 
 
 class VolatilityTarget(_Model):
-    """Each order targets ``target_vol_bps`` annualised volatility from the
-    last 21 returns, at most 5x leverage and a quarter of equity."""
+    """A position targets ``target_vol_bps`` annualised volatility from the
+    last 21 returns, at most 5x leverage and a quarter of equity, sized when
+    it is entered."""
     method: Literal["volatility_target"]
     target_vol_bps: int = Field(ge=1, le=2 * _BPS)
 

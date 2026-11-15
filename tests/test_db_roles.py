@@ -327,6 +327,31 @@ def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(prov
     assert provisioned.connect().execute("SELECT count(*) FROM user_datasets").fetchone() == (2,)
 
 
+def test_the_app_may_register_and_tag_strategy_versions_but_never_change_them(provisioned):
+    """The research worker reaches none of the three tables yet
+    (test_the_research_worker_cannot_reach_trading_or_identity)."""
+    from backend.services import strategy_registry
+    from test_strategy_spec import spec
+
+    roles = provisioned.roles
+    provisioned.connect().execute("INSERT INTO users (id, email, password_hash) VALUES ('u1', 'u1@example.com', 'h')")
+    with sessionmaker(bind=provisioned.engine_as(roles.app))() as db:
+        version = strategy_registry.register(db, spec(), user_id="u1")
+        strategy_registry.tag(db, "u1", version.version_id, "1.0.0")
+        db.commit()
+        assert strategy_registry.resolve(db, "u1", "1.0.0").version_id == version.version_id
+    app = provisioned.connect(roles.app)
+    for statement in ("UPDATE strategy_versions SET family = family", "DELETE FROM strategy_versions",
+                      "TRUNCATE strategy_versions CASCADE", "UPDATE user_strategy_versions SET created_at = now()",
+                      "DELETE FROM user_strategy_versions", "UPDATE user_strategy_tags SET label = 'moved'",
+                      "DELETE FROM user_strategy_tags", "TRUNCATE user_strategy_tags"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            app.execute(statement)
+    owner = provisioned.connect()
+    assert [owner.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            for t in ("strategy_versions", "user_strategy_versions", "user_strategy_tags")] == [1, 1, 1]
+
+
 def test_the_research_worker_runs_a_dataset_snapshot_as_its_own_role(provisioned, monkeypatch, tmp_path):
     """The snapshot finalizer reads the blobs back and registers them as
     qs_research_worker, with the user's row written by the API as qs_app."""

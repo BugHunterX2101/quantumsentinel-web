@@ -69,8 +69,13 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "server_signing_keys": DML,
     "signals": DML,
     "strategies": DML,
+    # Append-only (migration 0006's triggers): a strategy version, who holds
+    # it and a holder's tags are recorded once and never changed.
+    "strategy_versions": ("SELECT", "INSERT"),
     "trades": DML,
     "user_datasets": ("SELECT", "INSERT"),
+    "user_strategy_tags": ("SELECT", "INSERT"),
+    "user_strategy_versions": ("SELECT", "INSERT"),
     "users": DML,
     "webhooks": DML,
 }

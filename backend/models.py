@@ -4,7 +4,7 @@ import datetime as dt
 
 from sqlalchemy import (
     Column, String, Boolean, Date, DateTime, Numeric, Integer, BigInteger, ForeignKey, Text, JSON,
-    LargeBinary, UniqueConstraint, Sequence, Index, text,
+    LargeBinary, UniqueConstraint, Sequence, Index, ForeignKeyConstraint, text,
 )
 from sqlalchemy.orm import relationship
 
@@ -378,6 +378,51 @@ class DatasetHoldout(Base):
     holdout_start = Column(Date, primary_key=True)
     set_by = Column(String(320), nullable=False)
     reason = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class StrategyVersion(Base):
+    """A strategy spec, stored as its canonical JSON under its content hash
+    (services/strategy_registry.py). One row serves every user who wrote the
+    same spec.
+
+    Immutable: migration 0006 adds triggers that refuse UPDATE, DELETE and
+    TRUNCATE, and CHECKs that the id is the hash of ``spec_canonical`` and
+    ``dsl``, ``template`` and ``family`` are the values inside it. Those are
+    PostgreSQL SQL, so they live in the migration only.
+    """
+    __tablename__ = "strategy_versions"
+
+    version_id = Column(String(80), primary_key=True)
+    dsl = Column(String(32), nullable=False)
+    template = Column(String(32), nullable=False)
+    family = Column(String(64), nullable=False)
+    spec_canonical = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class UserStrategyVersion(Base):
+    """A user who registered a strategy version; append-only (migration 0006)."""
+    __tablename__ = "user_strategy_versions"
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    version_id = Column(String(80), ForeignKey("strategy_versions.version_id"), primary_key=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class UserStrategyTag(Base):
+    """A user's own name for a version they hold. A tag is never moved or
+    removed (migration 0006): it always names the version it was given to."""
+    __tablename__ = "user_strategy_tags"
+    __table_args__ = (
+        ForeignKeyConstraint(["user_id", "version_id"],
+                             ["user_strategy_versions.user_id", "user_strategy_versions.version_id"],
+                             name="fk_user_strategy_tags_held_version"),
+    )
+
+    user_id = Column(String, primary_key=True)
+    label = Column(String(64), primary_key=True)
+    version_id = Column(String(80), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 

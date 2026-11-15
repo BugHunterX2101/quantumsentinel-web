@@ -113,6 +113,10 @@ def test_tags_belong_to_their_user(db):
     sr.tag(db, "u1", a.version_id, "1.0.0")
     sr.tag(db, "u2", a.version_id, "mine")
     db.commit()
+    # Each sees only their own tags on the shared version, so a listing
+    # never shows that someone else holds it.
+    assert [(v.version_id, tags) for v, tags in sr.list_for_user(db, "u1")] == [(a.version_id, ["1.0.0"])]
+    assert [(v.version_id, tags) for v, tags in sr.list_for_user(db, "u2")] == [(a.version_id, ["mine"])]
     assert sr.resolve(db, "u2", "1.0.0") is None
     assert sr.resolve(db, "u1", "mine") is None
     # The same label is free for another user, even for another version.

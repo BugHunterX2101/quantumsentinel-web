@@ -65,10 +65,16 @@ class JobKind:
     # registers the snapshot it took and names the datasets in the result
     # and audit event (dataset_registry.record_market_data).
     market_data: bool = False
+    # "module:function"(db, job) run in the worker process before the job
+    # process runs the task: it reads what the task needs from the database
+    # (the job process has none) and returns it, a dict the task takes as its
+    # second argument. A TaskError fails the job before it runs.
+    prepare: str | None = None
 
 
 _TASKS = "backend.services.research_tasks"
 _EXPERIMENTS = "backend.services.experiment_registry"
+_STRATEGIES = "backend.services.strategy_registry"
 KINDS: dict[str, JobKind] = {
     "ma_backtest": JobKind(schemas.BacktestRequest, f"{_TASKS}:ma_backtest", "BACKTEST_COMPLETED",
                            market_data=True),
@@ -105,6 +111,9 @@ KINDS: dict[str, JobKind] = {
                                  "EXPERIMENT_REPLAYED", f"{_EXPERIMENTS}:finalize_replay_job"),
     "dataset_snapshot": JobKind(schemas.DatasetSnapshotRequest, f"{_TASKS}:dataset_snapshot", "DATASET_SNAPSHOT",
                                 "backend.services.dataset_registry:finalize_snapshot_job"),
+    "strategy_backtest": JobKind(schemas.StrategyBacktestJob, f"{_TASKS}:strategy_backtest", "STRATEGY_BACKTEST",
+                                 f"{_STRATEGIES}:finalize_backtest_job", market_data=True,
+                                 prepare=f"{_STRATEGIES}:backtest_inputs"),
 }
 
 

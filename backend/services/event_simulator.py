@@ -458,6 +458,8 @@ def run_event_backtest(
     cost_model_name: str = "retail",
     allow_short: bool = False,
     sizing_method: str = "fixed_fractional",
+    *,
+    full_returns: bool = False,
 ) -> dict:
     """Run the event-driven backtester.
 
@@ -471,6 +473,9 @@ def run_event_backtest(
     cost_model_name : "zero_cost" | "retail" | "institutional"
     allow_short : enable short selling
     sizing_method : "fixed_fractional" | "volatility_target"
+    full_returns : also return ``returns``, every bar's return unrounded (an
+        array; ``daily_returns`` keeps the last 504, rounded, for display).
+        It is the series ``sharpe_ratio`` and the other statistics come from.
     """
     params = strategy_params or {}
 
@@ -683,7 +688,7 @@ def run_event_backtest(
     else:
         cvar = 0.0
 
-    return {
+    result = {
         "strategy": strategy_name,
         "cost_model": cost_model_name,
         "sizing_method": sizing_method,
@@ -710,3 +715,6 @@ def run_event_backtest(
         "n_bars": T,
         "tickers": tickers,
     }
+    if full_returns:
+        result["returns"] = returns_arr.copy()
+    return result

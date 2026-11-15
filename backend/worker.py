@@ -95,16 +95,19 @@ def _resolve(target: str):
     return getattr(importlib.import_module(module_name), attr)
 
 
-def _run_target(target: str, params: dict, holdouts: dict | None = None) -> tuple:
+def _run_target(target: str, params: dict, holdouts: dict | None = None,
+                prepared: dict | None = None) -> tuple:
     """Run a task, with the dataset holdout starts ``holdouts`` ({family:
-    date}) applied to the market data it reads; return ("ok", result, audit,
-    trials) or ("error", status, detail)."""
+    date}) applied to the market data it reads, and what its kind's
+    ``prepare`` read from the database, if anything, as its second argument;
+    return ("ok", result, audit, trials) or ("error", status, detail)."""
     from .services import market_data
     from .services.research_jobs import json_safe
     from .services.research_tasks import TaskError
     try:
+        task = _resolve(target)
         with market_data.holdouts(holdouts):
-            output = _resolve(target)(params)
+            output = task(params) if prepared is None else task(params, prepared)
     except TaskError as exc:
         return ("error", exc.status_code, exc.detail)
     except Exception:
@@ -133,8 +136,8 @@ def _child_main(conn) -> None:
             return
         if message is None:
             return
-        target, params, holdouts = message
-        conn.send(_run_target(target, params, holdouts))
+        target, params, holdouts, prepared = message
+        conn.send(_run_target(target, params, holdouts, prepared))
 
 
 class JobProcess:
@@ -176,9 +179,10 @@ class JobProcess:
         self._proc = self._conn = None
 
     def run(self, target: str, params: dict, timeout: float, on_tick, tick_seconds: float = 1.0,
-            *, holdouts: dict | None = None):
+            *, holdouts: dict | None = None, prepared: dict | None = None):
         """Run ``target(params)`` in the child, with the dataset holdout
-        starts ``holdouts`` applied (see _run_target).
+        starts ``holdouts`` applied, or ``target(params, prepared)`` (see
+        _run_target).
 
         ``on_tick()`` is called about every ``tick_seconds`` while it runs; if
         it returns a string, the child is killed and that string returned
@@ -192,7 +196,7 @@ class JobProcess:
             boot_deadline = time.monotonic() + CHILD_BOOT_SECONDS
         else:
             deadline = time.monotonic() + timeout
-        self._conn.send((target, params, holdouts))
+        self._conn.send((target, params, holdouts, prepared))
         while True:
             if self._conn.poll(tick_seconds):
                 try:
@@ -322,9 +326,21 @@ class Worker:
             from .services import dataset_holdouts
             holdouts = dataset_holdouts.current(db)
             db.commit()
+        prepared = None
+        if kind.prepare is not None:
+            from .services.research_tasks import TaskError
+            try:
+                prepared = research_jobs._resolve(kind.prepare)(db, job)
+            except TaskError as exc:
+                db.rollback()
+                research_jobs.fail(db, job, self.id, attempt, exc.status_code, exc.detail)
+                log.info("research job %s -> refused before it ran: %s", job.id, exc.detail)
+                self._heartbeat(db, None, force=True)
+                return
+            db.commit()
         started = time.monotonic()
         outcome = self.job_process.run(kind.target, job.params_json, self.timeout_seconds, on_tick,
-                                       holdouts=holdouts)
+                                       holdouts=holdouts, prepared=prepared)
         elapsed = time.monotonic() - started
         status = outcome[0]
         if status == "ok":

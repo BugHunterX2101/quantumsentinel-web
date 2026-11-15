@@ -367,8 +367,9 @@ def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(prov
 
 
 def test_the_app_may_register_and_tag_strategy_versions_but_never_change_them(provisioned):
-    """The research worker reaches none of the three tables yet
-    (test_the_research_worker_cannot_reach_trading_or_identity)."""
+    """The research worker may only read versions and who holds them
+    (test_the_research_worker_runs_a_strategy_backtest_as_its_own_role); tags
+    are out of its reach (test_the_research_worker_cannot_reach_trading_or_identity)."""
     from backend.services import strategy_registry
     from test_strategy_spec import spec
 
@@ -389,6 +390,61 @@ def test_the_app_may_register_and_tag_strategy_versions_but_never_change_them(pr
     owner = provisioned.connect()
     assert [owner.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
             for t in ("strategy_versions", "user_strategy_versions", "user_strategy_tags")] == [1, 1, 1]
+
+
+def test_the_research_worker_runs_a_strategy_backtest_as_its_own_role(provisioned, monkeypatch, tmp_path):
+    """The API registers the version and queues the job as qs_app; the worker
+    loads the spec, records the trial and its evaluation and signs the audit
+    event as qs_research_worker, which can read versions but never write one,
+    and which, like qs_app, can never change or remove an evaluation."""
+    import numpy as np
+    import pandas as pd
+
+    from market_helpers import fake_market
+    from test_trial_evaluations import strategy
+
+    days = pd.bdate_range("2023-01-02", periods=300)
+    rng = np.random.default_rng(5)
+    fake_market(monkeypatch, tmp_path, pd.DataFrame(
+        {("Close", t): 100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(days)))) for t in ("AAA", "BBB", "CCC")},
+        index=days))
+    monkeypatch.setattr(security_service.server_identity, "_registered", False)
+    roles = provisioned.roles
+    api = sessionmaker(bind=provisioned.engine_as(roles.app))()
+    worker_sessions = sessionmaker(bind=provisioned.engine_as(roles.research_worker))
+    with worker_sessions() as db:
+        security_service.server_identity.ensure_registered(db)
+    user = models.User(email="strategy-role@example.com", password_hash="x", role="user")
+    api.add(user)
+    api.commit()
+    version_id = main.register_strategy(schemas.StrategyRegisterRequest(spec=strategy(), tag="v1"),
+                                        user=user, db=api)["version_id"]
+    response = main.strategy_backtest(schemas.StrategyBacktestRequest(strategy="v1", period="1y"), user=user, db=api)
+    runner = worker.Worker(job_process=InlineJobProcess(), session_factory=worker_sessions,
+                           lease_seconds=60, timeout_seconds=300, poll_seconds=0.1)
+    assert runner.run_once() is True
+    api.expire_all()
+    view = research_jobs.view(api, api.get(models.ResearchJob, json.loads(response.body)["job_id"]))
+    assert view["status"] == "succeeded", view
+    assert view["result"]["strategy_version_id"] == version_id
+    assert security_service.audit_chain_status(api, full=True)["valid"]
+    api.close()
+    research_worker = provisioned.connect(roles.research_worker)
+    assert research_worker.execute("SELECT count(*) FROM strategy_versions").fetchone() == (1,)
+    for statement in ("INSERT INTO strategy_versions (version_id) VALUES ('x')",
+                      "INSERT INTO user_strategy_versions (user_id, version_id) VALUES ('u', 'x')",
+                      "SELECT 1 FROM user_strategy_tags"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            research_worker.execute(statement)
+    for role in (roles.app, roles.research_worker):
+        conn = provisioned.connect(role)
+        for statement in ("UPDATE research_trial_evaluations SET sharpe = 9",
+                          "DELETE FROM research_trial_evaluations", "TRUNCATE research_trial_evaluations"):
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute(statement)
+    owner = provisioned.connect()
+    assert owner.execute("SELECT job_id, strategy_version_id FROM research_trial_evaluations").fetchall() == \
+        [(view["job_id"], version_id)]
 
 
 def test_the_research_worker_runs_a_dataset_snapshot_as_its_own_role(provisioned, monkeypatch, tmp_path):

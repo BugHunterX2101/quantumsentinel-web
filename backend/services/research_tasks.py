@@ -57,9 +57,9 @@ def uses_market_data(task):
     The result's ``market_data`` says which; the worker registers the snapshot
     and names its datasets (dataset_registry.record_market_data)."""
     @functools.wraps(task)
-    def run(params: dict) -> TaskOutput:
+    def run(params: dict, *prepared) -> TaskOutput:
         with market_data.session(params.get("dataset_ids")) as data:
-            output = task(params)
+            output = task(params, *prepared)
         return TaskOutput({**output.result, "market_data": data.record()}, output.audit, output.trials)
     run.uses_market_data = True
     return run
@@ -307,6 +307,63 @@ def event_backtest(params: dict) -> TaskOutput:
     trials = TrialRecord(research_trials.family_hash(f"event:{req.strategy}", req.assets),
                          [req.model_dump(exclude={"dataset_ids"})], "event_backtest")
     audit = {"n_assets": len(price_data), "strategy": req.strategy, "cost_model": req.cost_model}
+    return TaskOutput(result, audit, trials)
+
+
+# Sessions on which every symbol of a strategy's universe must have a price.
+STRATEGY_MIN_SESSIONS = 60
+
+
+def strategy_trial_config(req: schemas.StrategyBacktestJob) -> dict:
+    """The trial a strategy backtest counts as, in its template's family: the
+    version, which fixes the symbols and every parameter, with the period and
+    capital it ran on. The datasets are not part of it: running the same
+    version again on other data is the same trial."""
+    return {"strategy_version_id": req.strategy_version_id, "period": req.period,
+            "initial_capital": req.initial_capital}
+
+
+@uses_market_data
+def strategy_backtest(params: dict, prepared: dict) -> TaskOutput:
+    """Backtest a strategy version on its universe's prices with the event
+    engine. The worker loads the version's spec for the job's user
+    (strategy_registry.backtest_inputs) and passes it as ``prepared``; the
+    job's params only name it. The result carries what the run measured
+    (research_trials.evaluation_metrics), which the worker records as an
+    evaluation of the trial once it accepts the result
+    (strategy_registry.finalize_backtest_job)."""
+    from . import historical_data, strategy_spec
+    req = schemas.StrategyBacktestJob.model_validate(params)
+    spec = strategy_spec.parse(prepared["spec"])
+    if strategy_spec.version_id(spec) != req.strategy_version_id:
+        raise TaskError(500, "The research job was given another strategy than the one it names")
+    compiled = strategy_spec.compile_spec(spec)
+    symbols = list(compiled.tickers)
+    try:
+        raw = market_data.download(symbols, req.period)
+    except market_data.MarketDataError as exc:
+        raise TaskError(422, str(exc)) from exc
+    panel = historical_data.aligned_panel(raw, symbols, min_rows=STRATEGY_MIN_SESSIONS)
+    missing = [s for s in symbols if s not in panel.tickers]
+    if missing:
+        raise TaskError(422, f"Fewer than {STRATEGY_MIN_SESSIONS} sessions of prices in the period for "
+                             f"{', '.join(missing)}")
+    if len(panel) < STRATEGY_MIN_SESSIONS:
+        raise TaskError(422, f"Only {len(panel)} sessions in the period have a price for every symbol; "
+                             f"at least {STRATEGY_MIN_SESSIONS} are needed")
+    try:
+        result = compiled.run({s: panel.close[s].to_numpy(dtype=float) for s in symbols},
+                              req.initial_capital, full_returns=True)
+    except strategy_spec.StrategySpecError as exc:
+        raise TaskError(422, str(exc)) from exc
+    evaluation = research_trials.evaluation_metrics(result.pop("returns"))
+    dates = panel.date_strings()
+    result = {**result, "strategy_version_id": req.strategy_version_id, "family": spec.universe.family,
+              "period": req.period, "sessions": {"first": dates[0], "last": dates[-1], "count": len(dates)},
+              "evaluation": evaluation}
+    trials = TrialRecord(research_trials.family_hash(spec.signal.template, spec.universe.symbols),
+                         [strategy_trial_config(req)], "strategy_backtest")
+    audit = {"strategy_version_id": req.strategy_version_id, "period": req.period, **evaluation}
     return TaskOutput(result, audit, trials)
 
 

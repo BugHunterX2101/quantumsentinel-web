@@ -24,10 +24,11 @@ FORBIDDEN = {
     "backend.services.integration_service", "backend.services.redis_store",
 }
 RESEARCH_TASKS = "backend.services.research_tasks"
-# Modules whose finalizers a worker runs (research_jobs.JobKind.finalize). The
-# worker resolves them by name, so no import statement leads to them: each is
-# a root of the closure below in its own right.
-FINALIZERS = {"backend.services.experiment_registry", "backend.services.dataset_registry"}
+# Modules whose finalizers or preparers a worker runs (research_jobs.JobKind
+# finalize and prepare). The worker resolves them by name, so no import
+# statement leads to them: each is a root of the closure below in its own right.
+FINALIZERS = {"backend.services.experiment_registry", "backend.services.dataset_registry",
+              "backend.services.strategy_registry"}
 
 
 def _path(module: str) -> Path | None:
@@ -83,8 +84,10 @@ def test_every_job_kind_runs_research_code():
         module, _, attr = kind.target.partition(":")
         assert module == RESEARCH_TASKS, name
         assert getattr(importlib.import_module(module), attr).__module__ == RESEARCH_TASKS, name
-        if kind.finalize is not None:
-            assert kind.finalize.partition(":")[0] in FINALIZERS, name
+        for hook in (kind.finalize, kind.prepare):
+            if hook is not None:
+                assert hook.partition(":")[0] in FINALIZERS, name
+                assert callable(getattr(importlib.import_module(hook.partition(":")[0]), hook.partition(":")[2]))
 
 
 @pytest.mark.parametrize("root", ["backend.worker", RESEARCH_TASKS, *sorted(FINALIZERS)])

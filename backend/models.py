@@ -3,7 +3,7 @@ import uuid
 import datetime as dt
 
 from sqlalchemy import (
-    Column, String, Boolean, Date, DateTime, Numeric, Integer, BigInteger, ForeignKey, Text, JSON,
+    Column, String, Boolean, Date, DateTime, Numeric, Integer, BigInteger, Float, ForeignKey, Text, JSON,
     LargeBinary, UniqueConstraint, Sequence, Index, ForeignKeyConstraint, text,
 )
 from sqlalchemy.orm import relationship
@@ -283,8 +283,43 @@ class ResearchTrial(Base):
     user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
     family_hash = Column(String(64), nullable=False, index=True)
     config_hash = Column(String(64), nullable=False)
-    source = Column(String(32), nullable=False)  # backtest | walk_forward | event_backtest
+    source = Column(String(32), nullable=False)  # backtest | walk_forward | event_backtest | strategy_backtest
     created_at = Column(DateTime(timezone=True), default=utcnow)
+
+
+class ResearchTrialEvaluation(Base):
+    """One accepted run of a strategy version: the trial it counted as, and
+    the Sharpe ratio, number of returns and return-series hash of its result
+    (research_trials.evaluation_metrics), with the datasets it read.
+
+    One row per job, written with the job's result, so a result the worker
+    refuses (a holdout set while it ran, data of another family) or loses
+    (its lease lapsed) leaves the trial counted and no evaluation. ``job_id``
+    names the job but has no foreign key: finished jobs are purged, and these
+    rows stay.
+
+    Immutable: migration 0007 adds triggers that refuse UPDATE, DELETE and
+    TRUNCATE, and the CHECKs on the values (PostgreSQL SQL, so they live in
+    the migration only).
+    """
+    __tablename__ = "research_trial_evaluations"
+    __table_args__ = (
+        ForeignKeyConstraint(["user_id", "family_hash", "config_hash"],
+                             ["research_trials.user_id", "research_trials.family_hash",
+                              "research_trials.config_hash"],
+                             name="fk_research_trial_evaluations_trial"),
+    )
+
+    job_id = Column(String, primary_key=True)
+    user_id = Column(String, nullable=False)
+    family_hash = Column(String(64), nullable=False)
+    config_hash = Column(String(64), nullable=False)
+    strategy_version_id = Column(String(80), ForeignKey("strategy_versions.version_id"), nullable=False)
+    sharpe = Column(Float, nullable=False)
+    n_obs = Column(Integer, nullable=False)
+    returns_sha256 = Column(String(96), nullable=False)
+    dataset_ids = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class ResearchJob(Base):

@@ -10,9 +10,9 @@ from backend.services.research_tasks import TaskOutput
 class InlineJobProcess:
     """Runs tasks in this process (so monkeypatches apply); no time limit."""
 
-    def run(self, target, params, timeout, on_tick, tick_seconds=1.0, *, holdouts=None):
+    def run(self, target, params, timeout, on_tick, tick_seconds=1.0, *, holdouts=None, prepared=None):
         from backend import worker
-        return worker._run_target(target, params, holdouts)
+        return worker._run_target(target, params, holdouts, prepared)
 
     def stop(self):
         pass
@@ -52,6 +52,11 @@ def sleep_task(params: dict) -> TaskOutput:
 
 def crash_task(params: dict) -> TaskOutput:
     os._exit(3)
+
+
+def prepared_task(params: dict, prepared: dict | None = None) -> TaskOutput:
+    """What the task was handed: its params and what its kind's prepare read."""
+    return TaskOutput({"params": params, "prepared": prepared}, {})
 
 
 def holdouts_task(params: dict) -> TaskOutput:

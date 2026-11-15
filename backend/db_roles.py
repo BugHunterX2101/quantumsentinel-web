@@ -69,6 +69,9 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # embedded worker under this role, so it needs INSERT. Nothing updates or
     # deletes a trial, so a user's count can only grow.
     "research_trials": ("SELECT", "INSERT"),
+    # Append-only (migration 0007's triggers): what each accepted
+    # strategy-version run measured, written by the (embedded) worker.
+    "research_trial_evaluations": ("SELECT", "INSERT"),
     "research_workers": DML,
     "server_signing_keys": DML,
     "signals": DML,
@@ -109,9 +112,15 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # Claim, lease, finish, reap and purge jobs; only the API enqueues them.
     "research_jobs": ("SELECT", "UPDATE", "DELETE"),
     "research_trials": ("SELECT", "INSERT"),
+    # A strategy backtest records what its accepted result measured.
+    "research_trial_evaluations": ("SELECT", "INSERT"),
     "research_workers": DML,
     # The worker registers the server key it signs audit events with.
     "server_signing_keys": ("SELECT", "INSERT"),
+    # A strategy backtest loads the version it runs, which the job's user
+    # must hold, before the job process starts; the worker never registers one.
+    "strategy_versions": ("SELECT",),
+    "user_strategy_versions": ("SELECT",),
 }
 
 _ROLE_ATTRIBUTES = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"

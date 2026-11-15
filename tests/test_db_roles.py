@@ -287,6 +287,45 @@ def test_the_research_worker_runs_every_kind_of_job_as_its_own_role(provisioned,
     api.close()
 
 
+def test_an_embedded_worker_records_trials_as_the_app_role_which_can_never_remove_one(provisioned, monkeypatch):
+    """RESEARCH_WORKER_MODE=embedded, the default, runs the worker with the
+    API's credentials, so qs_app records trials (research_trials.record reads
+    which configs are known, then inserts the rest). It can never change or
+    remove one, so a user's trial count only grows."""
+    monkeypatch.setattr(backtest_service, "run_moving_average_backtest", lambda *a: {
+        "initial_capital": 100_000.0, "final_capital": 101_000.0, "total_return": 0.01,
+        "sharpe_ratio": 1.0, "max_drawdown": -0.02, "win_rate": 0.5, "total_trades": 4,
+        "daily_returns_net": [0.001 * ((i % 5) - 2) for i in range(30)]})
+    monkeypatch.setattr(security_service.server_identity, "_registered", False)
+    roles = provisioned.roles
+    sessions = sessionmaker(bind=provisioned.engine_as(roles.app))
+    api = sessions()
+    user = models.User(email="embedded@example.com", password_hash="x", role="user")
+    api.add(user)
+    api.commit()
+    runner = worker.Worker(job_process=InlineJobProcess(), session_factory=sessions,
+                           lease_seconds=60, timeout_seconds=300, poll_seconds=0.1)
+    counts = []
+    for request in (schemas.BacktestRequest(asset="aapl"), schemas.BacktestRequest(asset="AAPL"),
+                    schemas.BacktestRequest(asset="aapl", fast_window=5)):
+        job_id = json.loads(main.run_backtest(request, user=user, db=api).body)["job_id"]
+        assert runner.run_once() is True
+        api.expire_all()
+        view = research_jobs.view(api, api.get(models.ResearchJob, job_id))
+        assert view["status"] == "succeeded", view
+        counts.append(view["result"]["trials_in_family"])
+    # The same config again is still one trial; a new one is the second.
+    assert counts == [1, 1, 2]
+    api.close()
+    app = provisioned.connect(roles.app)
+    for statement in ("UPDATE research_trials SET config_hash = family_hash",
+                      "UPDATE research_trials SET user_id = user_id", "DELETE FROM research_trials",
+                      "TRUNCATE research_trials"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            app.execute(statement)
+    assert provisioned.connect().execute("SELECT count(*) FROM research_trials").fetchone()[0] == 2
+
+
 def test_the_research_worker_cannot_reach_trading_or_identity(provisioned):
     roles = provisioned.roles
     research_worker = provisioned.connect(roles.research_worker)

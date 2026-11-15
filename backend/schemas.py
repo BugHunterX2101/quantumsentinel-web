@@ -598,6 +598,19 @@ class DatasetSnapshotRequest(BaseModel):
         return self
 
 
+class StrategyRegisterRequest(BaseModel):
+    """A strategy spec to register (DSL v1, services/strategy_spec.py, which
+    validates it), and optionally a tag to give the version."""
+    spec: dict[str, Any]
+    tag: str | None = None
+
+
+class StrategyTagRequest(BaseModel):
+    """A tag for one of the caller's strategy versions (strategy_registry.tag
+    checks it)."""
+    label: str
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Alpha Research & Factor Modeling Schemas
 # ---------------------------------------------------------------------------

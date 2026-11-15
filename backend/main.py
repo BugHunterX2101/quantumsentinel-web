@@ -41,6 +41,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.orm import Session
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -59,7 +60,7 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
                      RESEARCH_WORKER_MODE, PROCESS_ROLE)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, integration_service, order_security
-from .services import dataset_registry, paper_broker, research_jobs, research_trials
+from .services import dataset_registry, paper_broker, research_jobs, research_trials, strategy_registry
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -2024,6 +2025,72 @@ def get_dataset(dataset_id: str, user: models.User = Depends(get_current_user),
     if version is None:
         raise HTTPException(404, "Dataset not found")
     return dataset_registry.view(version)
+
+
+def _strategy_error(exc: strategy_registry.StrategyRegistryError) -> HTTPException:
+    if isinstance(exc, strategy_registry.UnknownStrategyVersion):
+        return HTTPException(404, "Strategy version not found")
+    return HTTPException(409 if isinstance(exc, strategy_registry.TagConflict) else 422, str(exc))
+
+
+@app.post("/api/research/strategies", status_code=201)
+def register_strategy(req: schemas.StrategyRegisterRequest,
+                      user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """Register a strategy spec (DSL v1) as an immutable version named by its
+    content hash, and optionally tag it. Registering a spec the caller, or
+    anyone, registered before returns the same version."""
+    try:
+        version = strategy_registry.register(db, req.spec, user_id=user.id)
+        if req.tag is not None:
+            strategy_registry.tag(db, user.id, version.version_id, req.tag)
+    except PydanticValidationError as exc:
+        db.rollback()
+        # The same 422 shape as any other invalid request body.
+        raise RequestValidationError([{**error, "loc": ("body", "spec", *error["loc"])}
+                                      for error in exc.errors(include_url=False, include_context=False)])
+    except strategy_registry.StrategyRegistryError as exc:
+        db.rollback()
+        raise _strategy_error(exc)
+    version_id = version.version_id
+    security_service.write_audit_log(db, user.id, "STRATEGY_REGISTERED", "strategy_version", version_id,
+                                     {"tag": req.tag})
+    return strategy_registry.view(strategy_registry.held(db, user.id, version_id))
+
+
+@app.get("/api/research/strategies")
+def list_strategies(limit: int = Query(50, ge=1, le=200),
+                    user: models.User = Depends(get_current_user),
+                    db: Session = Depends(get_db)):
+    """The caller's strategy versions, last registered first, with their tags."""
+    return [strategy_registry.view(h) for h in strategy_registry.list_for_user(db, user.id, limit)]
+
+
+@app.get("/api/research/strategies/{ref}")
+def get_strategy(ref: str, user: models.User = Depends(get_current_user),
+                 db: Session = Depends(get_db)):
+    """One of the caller's strategy versions, by its id or one of their tags."""
+    version = strategy_registry.resolve(db, user.id, ref)
+    if version is None:
+        raise HTTPException(404, "Strategy version not found")
+    return strategy_registry.view(strategy_registry.held(db, user.id, version.version_id))
+
+
+@app.post("/api/research/strategies/{version_id}/tags")
+def tag_strategy(version_id: str, req: schemas.StrategyTagRequest,
+                 user: models.User = Depends(get_current_user),
+                 db: Session = Depends(get_db)):
+    """Give one of the caller's versions a tag. A tag always names the version
+    it was first given to: giving it again to that version changes nothing,
+    and giving it to another is refused (409)."""
+    try:
+        strategy_registry.tag(db, user.id, version_id, req.label)
+    except strategy_registry.StrategyRegistryError as exc:
+        db.rollback()
+        raise _strategy_error(exc)
+    security_service.write_audit_log(db, user.id, "STRATEGY_TAGGED", "strategy_version", version_id,
+                                     {"label": req.label})
+    return strategy_registry.view(strategy_registry.held(db, user.id, version_id))
 
 
 @app.get("/api/research/jobs")

@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -32,6 +33,24 @@ LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 class StrategyRegistryError(ValueError):
     """A registry request that cannot be honoured."""
+
+
+class UnknownStrategyVersion(StrategyRegistryError):
+    """No version by that id is held by the user."""
+
+
+class TagConflict(StrategyRegistryError):
+    """The label already names another of the user's versions."""
+
+
+@dataclass(frozen=True)
+class Held:
+    """A version as one user holds it: when *they* registered it (never the
+    version's own ``created_at``, the first registrant's time, which would
+    tell them someone else wrote the same spec earlier) and their tags."""
+    version: models.StrategyVersion
+    held_since: dt.datetime
+    tags: list[str]
 
 
 def register(db: Session, value: Any, *, user_id: str) -> models.StrategyVersion:
@@ -81,19 +100,47 @@ def get_for_user(db: Session, user_id: str, version_id: str) -> models.StrategyV
                models.StrategyVersion.version_id == version_id)).scalar_one_or_none()
 
 
-def list_for_user(db: Session, user_id: str) -> list[tuple[models.StrategyVersion, list[str]]]:
-    """The versions ``user_id`` holds, first registered first, each with the
-    user's tags for it in the order given."""
+def _held(db: Session, user_id: str, *criteria, limit: int | None = None) -> list[Held]:
     rows = db.execute(
-        select(models.StrategyVersion)
+        select(models.StrategyVersion, models.UserStrategyVersion.created_at)
         .join(models.UserStrategyVersion, models.UserStrategyVersion.version_id == models.StrategyVersion.version_id)
-        .where(models.UserStrategyVersion.user_id == user_id)
-        .order_by(models.UserStrategyVersion.created_at, models.StrategyVersion.version_id)).scalars().all()
+        .where(models.UserStrategyVersion.user_id == user_id, *criteria)
+        .order_by(models.UserStrategyVersion.created_at.desc(), models.StrategyVersion.version_id)
+        .limit(limit)).all()
     tags: dict[str, list[str]] = {}
-    for row in db.execute(select(models.UserStrategyTag).where(models.UserStrategyTag.user_id == user_id)
-                          .order_by(models.UserStrategyTag.created_at, models.UserStrategyTag.label)).scalars():
-        tags.setdefault(row.version_id, []).append(row.label)
-    return [(version, tags.get(version.version_id, [])) for version in rows]
+    if rows:
+        for row in db.execute(select(models.UserStrategyTag).where(
+                models.UserStrategyTag.user_id == user_id,
+                models.UserStrategyTag.version_id.in_([version.version_id for version, _ in rows]))
+                .order_by(models.UserStrategyTag.created_at, models.UserStrategyTag.label)).scalars():
+            tags.setdefault(row.version_id, []).append(row.label)
+    return [Held(version, held_since, tags.get(version.version_id, [])) for version, held_since in rows]
+
+
+def list_for_user(db: Session, user_id: str, limit: int = 50) -> list[Held]:
+    """The versions ``user_id`` holds, last registered first, each with the
+    user's tags for it in the order given."""
+    return _held(db, user_id, limit=limit)
+
+
+def held(db: Session, user_id: str, version_id: str) -> Held | None:
+    """One version as ``user_id`` holds it, if they do."""
+    found = _held(db, user_id, models.StrategyVersion.version_id == version_id)
+    return found[0] if found else None
+
+
+def view(held_version: Held) -> dict:
+    """A held version as the API reports it."""
+    version = held_version.version
+    return {
+        "version_id": version.version_id,
+        "dsl": version.dsl,
+        "template": version.template,
+        "family": version.family,
+        "spec": json.loads(bytes(version.spec_canonical)),
+        "tags": list(held_version.tags),
+        "held_since": held_version.held_since.astimezone(dt.timezone.utc).isoformat(),
+    }
 
 
 def tag(db: Session, user_id: str, version_id: str, label: str) -> models.UserStrategyTag:
@@ -103,7 +150,7 @@ def tag(db: Session, user_id: str, version_id: str, label: str) -> models.UserSt
     if not isinstance(label, str) or not LABEL.fullmatch(label):
         raise StrategyRegistryError("a tag is 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit")
     if get_for_user(db, user_id, version_id) is None:
-        raise StrategyRegistryError("no such strategy version")
+        raise UnknownStrategyVersion("no such strategy version")
     existing = db.get(models.UserStrategyTag, (user_id, label))
     if existing is None:
         row = models.UserStrategyTag(user_id=user_id, label=label, version_id=version_id,
@@ -116,7 +163,7 @@ def tag(db: Session, user_id: str, version_id: str, label: str) -> models.UserSt
             # A concurrent request gave the label first.
             existing = db.get(models.UserStrategyTag, (user_id, label))
     if existing is None or existing.version_id != version_id:
-        raise StrategyRegistryError(f"the tag {label!r} already names another version")
+        raise TagConflict(f"the tag {label!r} already names another version")
     return existing
 
 

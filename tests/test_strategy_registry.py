@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from backend import models
 from backend.services import strategy_registry as sr
 from backend.services import strategy_spec as ss
-from backend.services.strategy_registry import StrategyRegistryError
+from backend.services.strategy_registry import StrategyRegistryError, TagConflict, UnknownStrategyVersion
 from test_strategy_spec import spec
 
 
@@ -37,6 +37,11 @@ def register(db, value=None, user_id="u1"):
     version = sr.register(db, value if value is not None else spec(), user_id=user_id)
     db.commit()
     return version
+
+
+def listed(db, user_id):
+    """(version id, tags) of what the user holds, last registered first."""
+    return [(h.version.version_id, h.tags) for h in sr.list_for_user(db, user_id)]
 
 
 def count(db, table):
@@ -79,9 +84,8 @@ def test_versions_are_listed_and_found_only_for_their_holders(db):
     a = register(db, spec(), user_id="u1")
     b = register(db, spec(**{"signal.fast": 10}), user_id="u1")
     register(db, spec(**{"signal.fast": 10}), user_id="u2")
-    assert [(v.version_id, tags) for v, tags in sr.list_for_user(db, "u1")] == \
-        [(a.version_id, []), (b.version_id, [])]
-    assert [v.version_id for v, _ in sr.list_for_user(db, "u2")] == [b.version_id]
+    assert listed(db, "u1") == [(b.version_id, []), (a.version_id, [])]
+    assert listed(db, "u2") == [(b.version_id, [])]
     assert sr.get_for_user(db, "u2", b.version_id).version_id == b.version_id
     assert sr.get_for_user(db, "u2", a.version_id) is None
     assert sr.resolve(db, "u2", a.version_id) is None
@@ -97,11 +101,10 @@ def test_a_tag_names_one_of_its_users_versions_forever(db):
     sr.tag(db, "u1", b.version_id, "1.1.0")
     db.commit()
     assert sr.tag(db, "u1", a.version_id, "1.0.0").version_id == a.version_id  # again: a no-op
-    with pytest.raises(StrategyRegistryError, match="'1.0.0' already names another version"):
+    with pytest.raises(TagConflict, match="'1.0.0' already names another version"):
         sr.tag(db, "u1", b.version_id, "1.0.0")
     db.rollback()
-    assert [(v.version_id, tags) for v, tags in sr.list_for_user(db, "u1")] == \
-        [(a.version_id, ["1.0.0", "baseline"]), (b.version_id, ["1.1.0"])]
+    assert listed(db, "u1") == [(b.version_id, ["1.1.0"]), (a.version_id, ["1.0.0", "baseline"])]
     assert sr.resolve(db, "u1", "1.0.0").version_id == a.version_id
     assert sr.resolve(db, "u1", "1.1.0").version_id == b.version_id
     assert sr.resolve(db, "u1", "2.0.0") is None
@@ -115,8 +118,8 @@ def test_tags_belong_to_their_user(db):
     db.commit()
     # Each sees only their own tags on the shared version, so a listing
     # never shows that someone else holds it.
-    assert [(v.version_id, tags) for v, tags in sr.list_for_user(db, "u1")] == [(a.version_id, ["1.0.0"])]
-    assert [(v.version_id, tags) for v, tags in sr.list_for_user(db, "u2")] == [(a.version_id, ["mine"])]
+    assert listed(db, "u1") == [(a.version_id, ["1.0.0"])]
+    assert listed(db, "u2") == [(a.version_id, ["mine"])]
     assert sr.resolve(db, "u2", "1.0.0") is None
     assert sr.resolve(db, "u1", "mine") is None
     # The same label is free for another user, even for another version.
@@ -137,9 +140,9 @@ def test_what_a_tag_cannot_be(db, label):
 
 def test_a_version_the_user_does_not_hold_cannot_be_tagged(db):
     version = register(db, user_id="u1")
-    with pytest.raises(StrategyRegistryError, match="no such strategy version"):
+    with pytest.raises(UnknownStrategyVersion, match="no such strategy version"):
         sr.tag(db, "u2", version.version_id, "stolen")
-    with pytest.raises(StrategyRegistryError, match="no such strategy version"):
+    with pytest.raises(UnknownStrategyVersion, match="no such strategy version"):
         sr.tag(db, "u1", "qs-sv-sha256-v1:" + "0" * 64, "nothing")
 
 
@@ -162,7 +165,7 @@ def test_a_label_another_request_gave_first_is_refused_or_returned(engine, db):
         return real_get(entity, key, **kwargs)
 
     db.get = get
-    with pytest.raises(StrategyRegistryError, match="already names another version"):
+    with pytest.raises(TagConflict, match="already names another version"):
         sr.tag(db, "u1", b.version_id, "1.0.0")
     # A real stale read means the row is not in this session yet.
     db.expunge(db.get(models.UserStrategyTag, ("u1", "1.0.0")))

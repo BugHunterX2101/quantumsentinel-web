@@ -611,6 +611,49 @@ class StrategyTagRequest(BaseModel):
     label: str
 
 
+def _trailing_period(value: str) -> str:
+    from .services.market_data import PERIOD
+
+    if not isinstance(value, str) or not PERIOD.fullmatch(value):
+        raise ValueError("period is 1 to 99 months or years, such as 6mo or 2y")
+    return value
+
+
+class StrategyBacktestRequest(MarketDataRequest):
+    """Backtest one of the caller's strategy versions, named by its id or by
+    one of their tags (resolved to the id when the job is queued), over the
+    trailing ``period`` of its universe's data."""
+    strategy: str = Field(min_length=1, max_length=96)
+    period: str = "2y"
+    initial_capital: float = Field(default=100_000.0, ge=1000.0, le=100_000_000.0)
+
+    @field_validator("period")
+    @classmethod
+    def valid_period(cls, value: str) -> str:
+        return _trailing_period(value)
+
+
+class StrategyBacktestJob(MarketDataRequest):
+    """A queued strategy backtest, with the version id the API resolved."""
+    strategy_version_id: str
+    period: str
+    initial_capital: float = Field(ge=1000.0, le=100_000_000.0)
+
+    @field_validator("period")
+    @classmethod
+    def valid_period(cls, value: str) -> str:
+        return _trailing_period(value)
+
+    @field_validator("strategy_version_id")
+    @classmethod
+    def valid_version_id(cls, value: str) -> str:
+        from .services.strategy_spec import STRATEGY_VERSION_ID
+
+        if not STRATEGY_VERSION_ID.fullmatch(value):
+            raise ValueError("not a strategy version id")
+        return value
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Alpha Research & Factor Modeling Schemas
 # ---------------------------------------------------------------------------

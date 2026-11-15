@@ -221,14 +221,17 @@ class CompiledStrategy:
     tickers: tuple[str, ...]
     engine_kwargs: Mapping[str, Any]
 
-    def run(self, price_data: Mapping[str, np.ndarray], initial_capital: float) -> dict:
-        """Backtest on date-aligned close arrays, one per universe symbol."""
+    def run(self, price_data: Mapping[str, np.ndarray], initial_capital: float, *,
+            full_returns: bool = False) -> dict:
+        """Backtest on date-aligned close arrays, one per universe symbol
+        (``full_returns``: see run_event_backtest)."""
         missing = sorted(set(self.tickers) - set(price_data))
         if missing:
             raise StrategySpecError(f"no prices for {', '.join(missing)}")
         return run_event_backtest(tickers=list(self.tickers),
                                   price_data={t: price_data[t] for t in self.tickers},
-                                  initial_capital=initial_capital, **self.engine_kwargs)
+                                  initial_capital=initial_capital, full_returns=full_returns,
+                                  **self.engine_kwargs)
 
 
 def _signal_params(signal) -> dict:

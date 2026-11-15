@@ -1834,11 +1834,15 @@ def _queue_job(db: Session, user: models.User, kind: str, params: dict,
                         headers={"Location": f"/api/research/jobs/{job.id}"})
 
 
-def _queue_research(db: Session, user: models.User, kind: str, req) -> JSONResponse:
+def _require_held_datasets(db: Session, user: models.User, req) -> None:
     # A request may name only datasets this user holds (fetched by them).
     for dataset_id in getattr(req, "dataset_ids", None) or ():
         if dataset_registry.get_for_user(db, user.id, dataset_id) is None:
             raise HTTPException(404, f"Dataset not found: {dataset_id}")
+
+
+def _queue_research(db: Session, user: models.User, kind: str, req) -> JSONResponse:
+    _require_held_datasets(db, user, req)
     return _queue_job(db, user, kind, req.model_dump())
 
 
@@ -2091,6 +2095,27 @@ def tag_strategy(version_id: str, req: schemas.StrategyTagRequest,
     security_service.write_audit_log(db, user.id, "STRATEGY_TAGGED", "strategy_version", version_id,
                                      {"label": req.label})
     return strategy_registry.view(strategy_registry.held(db, user.id, version_id))
+
+
+@app.post("/api/research/strategy-backtest", status_code=202)
+def strategy_backtest(req: schemas.StrategyBacktestRequest,
+                      user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """Queue a backtest of one of the caller's strategy versions, named by its
+    id or one of their tags: the event engine runs its spec on its universe's
+    prices over the trailing period. A tag is resolved now, so the job runs
+    the version the tag names when it is queued. The run counts as a trial in
+    the template's family on those symbols (the family moving-average
+    backtests of the same symbols count in), and the result reports its
+    Sharpe ratio, number of returns and return-series id, which are recorded
+    with the trial."""
+    version = strategy_registry.resolve(db, user.id, req.strategy)
+    if version is None:
+        raise HTTPException(404, "Strategy version not found")
+    _require_held_datasets(db, user, req)
+    job = schemas.StrategyBacktestJob(strategy_version_id=version.version_id, period=req.period,
+                                      initial_capital=req.initial_capital, dataset_ids=req.dataset_ids)
+    return _queue_job(db, user, "strategy_backtest", job.model_dump())
 
 
 @app.get("/api/research/jobs")

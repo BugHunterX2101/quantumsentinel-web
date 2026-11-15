@@ -10,11 +10,16 @@ wrote the same spec.
 A tag is a user's own name for a version they hold, such as ``1.2.0``. It is
 an alias for reading: it belongs to that user, always names the version it
 was first given to, and means nothing to any gate.
+
+The research worker runs a strategy backtest job with two functions here:
+``backtest_inputs`` loads the version's spec before the job process starts,
+and ``finalize_backtest_job`` accepts the result and records its evaluation.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -29,6 +34,7 @@ from . import strategy_spec
 from .strategy_spec import STRATEGY_VERSION_ID, StrategySpec
 
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+log = logging.getLogger(__name__)
 
 
 class StrategyRegistryError(ValueError):
@@ -173,3 +179,68 @@ def resolve(db: Session, user_id: str, ref: str) -> models.StrategyVersion | Non
         return get_for_user(db, user_id, ref)
     found = db.get(models.UserStrategyTag, (user_id, ref)) if LABEL.fullmatch(ref) else None
     return get_for_user(db, user_id, found.version_id) if found else None
+
+
+# --------------------------------------------------------------------------
+# Strategy backtest jobs (research_jobs.KINDS["strategy_backtest"]), run by
+# the research worker
+# --------------------------------------------------------------------------
+
+def _job_version(db: Session, job: models.ResearchJob) -> models.StrategyVersion:
+    from .research_tasks import TaskError
+
+    version_id = (job.params_json or {}).get("strategy_version_id")
+    version = get_for_user(db, job.user_id, version_id) if isinstance(version_id, str) else None
+    if version is None:
+        raise TaskError(404, "Strategy version not found")
+    return version
+
+
+def backtest_inputs(db: Session, job: models.ResearchJob) -> dict:
+    """What a strategy backtest's job process is given: the spec of the
+    version the job names, which the job's user must hold, as today's DSL
+    code reads it (``spec_of``). The job's params only name the version, so a
+    task never runs a spec the API did not resolve for that user."""
+    from .research_tasks import TaskError
+
+    try:
+        spec = spec_of(_job_version(db, job))
+    except StrategyRegistryError as exc:
+        raise TaskError(422, str(exc)) from exc
+    return {"spec": json.loads(strategy_spec.canonical(spec))}
+
+
+def finalize_backtest_job(db: Session, job: models.ResearchJob, result: dict, audit: dict):
+    """Accept a strategy backtest's result, after the worker has accepted the
+    market data it read (dataset_registry.record_market_data): every dataset
+    that supplied its prices must be of the version's family (the spec's
+    ``universe.family`` selects the data), and what it measured is recorded
+    as an evaluation of its trial (research_trials.record_evaluation), in
+    the transaction that stores the result."""
+    from .. import schemas
+    from . import research_trials
+    from .research_tasks import TaskError, strategy_trial_config
+
+    version = _job_version(db, job)
+    datasets = list(result["market_data"]["datasets"])
+    families = sorted(set(db.execute(select(models.DatasetVersion.family).where(
+        models.DatasetVersion.dataset_id.in_(datasets))).scalars()))
+    if families != [version.family]:
+        raise TaskError(422, f"The strategy trades {version.family} data, but its prices came from "
+                             f"{', '.join(families) or 'no'} datasets")
+    try:
+        spec = spec_of(version)
+    except StrategyRegistryError as exc:
+        raise TaskError(422, str(exc)) from exc
+    family = research_trials.family_hash(spec.signal.template, spec.universe.symbols)
+    if result.get("trial_family") != family:
+        raise TaskError(500, "The research job recorded its trial in another family")
+    try:
+        research_trials.record_evaluation(
+            db, job_id=job.id, user_id=job.user_id, family=family,
+            config=strategy_trial_config(schemas.StrategyBacktestJob.model_validate(job.params_json)),
+            strategy_version_id=version.version_id, metrics=result["evaluation"], dataset_ids=datasets)
+    except (KeyError, TypeError, ValueError) as exc:
+        log.error("strategy backtest job %s: its evaluation was refused: %s", job.id, exc)
+        raise TaskError(500, "The research job reported an invalid evaluation") from exc
+    return result, ("strategy_version", version.version_id), audit

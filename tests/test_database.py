@@ -62,7 +62,8 @@ class TestMigrations:
             conn.execute(text("DROP TABLE user_datasets, dataset_versions"))
             # And revision 0005 this one.
             conn.execute(text("DROP TABLE dataset_holdouts"))
-            # And revision 0006 these.
+            # And revision 0007 this one; then 0006's.
+            conn.execute(text("DROP TABLE research_trial_evaluations"))
             conn.execute(text("DROP TABLE user_strategy_tags, user_strategy_versions, strategy_versions"))
             conn.execute(text("INSERT INTO users (id, email, password_hash) VALUES ('u1', 'old@example.com', 'h')"))
             conn.execute(text("INSERT INTO trades (id, user_id, asset, side, quantity, status) "

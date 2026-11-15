@@ -585,9 +585,13 @@ def run_event_backtest(
 
                 fill = cost_model.compute_fill(order, mkt, daily_vol)
 
-                # Check leverage constraint
-                # Enforce the post-trade gross exposure, not merely the
-                # pre-trade account state.
+                # Check leverage constraint: the post-trade gross exposure,
+                # not merely the pre-trade account state. An order that would
+                # take it past the limit keeps only its reducing part: it moves
+                # the position toward zero and never past it. A close (after a
+                # gap, or after prices have carried the book past the limit)
+                # executes; the opposite position of a flip is not opened; an
+                # order that only opens or adds is skipped.
                 equity = max(portfolio.equity_curve[-1], 1e-9)
                 projected_notional = sum(
                     abs(position + (fill.quantity if ticker == order.ticker else 0.0))
@@ -598,7 +602,21 @@ def run_event_backtest(
                     projected_notional += abs(fill.quantity) * current_prices.get(order.ticker, 0.0)
                 projected_gross = projected_notional / equity
                 if projected_gross > portfolio.leverage_limit + 1e-9:
-                    continue  # skip order — over leverage limit
+                    current_pos = portfolio.positions.get(order.ticker, 0.0)
+                    if current_pos * fill.quantity >= 0:
+                        continue  # opens or adds: skip, over leverage limit
+                    if abs(fill.quantity) > abs(current_pos):
+                        # A flip: close the position, open nothing. As in the
+                        # short-selling cap below, the fill is recomputed for
+                        # the capped size.
+                        capped_order = OrderEvent(
+                            timestamp=order.timestamp,
+                            ticker=order.ticker,
+                            quantity=-current_pos,
+                            order_type=order.order_type,
+                            limit_price=order.limit_price,
+                        )
+                        fill = cost_model.compute_fill(capped_order, mkt, daily_vol)
 
                 # Check short selling constraint
                 if fill.quantity < 0 and not portfolio.allow_short:

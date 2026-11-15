@@ -185,3 +185,78 @@ def test_a_signal_repeated_every_bar_enters_once(run, monkeypatch):
     _, pf = run({"A": np.full(20, 100.0)}, strategy_name="ma_crossover",
                 strategy_params={"fraction": 0.1})
     assert fills(pf, "A") == [pytest.approx(100.0)]
+
+
+def _scripted(signals: dict[tuple[int, str], int]):
+    """A strategy that emits exactly ``signals[(bar, ticker)]`` and nothing else."""
+    class Scripted(es.BaseStrategy):
+        def __init__(self, **_):
+            pass
+
+        def on_market(self, event, portfolio, history):
+            direction = signals.get((event.timestamp, event.ticker))
+            if direction is None:
+                return []
+            return [es.SignalEvent(timestamp=event.timestamp, ticker=event.ticker,
+                                   signal_strength=1.0, suggested_direction=direction)]
+    return Scripted
+
+
+def test_a_long_only_exit_filled_on_a_gap_up_is_executed(run, monkeypatch):
+    # Long 500 at 100 (half of 100,000). The exit signal comes at 50, where
+    # equity is 75,000, so the sell is sized for a 750-share short. It fills on
+    # a gap up to 160: as sized it would leave 1.6x gross, but without
+    # shorting it only flattens, and a flatten must not be refused.
+    monkeypatch.setattr(es, "MACrossoverStrategy", _scripted({(5, "A"): 1, (8, "A"): -1}))
+    prices = np.array([100.0] * 7 + [80.0, 50.0, 160.0, 150.0, 150.0])
+    _, pf = run({"A": prices}, strategy_name="ma_crossover", strategy_params={"fraction": 0.5})
+    assert fills(pf, "A") == [pytest.approx(500.0), pytest.approx(-500.0)]
+    assert held(pf) == {}
+
+
+# A and B bought at 100 with 30% of equity each (gross 0.6, limit 0.65); then
+# A collapses to 10 and B climbs to 300. Equity is 133,000 and B alone is
+# 90,000 of it: 0.68 gross, past the limit through price drift alone.
+DRIFT = {
+    "A": np.array([100.0] * 7 + [10.0] * 5),
+    "B": np.array([100.0] * 7 + [300.0] * 5),
+}
+
+
+def test_a_close_executes_when_the_rest_of_the_book_has_drifted_past_the_limit(run, monkeypatch):
+    monkeypatch.setattr(es, "MACrossoverStrategy",
+                        _scripted({(5, "A"): 1, (5, "B"): 1, (8, "A"): 0}))
+    _, pf = run(DRIFT, strategy_name="ma_crossover",
+                strategy_params={"fraction": 0.3, "leverage_limit": 0.65})
+    assert fills(pf, "A") == [pytest.approx(300.0), pytest.approx(-300.0)]
+    assert held(pf) == {"B": pytest.approx(300.0)}
+
+
+def test_a_flip_over_the_limit_closes_and_opens_nothing(run, monkeypatch):
+    # A, B and C bought at 100 with 20% each (gross 0.6, limit 0.65); B climbs
+    # to 500 and C to 300. Equity is 220,000 and gross 0.82. A reverse signal
+    # on C sizes a 44,000 short, smaller than the 60,000 long it replaces, so
+    # the flip would lower gross exposure, yet leave it at 0.75: past the
+    # limit. Only the reducing part executes: C is closed and no short opens.
+    prices = {
+        "A": np.full(12, 100.0),
+        "B": np.array([100.0] * 7 + [500.0] * 5),
+        "C": np.array([100.0] * 7 + [300.0] * 5),
+    }
+    monkeypatch.setattr(es, "MACrossoverStrategy",
+                        _scripted({**{(5, t): 1 for t in "ABC"}, (8, "C"): -1}))
+    _, pf = run(prices, strategy_name="ma_crossover", allow_short=True,
+                strategy_params={"fraction": 0.2, "leverage_limit": 0.65})
+    assert fills(pf, "C") == [pytest.approx(200.0), pytest.approx(-200.0)]
+    assert held(pf) == {"A": pytest.approx(200.0), "B": pytest.approx(200.0)}
+
+
+def test_an_order_that_raises_gross_exposure_past_the_limit_is_still_refused(run, monkeypatch):
+    # The third 30% position would take gross exposure to 0.9 against 0.65.
+    three = {t: np.full(10, 100.0) for t in "ABC"}
+    monkeypatch.setattr(es, "MACrossoverStrategy",
+                        _scripted({(5, t): 1 for t in "ABC"}))
+    _, pf = run(three, strategy_name="ma_crossover",
+                strategy_params={"fraction": 0.3, "leverage_limit": 0.65})
+    assert held(pf) == {"A": pytest.approx(300.0), "B": pytest.approx(300.0)}
+    assert fills(pf, "C") == []

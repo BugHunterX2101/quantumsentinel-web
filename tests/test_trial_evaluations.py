@@ -199,6 +199,26 @@ def test_a_backtest_runs_the_version_and_records_its_trial_and_evaluation(db, ma
     assert audit.metadata_json["datasets"] == row.dataset_ids
 
 
+def test_a_backtest_reports_its_risk_and_what_the_policys_risk_gate_says_of_it(db, market):
+    """The run measures its drawdown and largest position (unrounded) and
+    reports the validation policy's risk gate on them."""
+    from backend.services import validation_policy
+    user = make_user(db)
+    capped = strategy(**{"risk_limits.max_drawdown_bps": 2_500, "risk_limits.max_position_bps": 2_500})
+    for value, declared_ok in ((capped, True), (strategy(), False)):  # strategy() declares 50% positions
+        view = backtest(db, user, register(db, user, value))
+        assert view["status"] == "succeeded", view
+        result = view["result"]
+        risk, check = result["risk"], result["risk_check"]
+        assert check == validation_policy.risk_gate(strategy_spec.parse(value).risk_limits, risk)
+        assert check["policy"] == validation_policy.policy_id(validation_policy.POLICY_V1)
+        assert check["checks"]["declared_position_within_policy"]["passed"] is declared_ok
+        assert check["passed"] is (declared_ok and check["checks"]["drawdown_within_declared"]["passed"])
+        # 2% fixed-fractional positions.
+        assert risk["equity_exhausted"] is False and 0.015 < risk["max_position_share"] < 0.05
+        assert round(-risk["max_drawdown"], 4) == result["max_drawdown"]
+
+
 def test_the_same_run_on_the_same_data_reproduces_its_evaluation_as_the_same_trial(db, market):
     """A rerun on the datasets the first run snapshotted is the same trial
     (the count stays 1) and a second evaluation with the same measurements;

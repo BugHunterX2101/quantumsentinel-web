@@ -460,6 +460,7 @@ def run_event_backtest(
     sizing_method: str = "fixed_fractional",
     *,
     full_returns: bool = False,
+    risk_metrics: bool = False,
 ) -> dict:
     """Run the event-driven backtester.
 
@@ -476,6 +477,18 @@ def run_event_backtest(
     full_returns : also return ``returns``, every bar's return unrounded (an
         array; ``daily_returns`` keeps the last 504, rounded, for display).
         It is the series ``sharpe_ratio`` and the other statistics come from.
+    risk_metrics : also return ``risk``, what a risk gate checks against a
+        strategy's declared limits, unrounded, over every bar:
+        ``max_drawdown``, the largest fall of equity from its running peak
+        as a fraction of that peak; above 1 once equity is negative. ``max_position_share``, the largest
+        single position's absolute market value as a fraction of equity,
+        valued at each bar's price both before and after that bar's fills
+        (an order fills at its bar's price, so a position the bar closes is
+        held at that price until it is sold), wherever equity is positive.
+        ``equity_exhausted``, whether equity was ever zero or negative at
+        either of those points (a share of non-positive equity has no
+        meaning, so such points count here instead). Fills never raise
+        equity, so the drawdown needs only the marks after them.
     """
     params = strategy_params or {}
 
@@ -526,6 +539,14 @@ def run_event_backtest(
 
     # Pending orders (1-bar delay)
     pending_orders: list[OrderEvent] = []
+    exposure = {"max_position_share": 0.0, "equity_exhausted": False}
+
+    def measure_exposure(prices: dict[str, float], equity: float) -> None:
+        if equity <= 0:
+            exposure["equity_exhausted"] = True
+            return
+        largest = max((abs(q) * prices.get(t, 0.0) for t, q in portfolio.positions.items()), default=0.0)
+        exposure["max_position_share"] = max(exposure["max_position_share"], largest / equity)
 
     # ── Main event loop ──
     for bar in range(T):
@@ -536,6 +557,12 @@ def run_event_backtest(
         # Existing short positions accrue borrow before any new fills. A new
         # short's first day is charged by its FillEvent below.
         portfolio.accrue_borrow(current_prices, cost_model.borrow_rate_annual)
+
+        # Orders fill at this bar's price, so a position this bar closes is
+        # held at that price until the moment it is sold: measure it then.
+        if risk_metrics:
+            measure_exposure(current_prices, portfolio.cash + sum(
+                q * current_prices.get(t, 0.0) for t, q in portfolio.positions.items()))
 
         # ── 1. Fill pending orders at this bar's open ──
         if bar > 0 and pending_orders:
@@ -657,7 +684,9 @@ def run_event_backtest(
             ))
 
         # ── 5. Mark to market ──
-        portfolio.update_equity(current_prices)
+        marked = portfolio.update_equity(current_prices)
+        if risk_metrics:
+            measure_exposure(current_prices, marked)
 
     # ── Compute performance ──
     equity_curve = np.array(portfolio.equity_curve)
@@ -717,4 +746,11 @@ def run_event_backtest(
     }
     if full_returns:
         result["returns"] = returns_arr.copy()
+    if risk_metrics:
+        # The curve starts with the initial capital, then one mark per bar.
+        result["risk"] = {
+            "max_drawdown": float(np.max(1.0 - equity_curve / np.maximum.accumulate(equity_curve))),
+            "max_position_share": float(exposure["max_position_share"]),
+            "equity_exhausted": bool(exposure["equity_exhausted"]),
+        }
     return result

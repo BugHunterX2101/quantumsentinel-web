@@ -222,16 +222,16 @@ class CompiledStrategy:
     engine_kwargs: Mapping[str, Any]
 
     def run(self, price_data: Mapping[str, np.ndarray], initial_capital: float, *,
-            full_returns: bool = False) -> dict:
+            full_returns: bool = False, risk_metrics: bool = False) -> dict:
         """Backtest on date-aligned close arrays, one per universe symbol
-        (``full_returns``: see run_event_backtest)."""
+        (``full_returns``, ``risk_metrics``: see run_event_backtest)."""
         missing = sorted(set(self.tickers) - set(price_data))
         if missing:
             raise StrategySpecError(f"no prices for {', '.join(missing)}")
         return run_event_backtest(tickers=list(self.tickers),
                                   price_data={t: price_data[t] for t in self.tickers},
                                   initial_capital=initial_capital, full_returns=full_returns,
-                                  **self.engine_kwargs)
+                                  risk_metrics=risk_metrics, **self.engine_kwargs)
 
 
 def _signal_params(signal) -> dict:

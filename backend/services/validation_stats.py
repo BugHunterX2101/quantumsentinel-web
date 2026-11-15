@@ -37,9 +37,15 @@ the typeset papers):
   ratio of Harvey and Liu, "Backtesting", Journal of Portfolio Management,
   Fall 2015.
 
-The deflated Sharpe ratio with an empirical trial variance and the number of
-effectively independent trials (ONC clustering) are a separate change. The
-columns these functions take are a trial matrix's (``trial_matrix.build``):
+* ``deflated_sharpe`` (and ``deflated_sharpe_ratio``, ``probabilistic_sharpe``,
+  ``moments``, ``implied_trials``): the deflated Sharpe ratio of Bailey and
+  López de Prado, "The Deflated Sharpe Ratio: Correcting for Selection Bias,
+  Backtest Overfitting and Non-Normality", Journal of Portfolio Management
+  40(5), 2014, eq. (1) and (2), with the number of effectively independent
+  trials implied by the trials' average correlation (its Appendix A.3,
+  eq. 8 and 9).
+
+The columns these functions take are a trial matrix's (``trial_matrix.build``):
 Python integers, oldest session first.
 
 Cost. ``pbo_cscv`` is pure Python over C(S, S/2) combinations (12,870 at the
@@ -363,3 +369,188 @@ def pbo_cscv(columns: Sequence[Sequence[int]], n_splits: int = 16) -> dict:
     return {"n_splits": splits, "rows": rows, "rows_used": block * splits, "rows_dropped": dropped,
             "strategies": n_strategies, "combinations": len(chosen), "overfit": overfit,
             "pbo": overfit / len(chosen)}
+
+
+# --------------------------------------------------------------------------
+# Deflated Sharpe ratio
+# --------------------------------------------------------------------------
+
+def moments(column) -> dict:
+    """The skewness and the kurtosis of a return series given as quanta, as
+    the moments of its sessions: m3 / m2^(3/2) and m4 / m2^2, m_k the k-th
+    central moment with divisor n (scipy's ``skew`` and
+    ``kurtosis(fisher=False)`` with their default bias=True). The kurtosis is
+    plain, not excess: 3 for normal returns, as the deflated Sharpe ratio's
+    eq. (2) takes it. Both come from exact integer power sums, so they are
+    the same on every platform; a constant series has neither."""
+    values = _quanta(column)
+    n = len(values)
+    if n < 2:
+        raise StatsError("moments need at least two sessions")
+    s1 = sum(values)
+    s2 = sum(v * v for v in values)
+    s3 = sum(v * v * v for v in values)
+    s4 = sum(v * v * v * v for v in values)
+    dispersion = _dispersion(n, s1, s2)  # n^2 m2
+    if dispersion == 0:
+        raise StatsError("a constant series has no skewness or kurtosis")
+    third = n * n * s3 - 3 * n * s1 * s2 + 2 * s1 ** 3  # n^3 m3
+    fourth = n ** 3 * s4 - 4 * n * n * s1 * s3 + 6 * n * s1 * s1 * s2 - 3 * s1 ** 4  # n^4 m4
+    return {"skewness": third / dispersion / math.sqrt(dispersion),
+            "kurtosis": fourth / (dispersion * dispersion)}
+
+
+def _expected_max_real(n_trials: float) -> float:
+    """``expected_max`` for a real number of trials N >= 1, as an implied
+    number of independent trials is. As N falls towards 1 the large-N
+    approximation falls to minus infinity, where the true value is 0; the
+    expected maximum of draws with mean 0 is never negative, so the
+    approximation is floored at 0 (and N = 1 gives 0, as ``expected_max``).
+    For integer N >= 2 it equals ``expected_max``."""
+    n = _finite(n_trials, "the number of trials")
+    if n < 1:
+        raise StatsError("the number of trials must be at least 1")
+    if n == 1:
+        return 0.0
+    inv = NormalDist().inv_cdf
+    return max(0.0, (1 - EULER_GAMMA) * inv(1 - 1 / n) + EULER_GAMMA * inv(1 - 1 / (n * math.e)))
+
+
+def probabilistic_sharpe(sharpe_per_period: float, benchmark: float, n_obs: int,
+                         skewness: float, kurtosis: float) -> float:
+    """The probability that the true Sharpe ratio exceeds ``benchmark``,
+    given an estimate over ``n_obs`` sessions with that skewness and plain
+    kurtosis (Deflated Sharpe Ratio, eq. 2):
+
+        Z[(SR - SR*) sqrt(T - 1) / sqrt(1 - g3 SR + (g4 - 1) / 4 SR^2)].
+
+    The square root's argument is positive for the moments of any sample
+    (g4 >= g3^2 + 1); moments that make it zero or negative are refused."""
+    sr = _finite(sharpe_per_period, "the Sharpe ratio")
+    sr0 = _finite(benchmark, "the benchmark Sharpe ratio")
+    n = _count(n_obs, "the number of sessions", 2)
+    g3, g4 = _finite(skewness, "the skewness"), _finite(kurtosis, "the kurtosis")
+    spread = 1 - g3 * sr + (g4 - 1) / 4 * sr * sr
+    if not spread > 0:
+        raise StatsError("these moments give the Sharpe ratio's estimate no variance")
+    return NormalDist().cdf((sr - sr0) * math.sqrt(n - 1) / math.sqrt(spread))
+
+
+def deflated_sharpe_ratio(sharpe_per_period: float, n_obs: int, n_trials: float, variance: float,
+                          skewness: float, kurtosis: float) -> dict:
+    """The deflated Sharpe ratio (Deflated Sharpe Ratio, eq. 1 and 2): the
+    probabilistic Sharpe ratio against SR0, the Sharpe ratio expected of the
+    best of ``n_trials`` skill-less trials whose Sharpe ratios have
+    ``variance`` V across trials,
+
+        SR0 = sqrt(V) ((1 - gamma) Z^-1(1 - 1/N) + gamma Z^-1(1 - 1/(N e))).
+
+    ``n_trials`` may be fractional (an implied number of trials)."""
+    v = _finite(variance, "the variance of the trials' Sharpe ratios")
+    if v <= 0:
+        raise StatsError("the variance of the trials' Sharpe ratios must be positive")
+    sr0 = math.sqrt(v) * _expected_max_real(n_trials)
+    dsr = probabilistic_sharpe(sharpe_per_period, sr0, n_obs, skewness, kurtosis)
+    return {"sharpe": float(sharpe_per_period), "n_obs": n_obs, "n_trials": float(n_trials),
+            "variance": v, "skewness": float(skewness), "kurtosis": float(kurtosis),
+            "benchmark_sharpe": sr0, "dsr": dsr}
+
+
+def _distinct_columns(columns) -> list[list[int]]:
+    if isinstance(columns, (str, bytes)) or not isinstance(columns, Sequence):
+        raise StatsError("the trials' return series are a sequence of columns")
+    series = [_quanta(column) for column in columns]
+    if not series:
+        raise StatsError("there are no return series")
+    rows = len(series[0])
+    if any(len(column) != rows for column in series):
+        raise StatsError("every trial needs a return for every session")
+    if len({tuple(column) for column in series}) != len(series):
+        raise StatsError("the columns must be distinct: a matrix stores each return series once")
+    return series
+
+
+def implied_trials(columns: Sequence[Sequence[int]], n_trials: int) -> dict:
+    """The number of effectively independent trials implied by the average
+    correlation of the trials' return series (Deflated Sharpe Ratio,
+    Appendix A.3): rho is the mean of the correlations between distinct
+    columns (eq. 8) and N = rho + (1 - rho) M (eq. 9), M = ``n_trials``.
+
+    The correlations are those of the distinct columns only: versions that
+    share a column are counted in M but add no correlation of 1, so they do
+    not pull N down. N falls to 1 as rho rises to 1, and exceeds M when rho
+    is negative; it is not capped, a larger N being the stricter. The
+    correlations come from exact integer sums; each is clamped to [-1, 1],
+    which rounding can overstep by an ulp (a column and 13 times it plus a
+    constant give 1.0000000000000002). With the clamp rho <= 1 and, rounding
+    being monotone, N >= 1 holds in floating point too. A constant column
+    has no correlation and is refused, as are fewer than two columns."""
+    series = _distinct_columns(columns)
+    m = _count(n_trials, "the number of trials", 1)
+    k = len(series)
+    if k < 2:
+        raise StatsError("an average correlation needs at least two distinct return series")
+    if m < k:
+        raise StatsError(f"{m} trials cannot have {k} distinct return series")
+    n = len(series[0])
+    if n < 2:
+        raise StatsError("a correlation needs at least two sessions")
+    totals = [sum(column) for column in series]
+    dispersions = [_dispersion(n, totals[i], sum(v * v for v in series[i])) for i in range(k)]
+    if any(d == 0 for d in dispersions):
+        raise StatsError("a constant return series has no correlation")
+    pairs = 0.0
+    for i, j in combinations(range(k), 2):
+        cross = n * sum(a * b for a, b in zip(series[i], series[j])) - totals[i] * totals[j]
+        pairs += max(-1.0, min(1.0, cross / math.sqrt(dispersions[i] * dispersions[j])))
+    rho = 2 * pairs / (k * (k - 1))
+    return {"distinct_series": k, "n_trials": m, "average_correlation": rho,
+            "implied_trials": rho + (1 - rho) * m}
+
+
+def deflated_sharpe(columns: Sequence[Sequence[int]], candidate: int, n_trials: int,
+                    every_trial_evaluated: bool) -> dict:
+    """The deflated Sharpe ratio of the trial matrix column ``candidate``
+    (its index in ``columns``, the matrix's distinct return series), chosen
+    among ``n_trials`` trials: the family's ledger count, in which every
+    strategy version is counted, those that share a column included.
+
+    * The number of trials is the one implied by the columns' average
+      correlation (``implied_trials``) when every trial in the ledger has a
+      column (``every_trial_evaluated``, from the matrix's ``ledger``).
+      Otherwise the trials without one are unknown and the raw ledger count
+      is used, as it is when there is a single distinct column.
+    * The variance of the trials' Sharpe ratios is V = max(V_null, V_emp).
+      V_emp is the sample variance (ddof=1) of the distinct columns'
+      per-period Sharpe ratios. V_null = 1 / (T - 1) is the variance of a
+      Sharpe ratio's estimate over T sessions when the true ratio is 0
+      (eq. 2's denominator at SR = 0): the dispersion skill-less trials show
+      by chance alone. The floor keeps a family of near-identical variants
+      from deflating nothing. With one distinct column V = V_null.
+    * The candidate's Sharpe ratio is ``sharpe`` of its column (ddof=1); its
+      skewness and plain kurtosis are ``moments``.
+    """
+    series = _distinct_columns(columns)
+    if isinstance(candidate, bool) or not isinstance(candidate, int) or not 0 <= candidate < len(series):
+        raise StatsError("the candidate is the index of one of the columns")
+    if not isinstance(every_trial_evaluated, bool):
+        raise StatsError("every_trial_evaluated must be true or false")
+    m = _count(n_trials, "the number of trials", 1)
+    k = len(series)
+    if m < k:
+        raise StatsError(f"{m} trials cannot have {k} distinct return series")
+    sessions = len(series[0])
+    sharpes = [sharpe(column) for column in series]
+    v_null = 1 / (sessions - 1)
+    v_emp = float(np.var(sharpes, ddof=1)) if k > 1 else None
+    if every_trial_evaluated and k > 1:
+        implied = implied_trials(series, m)
+        used, source, rho = implied["implied_trials"], "implied", implied["average_correlation"]
+    else:
+        used, source, rho = float(m), "ledger", None
+    shape = moments(series[candidate])
+    variance = v_null if v_emp is None else max(v_null, v_emp)
+    result = deflated_sharpe_ratio(sharpes[candidate], sessions, used, variance,
+                                   shape["skewness"], shape["kurtosis"])
+    return {**result, "ledger_trials": m, "distinct_series": k, "n_trials_source": source,
+            "average_correlation": rho, "variance_null": v_null, "variance_empirical": v_emp}

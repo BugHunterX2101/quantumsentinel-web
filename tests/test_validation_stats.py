@@ -498,3 +498,364 @@ def test_the_statistics_read_a_trial_matrix_as_trial_matrix_builds_it():
 def test_pbo_refuses_what_it_cannot_judge(columns, splits, reason):
     with pytest.raises(StatsError, match=reason):
         vs.pbo_cscv(columns, splits)
+
+
+# --------------------------------------------------------------------------
+# Deflated Sharpe ratio (Bailey and López de Prado 2014)
+# --------------------------------------------------------------------------
+
+# The paper's worked example. Its typeset symbols did not survive text
+# extraction, so its inputs were reconstructed (an annual Sharpe ratio of 2.5
+# over five years of 250 sessions, a variance of the trials' annual Sharpe
+# ratios of 0.5, skewness -3, kurtosis 10) and confirmed by reproducing all
+# three of its published outcomes: SR0 0.1132 and a DSR of about 90% for 100
+# trials; 0.9505 for 46 trials; and, for normal returns, 88 trials as the most
+# that keep the DSR at 95%.
+PAPER = {"sharpe_per_period": 2.5 / math.sqrt(250), "n_obs": 1250, "variance": 0.5 / 250,
+         "skewness": -3.0, "kurtosis": 10.0}
+
+
+def test_the_papers_example_with_100_trials():
+    result = vs.deflated_sharpe_ratio(n_trials=100, **PAPER)
+    assert result["benchmark_sharpe"] == pytest.approx(0.113172, abs=1e-6)
+    assert result["dsr"] == pytest.approx(0.900397, abs=1e-6)
+
+
+def test_the_papers_example_with_46_trials():
+    """The kurtosis is plain (3 for normal returns): taking the paper's 10
+    as excess kurtosis would give 0.9495, not the published 0.9505."""
+    assert vs.deflated_sharpe_ratio(n_trials=46, **PAPER)["dsr"] == pytest.approx(0.950502, abs=1e-6)
+    misread = vs.deflated_sharpe_ratio(n_trials=46, **{**PAPER, "kurtosis": 13.0})["dsr"]
+    assert misread == pytest.approx(0.949469, abs=1e-6)
+
+
+def test_with_normal_returns_88_trials_are_the_most_that_keep_95_percent():
+    normal = {**PAPER, "skewness": 0.0, "kurtosis": 3.0}
+    assert vs.deflated_sharpe_ratio(n_trials=88, **normal)["dsr"] >= 0.95
+    assert vs.deflated_sharpe_ratio(n_trials=89, **normal)["dsr"] < 0.95
+
+
+def test_the_dsr_is_eq_2_written_out_with_scipy():
+    from scipy.stats import norm
+
+    for n_trials, skew, kurt in [(3, 0.4, 5.0), (17.5, -1.2, 9.0), (250, 0.0, 3.0)]:
+        sr, t, v = 0.07, 600, 0.0011
+        emax = (1 - vs.EULER_GAMMA) * norm.ppf(1 - 1 / n_trials) + vs.EULER_GAMMA * norm.ppf(1 - 1 / (n_trials * math.e))
+        sr0 = math.sqrt(v) * emax
+        z = (sr - sr0) * math.sqrt(t - 1) / math.sqrt(1 - skew * sr + (kurt - 1) / 4 * sr * sr)
+        result = vs.deflated_sharpe_ratio(sr, t, n_trials, v, skew, kurt)
+        assert result["benchmark_sharpe"] == pytest.approx(sr0, rel=1e-9)
+        assert result["dsr"] == pytest.approx(norm.cdf(z), rel=1e-9)
+
+
+def test_the_probabilistic_sharpe_ratio_is_one_half_at_its_benchmark():
+    assert vs.probabilistic_sharpe(0.05, 0.05, 500, -0.5, 6.0) == pytest.approx(0.5, abs=1e-15)
+    assert vs.probabilistic_sharpe(0.06, 0.05, 500, -0.5, 6.0) > 0.5 > vs.probabilistic_sharpe(0.04, 0.05, 500, -0.5, 6.0)
+
+
+def test_negative_skew_and_fat_tails_lower_the_probabilistic_sharpe_ratio():
+    base = vs.probabilistic_sharpe(0.08, 0.02, 400, 0.0, 3.0)
+    assert vs.probabilistic_sharpe(0.08, 0.02, 400, -1.0, 3.0) < base
+    assert vs.probabilistic_sharpe(0.08, 0.02, 400, 0.0, 12.0) < base
+
+
+def test_the_real_valued_expected_maximum_matches_the_integer_one():
+    for n in [2, 3, 10, 46, 100, 1000]:
+        assert vs._expected_max_real(n) == vs.expected_max(n)
+        assert vs._expected_max_real(float(n)) == vs.expected_max(n)
+    assert vs._expected_max_real(1) == vs._expected_max_real(1.0) == 0.0
+
+
+def test_the_real_valued_expected_maximum_is_floored_at_zero_near_one():
+    """The approximation falls to minus infinity as N approaches 1 (it is
+    negative below about N = 1.28); the true expected maximum is never
+    negative, and grows with N."""
+    inv = NormalDist().inv_cdf
+    raw = (1 - vs.EULER_GAMMA) * inv(1 - 1 / 1.1) + vs.EULER_GAMMA * inv(1 - 1 / (1.1 * math.e))
+    assert raw < 0
+    assert vs._expected_max_real(1.1) == 0.0
+    assert vs._expected_max_real(1.000001) == 0.0
+    grid = [1.0, 1.1, 1.3, 1.5, 2.0, 2.5, 7.25, 40.0]
+    values = [vs._expected_max_real(n) for n in grid]
+    assert values == sorted(values) and values[2] > 0
+
+
+@pytest.mark.parametrize("n_trials,reason", [
+    (0.99, "at least 1"), (0, "at least 1"), (-3, "at least 1"),
+    (math.nan, "finite"), (math.inf, "finite"), (True, "finite"), ("5", "finite"),
+])
+def test_the_real_valued_expected_maximum_refuses_what_is_not_a_count(n_trials, reason):
+    with pytest.raises(StatsError, match=reason):
+        vs._expected_max_real(n_trials)
+
+
+@pytest.mark.parametrize("kwargs,reason", [
+    ({"skewness": 2.0, "kurtosis": 1.0}, "no variance"),  # 1 - 2 SR + 0 at SR = 0.5: 0
+    ({"skewness": 3.0, "kurtosis": 1.0}, "no variance"),
+    ({"skewness": math.nan}, "skewness"),
+    ({"kurtosis": math.inf}, "kurtosis"),
+    ({"n_obs": 1}, "number of sessions"),
+    ({"n_obs": 12.0}, "number of sessions"),
+    ({"sharpe_per_period": math.nan}, "Sharpe ratio"),
+    ({"benchmark": math.inf}, "benchmark"),
+])
+def test_the_probabilistic_sharpe_ratio_refuses_what_it_cannot_judge(kwargs, reason):
+    args = {"sharpe_per_period": 0.5, "benchmark": 0.1, "n_obs": 100, "skewness": 0.0, "kurtosis": 3.0, **kwargs}
+    with pytest.raises(StatsError, match=reason):
+        vs.probabilistic_sharpe(**args)
+
+
+@pytest.mark.parametrize("variance", [0.0, -0.001, math.nan, True])
+def test_the_dsr_refuses_a_variance_that_is_not_positive(variance):
+    with pytest.raises(StatsError, match="variance"):
+        vs.deflated_sharpe_ratio(**{**PAPER, "variance": variance}, n_trials=10)
+
+
+def test_moments_are_scipys_skew_and_plain_kurtosis():
+    from scipy.stats import kurtosis, skew
+
+    rng = np.random.default_rng(11)
+    for sample in [rng.normal(0.0005, 0.01, 750), rng.standard_t(3, 500) * 0.01, rng.lognormal(0, 0.6, 300) * 0.01]:
+        column = [round(r * Q) for r in sample]
+        floats = np.array(column, dtype=float) / Q
+        result = vs.moments(column)
+        assert result["skewness"] == pytest.approx(float(skew(floats)), rel=1e-9, abs=1e-12)
+        assert result["kurtosis"] == pytest.approx(float(kurtosis(floats, fisher=False)), rel=1e-9)
+
+
+def test_normal_returns_have_kurtosis_three_not_zero():
+    rng = np.random.default_rng(5)
+    result = vs.moments([round(r * Q) for r in rng.normal(0, 0.01, 20_000)])
+    assert result["kurtosis"] == pytest.approx(3.0, abs=0.1)
+    assert result["skewness"] == pytest.approx(0.0, abs=0.05)
+
+
+def test_moments_of_a_two_point_series():
+    """Two equally likely values: skewness 0 and kurtosis exactly 1, the least
+    any distribution has."""
+    assert vs.moments([-5, 5, -5, 5]) == {"skewness": 0.0, "kurtosis": 1.0}
+    assert vs.moments([0, 0, 0, 7]) == pytest.approx({"skewness": 2 / math.sqrt(3), "kurtosis": 7 / 3}, rel=1e-15)
+
+
+@pytest.mark.parametrize("column,reason", [
+    ([4], "at least two sessions"), ([3, 3, 3], "constant"), ([1, 2.5, 3], "integer quanta"),
+    ("12", "sequence of integer quanta"),
+])
+def test_moments_refuse_a_series_that_has_none(column, reason):
+    with pytest.raises(StatsError, match=reason):
+        vs.moments(column)
+
+
+def average_correlation(columns):
+    c = np.corrcoef(np.array(columns, dtype=float))
+    k = len(columns)
+    return (c.sum() - np.trace(c)) / (k * (k - 1))
+
+
+def test_implied_trials_are_appendix_a3_written_out_with_numpy():
+    rng = np.random.default_rng(3)
+    common = rng.normal(0, 0.01, 400)
+    columns = [[round((0.6 * common[t] + 0.8 * x) * Q) for t, x in enumerate(rng.normal(0, 0.01, 400))]
+               for _ in range(6)]
+    rho = average_correlation(columns)
+    result = vs.implied_trials(columns, 9)
+    assert result["average_correlation"] == pytest.approx(rho, rel=1e-9)
+    assert result["implied_trials"] == pytest.approx(rho + (1 - rho) * 9, rel=1e-9)
+    assert result["distinct_series"] == 6 and result["n_trials"] == 9
+    assert 0.2 < rho < 0.5
+
+
+def test_perfectly_correlated_series_are_one_trial():
+    base = [3, -1, 4, 1, -5, 9, 2, -6]
+    columns = [base, [2 * q + 7 for q in base], [5 * q - 11 for q in base]]
+    result = vs.implied_trials(columns, 3)
+    assert result["average_correlation"] == 1.0
+    assert result["implied_trials"] == 1.0
+
+
+def test_a_correlation_that_rounds_past_one_is_clamped():
+    """Computed in floating point, the correlation of this column with 13
+    times it plus a constant is 1.0000000000000002; unclamped, the implied
+    number of trials would fall below 1."""
+    x = [-1139023663, 3391358857, 6153210692, -9098250963, -7904671614]
+    y = [13 * q - 70639805 for q in x]
+    n, tx, ty = len(x), sum(x), sum(y)
+    raw = (n * sum(a * b for a, b in zip(x, y)) - tx * ty) / math.sqrt(
+        (n * sum(q * q for q in x) - tx * tx) * (n * sum(q * q for q in y) - ty * ty))
+    assert raw > 1
+    result = vs.implied_trials([x, y], 2)
+    assert result["average_correlation"] == 1.0
+    assert result["implied_trials"] == 1.0
+    # and one that rounds below -1: -3 times a column plus a constant
+    x = [-7241366701, 2283376829, 8992804953, -2826092214, -107107555, 6675120324]
+    result = vs.implied_trials([x, [-3 * q + 12345 for q in x]], 2)
+    assert result["average_correlation"] == -1.0
+    assert result["implied_trials"] == 3.0
+
+
+def test_independent_series_are_about_as_many_trials_as_the_ledger_counts():
+    result = vs.implied_trials(noise(2000, 8, seed=19), 8)
+    assert abs(result["average_correlation"]) < 0.02
+    assert result["implied_trials"] == pytest.approx(8, abs=0.15)
+
+
+def test_negatively_correlated_series_imply_more_trials_than_counted():
+    """N = rho + (1 - rho) M exceeds M when rho < 0; it is not capped at M."""
+    base = [3, -1, 4, 1, -5, 9, 2, -6]
+    result = vs.implied_trials([base, [-q for q in base]], 2)
+    assert result["average_correlation"] == -1.0
+    assert result["implied_trials"] == 3.0
+
+
+def test_versions_sharing_a_column_count_in_m_but_add_no_correlation():
+    """Decision (b): every strategy version is a trial, including versions
+    that differ only in fields the engine does not read and so share a
+    column; the correlation is taken over the distinct columns."""
+    columns = noise(500, 3, seed=23)
+    three, five = vs.implied_trials(columns, 3), vs.implied_trials(columns, 5)
+    rho = three["average_correlation"]
+    assert five["average_correlation"] == rho
+    assert five["implied_trials"] == pytest.approx(rho + (1 - rho) * 5, rel=1e-12)
+    assert five["implied_trials"] > three["implied_trials"]
+
+
+def test_implied_trials_are_the_same_on_every_platform():
+    """Exact integer sums: a golden value, not a tolerance."""
+    result = vs.implied_trials(noise(300, 5, seed=29), 7)
+    assert result["average_correlation"] == -0.025019496644124083
+
+
+@pytest.mark.parametrize("columns,n_trials,reason", [
+    ([[1, 2, 3]], 1, "at least two distinct"),
+    ([], 2, "no return series"),
+    ([[1, 2, 3], [1, 2, 3]], 2, "distinct"),
+    ([[1, 2, 3], [4, 4, 4]], 2, "constant"),
+    ([[1, 2, 3], [3, 1, 2], [2, 3, 1]], 2, "cannot have 3"),
+    ([[1, 2, 3], [3, 1]], 2, "every session"),
+    ([[1], [2]], 2, "two sessions"),
+    ([[1, 2, 3], [3, 1, 2]], 0, "number of trials"),
+    ([[1, 2, 3], [3, 1, 2]], 2.0, "number of trials"),
+    ([[1, 2, 3], [3, 1.5, 2]], 2, "integer quanta"),
+    ("abc", 2, "sequence of columns"),
+])
+def test_implied_trials_refuse_what_they_cannot_judge(columns, n_trials, reason):
+    with pytest.raises(StatsError, match=reason):
+        vs.implied_trials(columns, n_trials)
+
+
+def reference_dsr(columns, candidate, n_trials, every_trial_evaluated):
+    """The deflated Sharpe ratio of a matrix written out with numpy/scipy."""
+    from scipy.stats import kurtosis, norm, skew
+
+    m = np.array(columns, dtype=float) / Q
+    k, t = m.shape
+    sharpes = m.mean(axis=1) / m.std(axis=1, ddof=1)
+    v = max(1 / (t - 1), float(np.var(sharpes, ddof=1)) if k > 1 else 0.0)
+    if every_trial_evaluated and k > 1:
+        rho = average_correlation(columns)
+        n = rho + (1 - rho) * n_trials
+    else:
+        n = n_trials
+    emax = (1 - vs.EULER_GAMMA) * norm.ppf(1 - 1 / n) + vs.EULER_GAMMA * norm.ppf(1 - 1 / (n * math.e))
+    sr, g3, g4 = sharpes[candidate], skew(m[candidate]), kurtosis(m[candidate], fisher=False)
+    z = (sr - math.sqrt(v) * emax) * math.sqrt(t - 1) / math.sqrt(1 - g3 * sr + (g4 - 1) / 4 * sr * sr)
+    return float(norm.cdf(z))
+
+
+def family(rows=500, k=6, seed=31):
+    rng = np.random.default_rng(seed)
+    common = rng.normal(0, 0.01, rows)
+    return [[round((0.0006 * j + 0.5 * common[t] + 0.85 * x) * Q) for t, x in enumerate(rng.normal(0, 0.01, rows))]
+            for j in range(k)]
+
+
+@pytest.mark.parametrize("every_trial_evaluated", [True, False])
+def test_the_dsr_of_a_matrix_column_is_the_paper_written_out(every_trial_evaluated):
+    columns = family()
+    for candidate in (0, 5):
+        result = vs.deflated_sharpe(columns, candidate, 8, every_trial_evaluated)
+        assert result["dsr"] == pytest.approx(reference_dsr(columns, candidate, 8, every_trial_evaluated), rel=1e-9)
+        assert result["sharpe"] == vs.sharpe(columns[candidate])
+        assert result["n_obs"] == 500 and result["ledger_trials"] == 8 and result["distinct_series"] == 6
+
+
+def test_the_implied_number_of_trials_is_used_only_when_every_trial_is_evaluated():
+    columns = family()
+    implied = vs.implied_trials(columns, 8)
+    complete = vs.deflated_sharpe(columns, 5, 8, True)
+    assert (complete["n_trials_source"], complete["n_trials"]) == ("implied", implied["implied_trials"])
+    assert complete["average_correlation"] == implied["average_correlation"]
+    incomplete = vs.deflated_sharpe(columns, 5, 8, False)
+    assert (incomplete["n_trials_source"], incomplete["n_trials"], incomplete["average_correlation"]) == ("ledger", 8.0, None)
+    # Correlated variants are fewer independent trials, so the DSR is higher.
+    assert complete["n_trials"] < 8 and complete["dsr"] > incomplete["dsr"]
+
+
+def test_the_trial_variance_is_the_empirical_one_above_its_floor():
+    columns = family()
+    result = vs.deflated_sharpe(columns, 5, 6, True)
+    sharpes = [vs.sharpe(c) for c in columns]
+    assert result["variance_empirical"] == pytest.approx(float(np.var(sharpes, ddof=1)), rel=1e-12)
+    assert result["variance_null"] == 1 / 499
+    assert result["variance"] == max(result["variance_null"], result["variance_empirical"])
+    assert result["variance"] == result["variance_empirical"]
+
+
+def test_near_identical_variants_deflate_by_at_least_the_null_variance():
+    """Variants whose Sharpe ratios hardly differ (V_emp ~ 0) still face the
+    dispersion skill-less trials show by chance, V_null = 1 / (T - 1)."""
+    (base,) = noise(400, 1, seed=37)
+    base = [q + 10 ** 9 for q in base]
+    columns = [base, [q + (1 if t == 0 else 0) for t, q in enumerate(base)]]
+    result = vs.deflated_sharpe(columns, 0, 2, True)
+    assert result["variance_empirical"] < 1e-12
+    assert result["variance"] == result["variance_null"] == 1 / 399
+
+
+def test_a_single_distinct_column_uses_the_ledger_count_and_the_null_variance():
+    (column,) = noise(300, 1, seed=41)
+    result = vs.deflated_sharpe([[q + 10 ** 9 for q in column]], 0, 4, True)
+    assert result["n_trials_source"] == "ledger" and result["n_trials"] == 4.0
+    assert result["variance_empirical"] is None and result["variance"] == 1 / 299
+
+
+def test_more_trials_never_raise_the_dsr():
+    columns = family()
+    values = [vs.deflated_sharpe(columns, 5, m, False)["dsr"] for m in (6, 7, 10, 50, 500)]
+    assert values == sorted(values, reverse=True) and values[0] > values[-1]
+
+
+def test_a_twin_version_shares_a_column_and_still_counts_as_a_trial():
+    """Through the producer: two versions with the same returns share one
+    column of trial_matrix.build; the ledger counts both, the correlation
+    sees the column once, and the implied N rises with the ledger count."""
+    rng = np.random.default_rng(43)
+    dates = [f"2024-{1 + d // 28:02d}-{1 + d % 28:02d}" for d in range(200)]
+    returns = [rng.normal(0.0005 * k, 0.01, len(dates)) for k in range(3)]
+    runs = {f"qs-sv-sha256-v1:{k:064x}": returns[k] for k in range(3)}
+    runs[f"qs-sv-sha256-v1:{9:064x}"] = returns[2]  # differs only in risk_limits
+    matrix = trial_matrix.build(dates, runs)
+    columns = [c["returns"] for c in matrix["columns"]]
+    assert len(columns) == 3 and sorted(len(c["strategy_version_ids"]) for c in matrix["columns"]) == [1, 1, 2]
+    with_twin, without = vs.deflated_sharpe(columns, 0, 4, True), vs.deflated_sharpe(columns, 0, 3, True)
+    assert with_twin["average_correlation"] == without["average_correlation"]
+    assert with_twin["n_trials"] > without["n_trials"]
+    assert with_twin["dsr"] <= without["dsr"]
+
+
+@pytest.mark.parametrize("columns,candidate,n_trials,complete,reason", [
+    ([[1, 2, 3], [3, 1, 2]], 2, 2, True, "index of one of the columns"),
+    ([[1, 2, 3], [3, 1, 2]], -1, 2, True, "index of one of the columns"),
+    ([[1, 2, 3], [3, 1, 2]], True, 2, True, "index of one of the columns"),
+    ([[1, 2, 3], [3, 1, 2]], 0, 2, 1, "true or false"),
+    ([[1, 2, 3], [3, 1, 2]], 0, 1, True, "cannot have 2"),
+    ([[1, 2, 3], [3, 1, 2]], 0, 1, False, "cannot have 2"),
+    ([[1, 2, 3], [1, 2, 3]], 0, 2, True, "distinct"),
+    ([[1, 2, 3], [5, 5, 5]], 0, 2, False, "constant series"),
+    ([[1, 2, 3], [5, 5, 5]], 0, 2, True, "constant series"),
+    ([[1], [2]], 0, 2, False, "two sessions"),
+    ([], 0, 1, True, "no return series"),
+])
+def test_the_dsr_of_a_matrix_refuses_what_it_cannot_judge(columns, candidate, n_trials, complete, reason):
+    with pytest.raises(StatsError, match=reason):
+        vs.deflated_sharpe(columns, candidate, n_trials, complete)

@@ -48,6 +48,11 @@ def _digest(value: dict) -> str:
                                      default=str).encode()).hexdigest()
 
 
+def config_hash(config: dict) -> str:
+    """The hash a trial's config is recorded under."""
+    return _digest(config)
+
+
 def family_hash(strategy: str, assets: list[str]) -> str:
     """One research question: a strategy applied to a set of assets."""
     return _digest({"strategy": strategy,
@@ -89,17 +94,32 @@ def count(db: Session, user_id: str, family: str) -> int:
     ).scalar() or 0)
 
 
-def returns_id(returns) -> str:
-    """The id of a series of returns (see the module docstring)."""
-    digest = hashlib.sha256()
+def quantise(returns) -> list[int]:
+    """Each return r as the integer round(r * 10^12) the series' id hashes."""
+    quantised = []
     for r in np.asarray(returns, dtype=float).reshape(-1):
         if not math.isfinite(r):
             raise ValueError("every return must be finite")
-        quantised = round(float(r) * _RETURNS_SCALE)
-        if not -_INT64_MAX - 1 <= quantised <= _INT64_MAX:
+        quantised.append(round(float(r) * _RETURNS_SCALE))
+    return quantised
+
+
+def quantised_returns_id(quantised) -> str:
+    """The id of a series already quantised (``quantise``): the SHA-256 of its
+    integers as signed 64-bit big-endian words."""
+    digest = hashlib.sha256()
+    for q in quantised:
+        if isinstance(q, bool) or not isinstance(q, int):
+            raise ValueError("a quantised return is an integer")
+        if not -_INT64_MAX - 1 <= q <= _INT64_MAX:
             raise ValueError("a return is too large to identify")
-        digest.update(quantised.to_bytes(8, "big", signed=True))
+        digest.update(q.to_bytes(8, "big", signed=True))
     return f"{RETURNS_SCHEME}:{digest.hexdigest()}"
+
+
+def returns_id(returns) -> str:
+    """The id of a series of returns (see the module docstring)."""
+    return quantised_returns_id(quantise(returns))
 
 
 def evaluation_metrics(returns) -> dict:

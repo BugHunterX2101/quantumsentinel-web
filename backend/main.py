@@ -60,7 +60,7 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
                      RESEARCH_WORKER_MODE, PROCESS_ROLE)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, integration_service, order_security
-from .services import dataset_registry, paper_broker, research_jobs, research_trials, strategy_registry
+from .services import dataset_registry, paper_broker, research_jobs, research_trials, strategy_registry, trial_matrix
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -2116,6 +2116,29 @@ def strategy_backtest(req: schemas.StrategyBacktestRequest,
     job = schemas.StrategyBacktestJob(strategy_version_id=version.version_id, period=req.period,
                                       initial_capital=req.initial_capital, dataset_ids=req.dataset_ids)
     return _queue_job(db, user, "strategy_backtest", job.model_dump())
+
+
+@app.post("/api/research/validation-matrix", status_code=202)
+def validation_matrix(req: schemas.ValidationMatrixRequest,
+                      user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """Queue the trial matrix of one of the caller's strategy evaluations,
+    named by the job that recorded it: every strategy version evaluated in
+    its family re-runs on the datasets it read, over the period and with the
+    capital it used (which must be the ones it ran with), and the result
+    holds their daily returns, one column per distinct series, and how many
+    of the family's trials they cover. The candidate's own re-run must
+    reproduce its evaluation (409 otherwise). Building it records no trial."""
+    evaluation = trial_matrix.evaluation_for_user(db, user.id, req.evaluation)
+    if evaluation is None:
+        raise HTTPException(404, "Evaluation not found")
+    if not trial_matrix.ran_with(evaluation, req.period, req.initial_capital):
+        raise HTTPException(422, "The period and initial capital are not the ones the evaluation ran with")
+    job = schemas.ValidationMatrixJob(evaluation=evaluation.job_id, period=req.period,
+                                      initial_capital=req.initial_capital,
+                                      dataset_ids=sorted(evaluation.dataset_ids))
+    _require_held_datasets(db, user, job)
+    return _queue_job(db, user, "validation_matrix", job.model_dump())
 
 
 @app.get("/api/research/jobs")

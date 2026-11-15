@@ -221,7 +221,7 @@ def test_every_kind_that_reads_prices_runs_in_a_market_data_session():
         task = getattr(research_tasks, kind.target.partition(":")[2])
         assert kind.market_data == getattr(task, "uses_market_data", False), name
         assert ("dataset_ids" in kind.schema.model_fields) == kind.market_data, name
-    assert sum(kind.market_data for kind in research_jobs.KINDS.values()) == 14
+    assert sum(kind.market_data for kind in research_jobs.KINDS.values()) == 15
 
 
 def test_a_job_registers_its_snapshot_and_names_it_in_the_result_and_audit(db, market):

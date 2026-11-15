@@ -654,6 +654,26 @@ class StrategyBacktestJob(MarketDataRequest):
         return value
 
 
+class ValidationMatrixRequest(BaseModel):
+    """Build the trial matrix for one of the caller's strategy evaluations,
+    named by the job that recorded it, with the period and initial capital
+    that run used (the evaluation keeps only their hash)."""
+    evaluation: str = Field(min_length=1, max_length=64)
+    period: str
+    initial_capital: float = Field(ge=1000.0, le=100_000_000.0)
+
+    @field_validator("period")
+    @classmethod
+    def valid_period(cls, value: str) -> str:
+        return _trailing_period(value)
+
+
+class ValidationMatrixJob(ValidationMatrixRequest, MarketDataRequest):
+    """A queued validation matrix, on the datasets the evaluation read
+    (required: it never takes a fresh snapshot)."""
+    dataset_ids: list[str] = Field(min_length=1, max_length=DATASET_MAX_INPUTS)
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Alpha Research & Factor Modeling Schemas
 # ---------------------------------------------------------------------------

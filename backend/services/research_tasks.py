@@ -323,24 +323,12 @@ def strategy_trial_config(req: schemas.StrategyBacktestJob) -> dict:
             "initial_capital": req.initial_capital}
 
 
-@uses_market_data
-def strategy_backtest(params: dict, prepared: dict) -> TaskOutput:
-    """Backtest a strategy version on its universe's prices with the event
-    engine. The worker loads the version's spec for the job's user
-    (strategy_registry.backtest_inputs) and passes it as ``prepared``; the
-    job's params only name it. The result carries what the run measured
-    (research_trials.evaluation_metrics), which the worker records as an
-    evaluation of the trial once it accepts the result
-    (strategy_registry.finalize_backtest_job)."""
-    from . import historical_data, strategy_spec, validation_policy
-    req = schemas.StrategyBacktestJob.model_validate(params)
-    spec = strategy_spec.parse(prepared["spec"])
-    if strategy_spec.version_id(spec) != req.strategy_version_id:
-        raise TaskError(500, "The research job was given another strategy than the one it names")
-    compiled = strategy_spec.compile_spec(spec)
-    symbols = list(compiled.tickers)
+def _strategy_panel(symbols: list[str], period: str):
+    """A strategy universe's closes over the trailing ``period``, aligned on
+    the sessions where every symbol has a price."""
+    from . import historical_data
     try:
-        raw = market_data.download(symbols, req.period)
+        raw = market_data.download(symbols, period)
     except market_data.MarketDataError as exc:
         raise TaskError(422, str(exc)) from exc
     panel = historical_data.aligned_panel(raw, symbols, min_rows=STRATEGY_MIN_SESSIONS)
@@ -351,11 +339,37 @@ def strategy_backtest(params: dict, prepared: dict) -> TaskOutput:
     if len(panel) < STRATEGY_MIN_SESSIONS:
         raise TaskError(422, f"Only {len(panel)} sessions in the period have a price for every symbol; "
                              f"at least {STRATEGY_MIN_SESSIONS} are needed")
+    return panel
+
+
+def _run_strategy(compiled, panel, initial_capital: float) -> dict:
+    """One run of a compiled strategy version on a panel of its universe, as
+    every strategy job runs it: with its full, unrounded daily returns."""
+    from . import strategy_spec
     try:
-        result = compiled.run({s: panel.close[s].to_numpy(dtype=float) for s in symbols},
-                              req.initial_capital, full_returns=True, risk_metrics=True)
+        return compiled.run({s: panel.close[s].to_numpy(dtype=float) for s in compiled.tickers},
+                            initial_capital, full_returns=True, risk_metrics=True)
     except strategy_spec.StrategySpecError as exc:
         raise TaskError(422, str(exc)) from exc
+
+
+@uses_market_data
+def strategy_backtest(params: dict, prepared: dict) -> TaskOutput:
+    """Backtest a strategy version on its universe's prices with the event
+    engine. The worker loads the version's spec for the job's user
+    (strategy_registry.backtest_inputs) and passes it as ``prepared``; the
+    job's params only name it. The result carries what the run measured
+    (research_trials.evaluation_metrics), which the worker records as an
+    evaluation of the trial once it accepts the result
+    (strategy_registry.finalize_backtest_job)."""
+    from . import strategy_spec, validation_policy
+    req = schemas.StrategyBacktestJob.model_validate(params)
+    spec = strategy_spec.parse(prepared["spec"])
+    if strategy_spec.version_id(spec) != req.strategy_version_id:
+        raise TaskError(500, "The research job was given another strategy than the one it names")
+    compiled = strategy_spec.compile_spec(spec)
+    panel = _strategy_panel(list(compiled.tickers), req.period)
+    result = _run_strategy(compiled, panel, req.initial_capital)
     evaluation = research_trials.evaluation_metrics(result.pop("returns"))
     dates = panel.date_strings()
     result = {**result, "strategy_version_id": req.strategy_version_id, "family": spec.universe.family,
@@ -368,6 +382,52 @@ def strategy_backtest(params: dict, prepared: dict) -> TaskOutput:
                          [strategy_trial_config(req)], "strategy_backtest")
     audit = {"strategy_version_id": req.strategy_version_id, "period": req.period, **evaluation}
     return TaskOutput(result, audit, trials)
+
+
+@uses_market_data
+def validation_matrix(params: dict, prepared: dict) -> TaskOutput:
+    """Re-run every strategy version evaluated in the candidate's family on
+    the candidate's datasets, over its period and with its capital, and
+    return their daily returns as a trial matrix (services/trial_matrix.py).
+    The worker passes the family's specs and the candidate's evaluation as
+    ``prepared`` (trial_matrix.matrix_inputs). The candidate's re-run must
+    reproduce its evaluation's return series. It records no trial."""
+    from . import strategy_spec, trial_matrix
+    req = schemas.ValidationMatrixJob.model_validate(params)
+    candidate, family = prepared["candidate"], prepared["family"]
+    compiled = {}
+    for version_id, value in prepared["specs"].items():
+        spec = strategy_spec.parse(value)
+        if (strategy_spec.version_id(spec) != version_id
+                or research_trials.family_hash(spec.signal.template, spec.universe.symbols) != family):
+            raise TaskError(500, "The research job was given another strategy than the ones it names")
+        compiled[version_id] = strategy_spec.compile_spec(spec)
+    if candidate["strategy_version_id"] not in compiled:
+        raise TaskError(500, "The research job was not given the candidate's strategy")
+    # A family is one template on one set of symbols: one panel serves all.
+    panel = _strategy_panel(list(compiled[candidate["strategy_version_id"]].tickers), req.period)
+    runs = {}
+    for version_id in sorted(compiled):
+        try:
+            runs[version_id] = _run_strategy(compiled[version_id], panel, req.initial_capital)["returns"]
+        except TaskError as exc:
+            raise TaskError(exc.status_code, f"{version_id} cannot be re-run: {exc.detail}") from exc
+    if research_trials.returns_id(runs[candidate["strategy_version_id"]]) != candidate["returns_sha256"]:
+        raise TaskError(409, "The candidate's evaluation does not reproduce on today's engine and data; "
+                             "backtest it again and validate the new evaluation")
+    dates = panel.date_strings()
+    try:
+        matrix = trial_matrix.build(dates, runs)
+    except ValueError as exc:
+        raise TaskError(422, f"The runs do not form a trial matrix: {exc}") from exc
+    result = {"candidate": {**candidate, "column": trial_matrix.column_of(matrix, candidate["strategy_version_id"])},
+              "family": family, "ledger": prepared["ledger"], "period": req.period,
+              "initial_capital": req.initial_capital,
+              "sessions": {"first": dates[0], "last": dates[-1], "count": len(dates)}, "matrix": matrix}
+    audit = {"evaluation": candidate["evaluation"], "strategy_version_id": candidate["strategy_version_id"],
+             "matrix_id": matrix["id"], "columns": len(matrix["columns"]), "strategy_versions": len(runs),
+             "every_trial_evaluated": prepared["ledger"]["every_trial_evaluated"]}
+    return TaskOutput(result, audit)
 
 
 # --------------------------------------------------------------------------

@@ -64,7 +64,11 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "refresh_tokens": DML,
     "research_experiments": DML,
     "research_jobs": DML,
-    "research_trials": DML,
+    # The trial ledger the Deflated Sharpe discount counts. Only
+    # research_trials.record writes it, from the worker, and the API runs an
+    # embedded worker under this role, so it needs INSERT. Nothing updates or
+    # deletes a trial, so a user's count can only grow.
+    "research_trials": ("SELECT", "INSERT"),
     "research_workers": DML,
     "server_signing_keys": DML,
     "signals": DML,

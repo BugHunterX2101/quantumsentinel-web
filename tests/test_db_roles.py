@@ -427,6 +427,16 @@ def test_the_research_worker_runs_a_strategy_backtest_as_its_own_role(provisione
     view = research_jobs.view(api, api.get(models.ResearchJob, json.loads(response.body)["job_id"]))
     assert view["status"] == "succeeded", view
     assert view["result"]["strategy_version_id"] == version_id
+    # The worker validates the evaluation as its own role too, and records the
+    # matrix and the verdict.
+    capital = api.get(models.ResearchJob, view["job_id"]).params_json["initial_capital"]
+    validation = main.validate_strategy(schemas.StrategyValidationRequest(
+        evaluation=view["job_id"], period="1y", initial_capital=capital), user=user, db=api)
+    assert runner.run_once() is True
+    api.expire_all()
+    validated = research_jobs.view(api, api.get(models.ResearchJob, json.loads(validation.body)["job_id"]))
+    assert validated["status"] == "succeeded", validated
+    assert validated["result"]["validation"]["passed"] is False
     assert security_service.audit_chain_status(api, full=True)["valid"]
     api.close()
     research_worker = provisioned.connect(roles.research_worker)
@@ -439,12 +449,17 @@ def test_the_research_worker_runs_a_strategy_backtest_as_its_own_role(provisione
     for role in (roles.app, roles.research_worker):
         conn = provisioned.connect(role)
         for statement in ("UPDATE research_trial_evaluations SET sharpe = 9",
-                          "DELETE FROM research_trial_evaluations", "TRUNCATE research_trial_evaluations"):
+                          "DELETE FROM research_trial_evaluations", "TRUNCATE research_trial_evaluations",
+                          "UPDATE strategy_validations SET passed = true", "DELETE FROM strategy_validations",
+                          "TRUNCATE strategy_validations", "DELETE FROM trial_matrices", "TRUNCATE trial_matrices"):
             with pytest.raises(errors.InsufficientPrivilege):
                 conn.execute(statement)
     owner = provisioned.connect()
     assert owner.execute("SELECT job_id, strategy_version_id FROM research_trial_evaluations").fetchall() == \
         [(view["job_id"], version_id)]
+    assert owner.execute("SELECT job_id, evaluation_job_id, passed FROM strategy_validations").fetchall() == \
+        [(validated["job_id"], view["job_id"], False)]
+    assert owner.execute("SELECT count(*) FROM trial_matrices").fetchone() == (1,)
 
 
 def test_the_research_worker_runs_a_dataset_snapshot_as_its_own_role(provisioned, monkeypatch, tmp_path):

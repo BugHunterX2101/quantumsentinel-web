@@ -460,7 +460,7 @@ def test_an_evaluation_must_name_a_recorded_trial(db):
 @pytest.mark.parametrize("statement", [
     "UPDATE research_trials SET source = 'x'", "DELETE FROM research_trials", "TRUNCATE research_trials CASCADE",
     "UPDATE research_trial_evaluations SET sharpe = 9", "DELETE FROM research_trial_evaluations",
-    "TRUNCATE research_trial_evaluations",
+    "TRUNCATE research_trial_evaluations CASCADE",
 ])
 def test_trials_and_evaluations_are_immutable_even_for_the_owner(db, statement):
     user_id, trial = _trial_and_version(db)

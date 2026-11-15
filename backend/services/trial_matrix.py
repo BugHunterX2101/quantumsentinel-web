@@ -39,8 +39,8 @@ and its ``returns_sha256`` agree exactly in any language. Columns are
 ordered by that id. The matrix id is ``qs-tm-sha256-v1:<hex>``, the SHA-256
 of the canonical JSON (``dataset_format.canonical_json``) of the scheme, the
 dates and the columns; tests/test_trial_matrix.py holds a golden vector.
-The matrix lives in the job's result; storing it beyond the job's retention
-is left to the validation job (R3-4).
+The matrix lives in the job's result; a strategy validation also stores it,
+beyond the job's retention (services/strategy_validation.py).
 """
 from __future__ import annotations
 
@@ -93,9 +93,15 @@ def build(dates: Sequence[str], runs: Mapping[str, Sequence[float]]) -> dict:
 
 
 def matrix_id(matrix: Mapping[str, Any]) -> str:
-    """The id of a matrix, after checking it is one: dates strictly
-    increasing, every column as long as the dates with values that hash to
-    its ``returns_sha256``, columns ordered by that id, and each version in
+    """The id of a matrix, after checking it is one (``canonical``)."""
+    return f"{MATRIX_SCHEME}:{hashlib.sha256(canonical(matrix)).hexdigest()}"
+
+
+def canonical(matrix: Mapping[str, Any]) -> bytes:
+    """The canonical JSON of a matrix's scheme, dates and columns, which its
+    id hashes, after checking it is a matrix: dates strictly increasing,
+    every column as long as the dates with values that hash to its
+    ``returns_sha256``, columns ordered by that id, and each version in
     exactly one column."""
     if matrix.get("scheme") != MATRIX_SCHEME:
         raise MatrixError(f"not a {MATRIX_SCHEME} matrix")
@@ -133,10 +139,9 @@ def matrix_id(matrix: Mapping[str, Any]) -> str:
             "columns": [{key: column[key] for key in ("returns_sha256", "strategy_version_ids", "returns")}
                         for column in columns]}
     try:
-        encoded = canonical_json(body)
+        return canonical_json(body)
     except DatasetError as exc:  # a return beyond +/-(2**53 - 1) quanta
         raise MatrixError(f"the matrix cannot be encoded: {exc}") from exc
-    return f"{MATRIX_SCHEME}:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def column_of(matrix: Mapping[str, Any], version_id: str) -> int:
@@ -229,10 +234,17 @@ def matrix_inputs(db: Session, job: models.ResearchJob) -> dict:
 
 
 def finalize_matrix_job(db: Session, job: models.ResearchJob, result: dict, audit: dict):
-    """Accept a validation matrix, after the worker has accepted the market
-    data it read: the prices came from exactly the evaluation's datasets, the
-    family's trials are still the ones it was built from, and the matrix is
-    well formed and holds every version evaluated in the family."""
+    """Accept a validation matrix (``accept_matrix``)."""
+    evaluation, _, _ = accept_matrix(db, job, result)
+    return result, ("strategy_version", evaluation.strategy_version_id), audit
+
+
+def accept_matrix(db: Session, job: models.ResearchJob, result: dict):
+    """Accept the matrix a job reported, after the worker has accepted the
+    market data it read: the prices came from exactly the evaluation's
+    datasets, the family's trials are still the ones it was built from, and
+    the matrix is well formed and holds every version evaluated in the
+    family. Returns the evaluation, the family's trials and the matrix."""
     from .research_tasks import TaskError
 
     _, evaluation = _job_evaluation(db, job)
@@ -250,4 +262,4 @@ def finalize_matrix_job(db: Session, job: models.ResearchJob, result: dict, audi
         valid, held = False, None
     if not valid or held != state["strategy_version_ids"]:
         raise TaskError(500, "The research job reported an invalid matrix")
-    return result, ("strategy_version", evaluation.strategy_version_id), audit
+    return evaluation, state, matrix

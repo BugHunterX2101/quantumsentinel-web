@@ -392,8 +392,24 @@ def validation_matrix(params: dict, prepared: dict) -> TaskOutput:
     The worker passes the family's specs and the candidate's evaluation as
     ``prepared`` (trial_matrix.matrix_inputs). The candidate's re-run must
     reproduce its evaluation's return series. It records no trial."""
+    result, audit, _ = _family_matrix(schemas.ValidationMatrixJob.model_validate(params), prepared)
+    return TaskOutput(result, audit)
+
+
+@uses_market_data
+def strategy_validation(params: dict, prepared: dict) -> TaskOutput:
+    """Build the candidate's trial matrix as ``validation_matrix`` does, with
+    the risk measurements of the candidate's re-run. The worker, not this
+    task, judges them against the validation policy
+    (strategy_validation.finalize_validation_job). It records no trial."""
+    result, audit, risk = _family_matrix(schemas.StrategyValidationJob.model_validate(params), prepared)
+    return TaskOutput({**result, "risk": risk}, audit)
+
+
+def _family_matrix(req: schemas.ValidationMatrixJob, prepared: dict) -> tuple[dict, dict, dict]:
+    """The trial matrix of the candidate's family (result, audit) and the
+    candidate's re-run's risk measurements."""
     from . import strategy_spec, trial_matrix
-    req = schemas.ValidationMatrixJob.model_validate(params)
     candidate, family = prepared["candidate"], prepared["family"]
     compiled = {}
     for version_id, value in prepared["specs"].items():
@@ -406,12 +422,15 @@ def validation_matrix(params: dict, prepared: dict) -> TaskOutput:
         raise TaskError(500, "The research job was not given the candidate's strategy")
     # A family is one template on one set of symbols: one panel serves all.
     panel = _strategy_panel(list(compiled[candidate["strategy_version_id"]].tickers), req.period)
-    runs = {}
+    runs, risk = {}, None
     for version_id in sorted(compiled):
         try:
-            runs[version_id] = _run_strategy(compiled[version_id], panel, req.initial_capital)["returns"]
+            run = _run_strategy(compiled[version_id], panel, req.initial_capital)
         except TaskError as exc:
             raise TaskError(exc.status_code, f"{version_id} cannot be re-run: {exc.detail}") from exc
+        runs[version_id] = run["returns"]
+        if version_id == candidate["strategy_version_id"]:
+            risk = run["risk"]
     if research_trials.returns_id(runs[candidate["strategy_version_id"]]) != candidate["returns_sha256"]:
         raise TaskError(409, "The candidate's evaluation does not reproduce on today's engine and data; "
                              "backtest it again and validate the new evaluation")
@@ -427,7 +446,7 @@ def validation_matrix(params: dict, prepared: dict) -> TaskOutput:
     audit = {"evaluation": candidate["evaluation"], "strategy_version_id": candidate["strategy_version_id"],
              "matrix_id": matrix["id"], "columns": len(matrix["columns"]), "strategy_versions": len(runs),
              "every_trial_evaluated": prepared["ledger"]["every_trial_evaluated"]}
-    return TaskOutput(result, audit)
+    return result, audit, risk
 
 
 # --------------------------------------------------------------------------

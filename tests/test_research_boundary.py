@@ -28,7 +28,8 @@ RESEARCH_TASKS = "backend.services.research_tasks"
 # finalize and prepare). The worker resolves them by name, so no import
 # statement leads to them: each is a root of the closure below in its own right.
 FINALIZERS = {"backend.services.experiment_registry", "backend.services.dataset_registry",
-              "backend.services.strategy_registry", "backend.services.trial_matrix"}
+              "backend.services.strategy_registry", "backend.services.trial_matrix",
+              "backend.services.strategy_validation"}
 
 
 def _path(module: str) -> Path | None:

@@ -460,6 +460,7 @@ def run_event_backtest(
     sizing_method: str = "fixed_fractional",
     *,
     full_returns: bool = False,
+    risk_metrics: bool = False,
 ) -> dict:
     """Run the event-driven backtester.
 
@@ -476,6 +477,15 @@ def run_event_backtest(
     full_returns : also return ``returns``, every bar's return unrounded (an
         array; ``daily_returns`` keeps the last 504, rounded, for display).
         It is the series ``sharpe_ratio`` and the other statistics come from.
+    risk_metrics : also return ``risk``, what a risk gate checks against a
+        strategy's declared limits, unrounded, over every bar:
+        ``max_drawdown``, the largest fall of equity from its running peak
+        as a fraction of that peak; above 1 once equity is negative. ``max_position_share``, the largest
+        single position's absolute market value as a fraction of equity,
+        marked at each bar's close after that bar's fills, over the bars
+        where equity is positive. ``equity_exhausted``, whether equity was
+        ever zero or negative (a share of non-positive equity has no
+        meaning, so such bars count here instead).
     """
     params = strategy_params or {}
 
@@ -526,6 +536,8 @@ def run_event_backtest(
 
     # Pending orders (1-bar delay)
     pending_orders: list[OrderEvent] = []
+    max_position_share = 0.0
+    equity_exhausted = False
 
     # ── Main event loop ──
     for bar in range(T):
@@ -657,7 +669,14 @@ def run_event_backtest(
             ))
 
         # ── 5. Mark to market ──
-        portfolio.update_equity(current_prices)
+        marked = portfolio.update_equity(current_prices)
+        if risk_metrics:
+            if marked <= 0:
+                equity_exhausted = True
+            else:
+                largest = max((abs(q) * current_prices.get(t, 0.0) for t, q in portfolio.positions.items()),
+                              default=0.0)
+                max_position_share = max(max_position_share, largest / marked)
 
     # ── Compute performance ──
     equity_curve = np.array(portfolio.equity_curve)
@@ -717,4 +736,11 @@ def run_event_backtest(
     }
     if full_returns:
         result["returns"] = returns_arr.copy()
+    if risk_metrics:
+        # The curve starts with the initial capital, then one mark per bar.
+        result["risk"] = {
+            "max_drawdown": float(np.max(1.0 - equity_curve / np.maximum.accumulate(equity_curve))),
+            "max_position_share": float(max_position_share),
+            "equity_exhausted": bool(equity_exhausted),
+        }
     return result

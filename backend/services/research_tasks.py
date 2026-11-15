@@ -332,7 +332,7 @@ def strategy_backtest(params: dict, prepared: dict) -> TaskOutput:
     (research_trials.evaluation_metrics), which the worker records as an
     evaluation of the trial once it accepts the result
     (strategy_registry.finalize_backtest_job)."""
-    from . import historical_data, strategy_spec
+    from . import historical_data, strategy_spec, validation_policy
     req = schemas.StrategyBacktestJob.model_validate(params)
     spec = strategy_spec.parse(prepared["spec"])
     if strategy_spec.version_id(spec) != req.strategy_version_id:
@@ -353,14 +353,17 @@ def strategy_backtest(params: dict, prepared: dict) -> TaskOutput:
                              f"at least {STRATEGY_MIN_SESSIONS} are needed")
     try:
         result = compiled.run({s: panel.close[s].to_numpy(dtype=float) for s in symbols},
-                              req.initial_capital, full_returns=True)
+                              req.initial_capital, full_returns=True, risk_metrics=True)
     except strategy_spec.StrategySpecError as exc:
         raise TaskError(422, str(exc)) from exc
     evaluation = research_trials.evaluation_metrics(result.pop("returns"))
     dates = panel.date_strings()
     result = {**result, "strategy_version_id": req.strategy_version_id, "family": spec.universe.family,
               "period": req.period, "sessions": {"first": dates[0], "last": dates[-1], "count": len(dates)},
-              "evaluation": evaluation}
+              "evaluation": evaluation,
+              # What the validation policy's risk gate says of this run; the
+              # validation job, not this backtest, decides eligibility.
+              "risk_check": validation_policy.risk_gate(spec.risk_limits, result["risk"])}
     trials = TrialRecord(research_trials.family_hash(spec.signal.template, spec.universe.symbols),
                          [strategy_trial_config(req)], "strategy_backtest")
     audit = {"strategy_version_id": req.strategy_version_id, "period": req.period, **evaluation}

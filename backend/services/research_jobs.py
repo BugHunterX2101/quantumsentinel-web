@@ -76,6 +76,7 @@ _TASKS = "backend.services.research_tasks"
 _EXPERIMENTS = "backend.services.experiment_registry"
 _STRATEGIES = "backend.services.strategy_registry"
 _MATRIX = "backend.services.trial_matrix"
+_VALIDATION = "backend.services.strategy_validation"
 KINDS: dict[str, JobKind] = {
     "ma_backtest": JobKind(schemas.BacktestRequest, f"{_TASKS}:ma_backtest", "BACKTEST_COMPLETED",
                            market_data=True),
@@ -118,6 +119,9 @@ KINDS: dict[str, JobKind] = {
     "validation_matrix": JobKind(schemas.ValidationMatrixJob, f"{_TASKS}:validation_matrix", "VALIDATION_MATRIX",
                                  f"{_MATRIX}:finalize_matrix_job", market_data=True,
                                  prepare=f"{_MATRIX}:matrix_inputs"),
+    "strategy_validation": JobKind(schemas.StrategyValidationJob, f"{_TASKS}:strategy_validation",
+                                   "STRATEGY_VALIDATION", f"{_VALIDATION}:finalize_validation_job",
+                                   market_data=True, prepare=f"{_MATRIX}:matrix_inputs"),
 }
 
 

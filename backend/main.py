@@ -60,7 +60,8 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
                      RESEARCH_WORKER_MODE, PROCESS_ROLE)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, integration_service, order_security
-from .services import dataset_registry, paper_broker, research_jobs, research_trials, strategy_registry, trial_matrix
+from .services import (dataset_registry, paper_broker, research_jobs, research_trials, strategy_registry,
+                       strategy_validation, trial_matrix)
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -2139,6 +2140,56 @@ def validation_matrix(req: schemas.ValidationMatrixRequest,
                                       dataset_ids=sorted(evaluation.dataset_ids))
     _require_held_datasets(db, user, job)
     return _queue_job(db, user, "validation_matrix", job.model_dump())
+
+
+@app.post("/api/research/strategy-validation", status_code=202)
+def validate_strategy(req: schemas.StrategyValidationRequest,
+                      user: models.User = Depends(get_current_user),
+                      db: Session = Depends(get_db)):
+    """Queue the validation of one of the caller's strategy evaluations,
+    named as for its trial matrix: the job builds the matrix (as
+    /api/research/validation-matrix does), and the worker judges the
+    candidate against the validation policy and records the verdict, with
+    every gate's figures (services/strategy_validation.py). The verdict is
+    pre-holdout. Validating records no trial."""
+    evaluation = trial_matrix.evaluation_for_user(db, user.id, req.evaluation)
+    if evaluation is None:
+        raise HTTPException(404, "Evaluation not found")
+    if not trial_matrix.ran_with(evaluation, req.period, req.initial_capital):
+        raise HTTPException(422, "The period and initial capital are not the ones the evaluation ran with")
+    job = schemas.StrategyValidationJob(evaluation=evaluation.job_id, period=req.period,
+                                        initial_capital=req.initial_capital,
+                                        dataset_ids=sorted(evaluation.dataset_ids))
+    _require_held_datasets(db, user, job)
+    return _queue_job(db, user, "strategy_validation", job.model_dump())
+
+
+@app.get("/api/research/strategy-validations")
+def list_strategy_validations(limit: int = Query(20, ge=1, le=100),
+                              user: models.User = Depends(get_current_user),
+                              db: Session = Depends(get_db)):
+    """The caller's validation verdicts, newest first."""
+    return [strategy_validation.view(row) for row in strategy_validation.list_for_user(db, user.id, limit)]
+
+
+@app.get("/api/research/strategy-validations/{job_id}")
+def get_strategy_validation(job_id: str, user: models.User = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    """One of the caller's validation verdicts, named by its job."""
+    row = strategy_validation.get_for_user(db, user.id, job_id)
+    if row is None:
+        raise HTTPException(404, "Validation not found")
+    return strategy_validation.view(row)
+
+
+@app.get("/api/research/strategy-validations/{job_id}/matrix")
+def get_strategy_validation_matrix(job_id: str, user: models.User = Depends(get_current_user),
+                                   db: Session = Depends(get_db)):
+    """The trial matrix one of the caller's verdicts judged."""
+    row = strategy_validation.get_for_user(db, user.id, job_id)
+    if row is None:
+        raise HTTPException(404, "Validation not found")
+    return strategy_validation.matrix_of(db, row)
 
 
 @app.get("/api/research/jobs")

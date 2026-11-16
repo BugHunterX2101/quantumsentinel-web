@@ -76,10 +76,14 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "server_signing_keys": DML,
     "signals": DML,
     "strategies": DML,
+    # Append-only (migration 0008's triggers): the validation policy's
+    # verdicts and the matrices they judged, written by the (embedded) worker.
+    "strategy_validations": ("SELECT", "INSERT"),
     # Append-only (migration 0006's triggers): a strategy version, who holds
     # it and a holder's tags are recorded once and never changed.
     "strategy_versions": ("SELECT", "INSERT"),
     "trades": DML,
+    "trial_matrices": ("SELECT", "INSERT"),
     "user_datasets": ("SELECT", "INSERT"),
     "user_strategy_tags": ("SELECT", "INSERT"),
     "user_strategy_versions": ("SELECT", "INSERT"),
@@ -121,6 +125,9 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # must hold, before the job process starts; the worker never registers one.
     "strategy_versions": ("SELECT",),
     "user_strategy_versions": ("SELECT",),
+    # A strategy validation records the matrix it judged and its verdict.
+    "strategy_validations": ("SELECT", "INSERT"),
+    "trial_matrices": ("SELECT", "INSERT"),
 }
 
 _ROLE_ATTRIBUTES = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"

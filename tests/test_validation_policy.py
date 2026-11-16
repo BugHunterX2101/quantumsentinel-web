@@ -16,9 +16,13 @@ from test_strategy_spec import prices, spec
 # The policy and its id
 # --------------------------------------------------------------------------
 
-POLICY_V1_CANONICAL = (b'{"max_declared_drawdown_bps":2500,"max_declared_position_bps":2500,'
-                       b'"name":"qs-validation-policy-v1"}')
-POLICY_V1_ID = "qs-vp-sha256-v1:d2320ec069c167cef0629c93e82014e1eec25aa8be10658bb1a44890b8b1a0b7"
+POLICY_V1_CANONICAL = (
+    b'{"haircut_method":"bhy","max_declared_drawdown_bps":2500,"max_declared_position_bps":2500,'
+    b'"max_pbo_bps":500,"min_dsr_bps":9500,"min_haircut_sharpe_annual_milli":500,"min_t_statistic_milli":3000,'
+    b'"name":"qs-validation-policy-v1","pbo_min_block_sessions":21,"pbo_min_strategies":10,'
+    b'"pbo_splits":[16,12,8],"sessions_per_year":[["CRYPTO_SPOT_EOD",365],["EQUITY_EOD",252],'
+    b'["FUND_NAV_EOD",252],["FUTURES_CONTINUOUS_EOD",252],["FX_SPOT_EOD",252],["INDEX_EOD",252]]}')
+POLICY_V1_ID = "qs-vp-sha256-v1:55369c1a3cdedb3d4eb1b5505063ded09b7fb085d3cd53a89e0c0e1321cd5bb0"
 
 
 def test_policy_v1_has_its_golden_id():
@@ -26,15 +30,35 @@ def test_policy_v1_has_its_golden_id():
     hand, so a verdict naming the id can be checked by another
     implementation."""
     assert POLICY_V1_ID == f"qs-vp-sha256-v1:{hashlib.sha256(POLICY_V1_CANONICAL).hexdigest()}"
+    assert validation_policy.policy_canonical(POLICY_V1) == POLICY_V1_CANONICAL
     assert policy_id(POLICY_V1) == POLICY_V1_ID
     assert validation_policy.POLICY_ID.fullmatch(POLICY_V1_ID)
-    assert (POLICY_V1.max_declared_drawdown_bps, POLICY_V1.max_declared_position_bps) == (2_500, 2_500)
 
 
-@pytest.mark.parametrize("field", ["name", "max_declared_drawdown_bps", "max_declared_position_bps"])
+def test_policy_v1_holds_the_thresholds_chosen_for_it():
+    """The handoff table's values (decided 2026-11-15)."""
+    p = POLICY_V1
+    assert (p.max_declared_drawdown_bps, p.max_declared_position_bps) == (2_500, 2_500)
+    assert (p.min_dsr_bps, p.max_pbo_bps, p.pbo_min_strategies) == (9_500, 500, 10)
+    assert (p.pbo_splits, p.pbo_min_block_sessions) == ((16, 12, 8), 21)
+    assert (p.haircut_method, p.min_haircut_sharpe_annual_milli, p.min_t_statistic_milli) == ("bhy", 500, 3_000)
+    assert dict(p.sessions_per_year) == {"CRYPTO_SPOT_EOD": 365, "EQUITY_EOD": 252, "FUND_NAV_EOD": 252,
+                                         "FUTURES_CONTINUOUS_EOD": 252, "FX_SPOT_EOD": 252, "INDEX_EOD": 252}
+
+
+CHANGED = {"name": "other", "max_declared_drawdown_bps": 2_499, "max_declared_position_bps": 2_499,
+           "min_dsr_bps": 9_501, "max_pbo_bps": 499, "pbo_min_strategies": 11, "pbo_splits": (16, 12),
+           "pbo_min_block_sessions": 20, "haircut_method": "holm", "min_haircut_sharpe_annual_milli": 499,
+           "min_t_statistic_milli": 2_999, "sessions_per_year": (("EQUITY_EOD", 252),)}
+
+
+def test_every_field_is_listed_here():
+    assert set(CHANGED) == set(POLICY_V1.__dict__)
+
+
+@pytest.mark.parametrize("field", sorted(CHANGED))
 def test_every_field_is_part_of_the_id(field):
-    changed = {"name": "other", "max_declared_drawdown_bps": 2_499, "max_declared_position_bps": 2_499}
-    other = ValidationPolicy(**{**POLICY_V1.__dict__, field: changed[field]})
+    other = ValidationPolicy(**{**POLICY_V1.__dict__, field: CHANGED[field]})
     assert policy_id(other) != POLICY_V1_ID
 
 
@@ -43,8 +67,23 @@ def test_every_field_is_part_of_the_id(field):
     {"max_declared_drawdown_bps": 0}, {"max_declared_drawdown_bps": 10_001},
     {"max_declared_drawdown_bps": 2_500.0}, {"max_declared_drawdown_bps": True},
     {"max_declared_position_bps": -1}, {"max_declared_position_bps": "2500"},
+    {"min_dsr_bps": 0}, {"min_dsr_bps": 10_001}, {"min_dsr_bps": 0.95},
+    {"max_pbo_bps": -1}, {"max_pbo_bps": 10_001},
+    {"pbo_min_strategies": 1}, {"pbo_min_strategies": 1_001}, {"pbo_min_strategies": True},
+    {"pbo_min_block_sessions": 1}, {"pbo_min_block_sessions": 10_001},
+    {"min_haircut_sharpe_annual_milli": -1}, {"min_haircut_sharpe_annual_milli": 0.5},
+    {"min_t_statistic_milli": -1}, {"min_t_statistic_milli": 100_001},
+    {"pbo_splits": ()}, {"pbo_splits": [16, 12, 8]}, {"pbo_splits": (16, 13)}, {"pbo_splits": (8, 16)},
+    {"pbo_splits": (16, 16)}, {"pbo_splits": (0,)}, {"pbo_splits": (16.0,)}, {"pbo_splits": (True,)},
+    {"haircut_method": "bh"}, {"haircut_method": "BHY"},
+    {"sessions_per_year": ()}, {"sessions_per_year": [("EQUITY_EOD", 252)]},
+    {"sessions_per_year": (("EQUITY_EOD", 0),)}, {"sessions_per_year": (("EQUITY_EOD", 367),)},
+    {"sessions_per_year": (("EQUITY_EOD", 252.0),)}, {"sessions_per_year": (("", 252),)},
+    {"sessions_per_year": (("EQUITY_EOD", 252), ("CRYPTO_SPOT_EOD", 365))},
+    {"sessions_per_year": (("EQUITY_EOD", 252), ("EQUITY_EOD", 252))},
+    {"sessions_per_year": (("EQUITY_EOD", 252, 1),)},
 ])
-def test_a_policy_refuses_thresholds_that_are_not_basis_points(changes):
+def test_a_policy_refuses_thresholds_of_the_wrong_kind(changes):
     with pytest.raises(ValueError):
         ValidationPolicy(**{**POLICY_V1.__dict__, **changes})
 
@@ -265,7 +304,8 @@ def test_a_measurement_that_is_missing_or_not_a_share_fails_closed(risk, failing
 
 
 def test_the_gate_uses_the_policy_it_is_given():
-    loose = ValidationPolicy(name="loose", max_declared_drawdown_bps=10_000, max_declared_position_bps=10_000)
+    loose = ValidationPolicy(**{**POLICY_V1.__dict__, "name": "loose", "max_declared_drawdown_bps": 10_000,
+                                "max_declared_position_bps": 10_000})
     limits = strategy_spec.RiskLimits(max_drawdown_bps=5_000, max_position_bps=5_000)
     assert risk_gate(limits, CLEAN)["passed"] is False
     verdict = risk_gate(limits, CLEAN, loose)

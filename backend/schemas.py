@@ -674,6 +674,16 @@ class ValidationMatrixJob(ValidationMatrixRequest, MarketDataRequest):
     dataset_ids: list[str] = Field(min_length=1, max_length=DATASET_MAX_INPUTS)
 
 
+class StrategyValidationRequest(ValidationMatrixRequest):
+    """Validate one of the caller's strategy evaluations against the
+    validation policy, named as for its trial matrix."""
+
+
+class StrategyValidationJob(ValidationMatrixJob):
+    """A queued strategy validation: its trial matrix's job, judged by the
+    worker against the validation policy."""
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Alpha Research & Factor Modeling Schemas
 # ---------------------------------------------------------------------------

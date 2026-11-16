@@ -322,6 +322,43 @@ class ResearchTrialEvaluation(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class TrialMatrix(Base):
+    """A trial matrix a strategy validation judged (services/trial_matrix.py),
+    stored once under its id: ``canonical`` is the canonical JSON the id
+    hashes. Immutable, and the id is held to the hash by a CHECK (migration
+    0008, PostgreSQL SQL, so it lives in the migration only)."""
+    __tablename__ = "trial_matrices"
+
+    matrix_id = Column(String(96), primary_key=True)
+    canonical = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class StrategyValidation(Base):
+    """The validation policy's verdict on one strategy evaluation
+    (services/strategy_validation.py), one row per job: the policy (its id
+    and canonical JSON), the matrix it judged, whether every gate passed,
+    and every gate's figures. ``job_id`` has no foreign key: finished jobs
+    are purged, and verdicts stay.
+
+    Immutable: migration 0008 adds triggers that refuse UPDATE, DELETE and
+    TRUNCATE, and CHECKs that hold the policy id to its JSON and the
+    verdict's passed, policy and candidate to the columns."""
+    __tablename__ = "strategy_validations"
+
+    job_id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    evaluation_job_id = Column(String, ForeignKey("research_trial_evaluations.job_id"), nullable=False)
+    strategy_version_id = Column(String(80), ForeignKey("strategy_versions.version_id"), nullable=False)
+    family_hash = Column(String(64), nullable=False)
+    matrix_id = Column(String(96), ForeignKey("trial_matrices.matrix_id"), nullable=False)
+    policy_id = Column(String(96), nullable=False)
+    policy_canonical = Column(LargeBinary, nullable=False)
+    passed = Column(Boolean, nullable=False)
+    verdict = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 class ResearchJob(Base):
     """A research computation queued by the API and run by a worker process.
 

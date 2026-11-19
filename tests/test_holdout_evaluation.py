@@ -19,7 +19,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 
-from backend import main, models, worker
+from backend import main, models, schemas, worker
 from backend.services import (dataset_holdouts, holdout_evaluation, market_data, research_jobs, research_tasks,
                               research_trials, strategy_spec, trial_matrix, validation_policy)
 from backend.services.research_tasks import TaskError
@@ -246,14 +246,31 @@ def test_a_verdict_reached_with_no_holdout_is_never_graded(db, market, monkeypat
         holdout_evaluation.queue(db, validation, "1y", CAPITAL)
 
 
-def test_no_ordinary_worker_claims_a_holdout_evaluation(db, market, monkeypatch):
+def test_no_ordinary_worker_claims_a_holdout_evaluation_and_its_view_counts_only_evaluators(
+        db, market, monkeypatch):
     _, _, _, validation = candidate(db, monkeypatch)
     job = holdout_evaluation.queue(db, validation, "1y", CAPITAL)
     for role in ("api", "research-worker"):
         assert evaluator(db, role=role).run_once() is False
     db.expire_all()
-    assert db.get(models.ResearchJob, job.id).status == "queued"
+    queued = db.get(models.ResearchJob, job.id)
+    assert queued.status == "queued"
     assert rows(db, models.HoldoutAttempt) == []
+    # Those two workers heartbeated, but neither can run it.
+    assert research_jobs.view(db, queued)["workers_online"] == 0
+    research_jobs.heartbeat_worker(db, "evaluator-1", "host", 1, None, research_jobs.EVALUATOR_ROLE)
+    db.expire_all()
+    assert research_jobs.view(db, db.get(models.ResearchJob, job.id))["workers_online"] == 1
+
+
+def test_a_stat_test_counts_the_familys_holdout_attempts_as_trials(db, market, monkeypatch):
+    user, _, _, validation = candidate(db, monkeypatch)
+    before = research_trials.count(db, user.id, FAMILY)
+    assert grade_it(db, validation)["status"] == "succeeded"
+    response = main.statistical_tests(schemas.StatTestRequest(returns=[0.01, -0.02, 0.003, 0.004, -0.001, 0.002],
+                                                              trial_family=FAMILY), user=user, db=db)
+    queued = db.get(models.ResearchJob, json.loads(response.body)["job_id"])
+    assert queued.params_json["server_counted"] == before + 1 == research_trials.count(db, user.id, FAMILY) + 1
 
 
 class _Altered(InlineJobProcess):

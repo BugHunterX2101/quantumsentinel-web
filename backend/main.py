@@ -1899,9 +1899,12 @@ def statistical_tests(req: schemas.StatTestRequest,
         raise HTTPException(422, "Every return observation must be a finite number")
 
     # The Deflated Sharpe discount uses at least every configuration the
-    # server evaluated for this research family (counted now, when the test
-    # is queued), whatever is declared.
-    server_counted = research_trials.count(db, user.id, trial_family) if trial_family else 0
+    # server evaluated for this research family, and every holdout attempt
+    # spent in it (counted now, when the test is queued), whatever is
+    # declared.
+    from .services.holdout_evaluation import holdout_queries
+    server_counted = (research_trials.count(db, user.id, trial_family) + holdout_queries(db, user.id, trial_family)
+                      if trial_family else 0)
     n_trials = max(req.n_strategies_tested, server_counted)
     return _queue_job(db, user, "stat_test", {
         "returns": [float(r) for r in returns], "n_trials": n_trials,

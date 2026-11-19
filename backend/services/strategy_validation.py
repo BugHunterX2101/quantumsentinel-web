@@ -26,7 +26,8 @@ not the series).
 
 The verdict and the matrix are stored in the transaction that stores the
 job's result (migration 0008): the matrix once under its id, the verdict once
-per job, both append-only. The job records no trial. A verdict is
+per job, both append-only. So is the verdict's signed manifest (v3,
+services/validation_manifest.py, migration 0009). The job records no trial. A verdict is
 pre-holdout: passing it makes a candidate eligible for the one-shot holdout
 evaluation, which is not part of it.
 """
@@ -41,7 +42,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from .. import models
-from . import trial_matrix
+from . import trial_matrix, validation_manifest
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +92,13 @@ def finalize_validation_job(db: Session, job: models.ResearchJob, result: dict, 
         policy_canonical=validation_policy.policy_canonical(policy), passed=verdict["passed"], verdict=verdict,
         created_at=now))
     db.flush()
+    try:
+        validation_manifest.record(db, job=job, created_at=now, evaluation=evaluation,
+                                   dataset_family=spec.universe.family, policy_id=verdict["policy"],
+                                   matrix_id=matrix["id"], verdict=verdict)
+    except validation_manifest.ManifestError as exc:
+        log.error("strategy validation job %s: its manifest could not be signed: %s", job.id, exc)
+        raise TaskError(500, "The validation's manifest could not be signed") from exc
 
     result = {key: value for key, value in result.items() if key not in ("matrix", "risk", "cost_stress")}
     result.update(matrix_id=matrix["id"], validation=verdict)

@@ -12,6 +12,9 @@
 #   H. a fresh install: provision, the backup service first, then up
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+# The commit the current file's image is built from (its QS_CODE_COMMIT build argument).
+QS_CODE_COMMIT=$(git rev-parse HEAD)
+export QS_CODE_COMMIT
 
 OLD=(docker compose -p qsci -f "$RUNNER_TEMP/compose.superuser.yml" --project-directory . --env-file .env.production)
 NEW=(docker compose -p qsci -f docker-compose.production.yml --env-file .env.production)
@@ -151,6 +154,8 @@ echo "::endgroup::"
 
 echo "::group::C. provision while the API runs, then up"
 "${NEW[@]}" --profile provision run --rm provision
+# Era A's file built the image without the commit; build it as the current file does.
+"${NEW[@]}" build -q
 "${NEW[@]}" up -d
 ready
 echo "::endgroup::"
@@ -171,6 +176,11 @@ if "${NEW[@]}" exec -T quantumsentinel env | grep -qF "$superuser_password"; the
 fi
 echo "the API, research-worker and migrate containers do not hold the superuser password"
 python3 .github/scripts/compose_smoke.py verify era-a@example.com
+# The image records the commit it was built from (validation manifests name it).
+commit=$("${NEW[@]}" exec -T research-worker python -c \
+  "from backend.services.validation_manifest import code_commit; print(code_commit())" | tr -d '\r')
+echo "the research worker records code commit $commit"
+test "$commit" = "$QS_CODE_COMMIT"
 # The jobs ran in the research-worker container: worker ids start with its hostname.
 worker_host=$("${NEW[@]}" exec -T research-worker python -c "import socket; print(socket.gethostname())" | tr -d '\r')
 ran_on=$("${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -Atc \

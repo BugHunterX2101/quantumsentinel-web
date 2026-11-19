@@ -88,6 +88,9 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "user_strategy_tags": ("SELECT", "INSERT"),
     "user_strategy_versions": ("SELECT", "INSERT"),
     "users": DML,
+    # Append-only (migration 0009's triggers): each verdict's signed
+    # manifest, written by the (embedded) worker with the verdict.
+    "validation_manifests": ("SELECT", "INSERT"),
     "webhooks": DML,
 }
 
@@ -125,9 +128,11 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # must hold, before the job process starts; the worker never registers one.
     "strategy_versions": ("SELECT",),
     "user_strategy_versions": ("SELECT",),
-    # A strategy validation records the matrix it judged and its verdict.
+    # A strategy validation records the matrix it judged, its verdict and
+    # the verdict's signed manifest (registering the signing key with it).
     "strategy_validations": ("SELECT", "INSERT"),
     "trial_matrices": ("SELECT", "INSERT"),
+    "validation_manifests": ("SELECT", "INSERT"),
 }
 
 _ROLE_ATTRIBUTES = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"

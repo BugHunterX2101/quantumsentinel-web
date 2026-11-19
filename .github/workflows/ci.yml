@@ -152,7 +152,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Docker image
-        run: docker build -t quantumsentinel:ci .
+        run: docker build --build-arg QS_CODE_COMMIT="$(git rev-parse HEAD)" -t quantumsentinel:ci .
       - name: Run Trivy (container scan)
         uses: aquasecurity/trivy-action@v0.36.0
         with:

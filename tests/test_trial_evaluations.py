@@ -210,8 +210,9 @@ def test_a_backtest_reports_its_risk_and_what_the_policys_risk_gate_says_of_it(d
         assert view["status"] == "succeeded", view
         result = view["result"]
         risk, check = result["risk"], result["risk_check"]
-        assert check == validation_policy.risk_gate(strategy_spec.parse(value).risk_limits, risk)
-        assert check["policy"] == validation_policy.policy_id(validation_policy.POLICY_V1)
+        assert check == validation_policy.risk_gate(strategy_spec.parse(value).risk_limits, risk,
+                                                    validation_policy.CURRENT_POLICY)
+        assert check["policy"] == validation_policy.policy_id(validation_policy.CURRENT_POLICY)
         assert check["checks"]["declared_position_within_policy"]["passed"] is declared_ok
         assert check["passed"] is (declared_ok and check["checks"]["drawdown_within_declared"]["passed"])
         # 2% fixed-fractional positions.

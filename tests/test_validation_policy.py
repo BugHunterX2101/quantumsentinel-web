@@ -1,15 +1,16 @@
 """The validation policy (services/validation_policy.py) and the risk
 measurements the event engine reports for its risk gate."""
+import dataclasses
 import hashlib
 import math
 
 import numpy as np
 import pytest
 
-from backend.services import strategy_spec, validation_policy
+from backend.services import event_simulator, strategy_spec, validation_policy
 from backend.services.event_simulator import run_event_backtest
 from backend.services.strategy_signals import ma_crossover_series
-from backend.services.validation_policy import POLICY_V1, ValidationPolicy, policy_id, risk_gate
+from backend.services.validation_policy import POLICY_V1, POLICY_V2, ValidationPolicy, policy_id, risk_gate
 from test_strategy_spec import prices, spec
 
 # --------------------------------------------------------------------------
@@ -49,7 +50,8 @@ def test_policy_v1_holds_the_thresholds_chosen_for_it():
 CHANGED = {"name": "other", "max_declared_drawdown_bps": 2_499, "max_declared_position_bps": 2_499,
            "min_dsr_bps": 9_501, "max_pbo_bps": 499, "pbo_min_strategies": 11, "pbo_splits": (16, 12),
            "pbo_min_block_sessions": 20, "haircut_method": "holm", "min_haircut_sharpe_annual_milli": 499,
-           "min_t_statistic_milli": 2_999, "sessions_per_year": (("EQUITY_EOD", 252),)}
+           "min_t_statistic_milli": 2_999, "sessions_per_year": (("EQUITY_EOD", 252),),
+           "cost_stress_multiplier_centi": 200}
 
 
 def test_every_field_is_listed_here():
@@ -82,10 +84,46 @@ def test_every_field_is_part_of_the_id(field):
     {"sessions_per_year": (("EQUITY_EOD", 252), ("CRYPTO_SPOT_EOD", 365))},
     {"sessions_per_year": (("EQUITY_EOD", 252), ("EQUITY_EOD", 252))},
     {"sessions_per_year": (("EQUITY_EOD", 252, 1),)},
+    {"cost_stress_multiplier_centi": 100}, {"cost_stress_multiplier_centi": 1_001},
+    {"cost_stress_multiplier_centi": 0}, {"cost_stress_multiplier_centi": 200.0},
+    {"cost_stress_multiplier_centi": True}, {"cost_stress_multiplier_centi": "200"},
 ])
 def test_a_policy_refuses_thresholds_of_the_wrong_kind(changes):
     with pytest.raises(ValueError):
         ValidationPolicy(**{**POLICY_V1.__dict__, **changes})
+
+
+@pytest.mark.parametrize("multiplier", [None, 101, 200, 1_000])
+def test_a_cost_stress_of_101_to_1000_hundredths_or_none_is_accepted(multiplier):
+    policy = ValidationPolicy(**{**POLICY_V1.__dict__, "cost_stress_multiplier_centi": multiplier})
+    assert policy.cost_stress_multiplier_centi == multiplier
+
+
+POLICY_V2_CANONICAL = (
+    b'{"cost_stress_multiplier_centi":200,'
+    b'"haircut_method":"bhy","max_declared_drawdown_bps":2500,"max_declared_position_bps":2500,'
+    b'"max_pbo_bps":500,"min_dsr_bps":9500,"min_haircut_sharpe_annual_milli":500,"min_t_statistic_milli":3000,'
+    b'"name":"qs-validation-policy-v2","pbo_min_block_sessions":21,"pbo_min_strategies":10,'
+    b'"pbo_splits":[16,12,8],"sessions_per_year":[["CRYPTO_SPOT_EOD",365],["EQUITY_EOD",252],'
+    b'["FUND_NAV_EOD",252],["FUTURES_CONTINUOUS_EOD",252],["FX_SPOT_EOD",252],["INDEX_EOD",252]]}')
+POLICY_V2_ID = "qs-vp-sha256-v1:07f52fc8e5cd48f43c48f13e79f83b191ffe4e114942b5f255e9b5d7ac01fcbd"
+
+
+def test_policy_v2_is_v1_with_a_2x_cost_stress_and_has_its_golden_id():
+    assert POLICY_V2_ID == f"qs-vp-sha256-v1:{hashlib.sha256(POLICY_V2_CANONICAL).hexdigest()}"
+    assert validation_policy.policy_canonical(POLICY_V2) == POLICY_V2_CANONICAL
+    assert policy_id(POLICY_V2) == POLICY_V2_ID
+    assert validation_policy.CURRENT_POLICY is POLICY_V2
+    assert {**POLICY_V2.__dict__, "name": POLICY_V1.name, "cost_stress_multiplier_centi": None} == \
+        POLICY_V1.__dict__
+
+
+def test_a_policy_without_cost_stress_keeps_the_id_it_had_before_the_field_existed():
+    """Verdicts reached under v1 name its id; the field v2 added is left out of
+    a canonical JSON that has no cost stress."""
+    assert POLICY_V1.cost_stress_multiplier_centi is None
+    assert b"cost_stress" not in validation_policy.policy_canonical(POLICY_V1)
+    assert policy_id(POLICY_V1) == POLICY_V1_ID
 
 
 def test_a_policy_is_frozen():
@@ -224,6 +262,76 @@ def test_a_short_that_loses_everything_is_reported_as_exhausting_equity():
     assert risk["equity_exhausted"] is True
     assert risk["max_drawdown"] > 1.0
     assert math.isfinite(risk["max_position_share"]) and risk["max_position_share"] > 1.0
+
+
+# --------------------------------------------------------------------------
+# The engine's cost multiplier (the cost stress)
+# --------------------------------------------------------------------------
+
+def _compiled(cost_model="retail"):
+    return strategy_spec.compile_spec(strategy_spec.parse(spec(**{"signal.fast": 5, "signal.slow": 20,
+                                                                  "cost_model": cost_model})))
+
+
+def _growth(result):
+    return float(np.prod(1 + np.asarray(result["returns"])))
+
+
+@pytest.mark.parametrize("cost_model", ["retail", "institutional", "zero_cost"])
+def test_a_multiplier_of_100_runs_exactly_as_without_it(cost_model):
+    compiled = _compiled(cost_model)
+    data = prices(compiled.tickers, bars=400)
+    plain = compiled.run(data, 100_000.0, full_returns=True, risk_metrics=True)
+    same = compiled.run(data, 100_000.0, full_returns=True, risk_metrics=True, cost_multiplier_centi=100)
+    np.testing.assert_array_equal(same.pop("returns"), plain.pop("returns"))
+    assert same == plain
+
+
+@pytest.mark.parametrize("multiplier", [101, 150, 200, 1_000])
+def test_the_multiplier_scales_every_parameter_of_the_cost_model(monkeypatch, multiplier):
+    """Every field of the model, whatever fields it has (the borrow rate
+    included), so a cost added to the model later cannot escape the stress."""
+    seen = []
+    compute_fill = event_simulator.TransactionCostModel.compute_fill
+
+    def spy(self, *args, **kwargs):
+        seen.append(self)
+        return compute_fill(self, *args, **kwargs)
+
+    monkeypatch.setattr(event_simulator.TransactionCostModel, "compute_fill", spy)
+    compiled = _compiled()
+    data = prices(compiled.tickers, bars=400)
+    compiled.run(data, 100_000.0)
+    plain = seen[-1]
+    compiled.run(data, 100_000.0, cost_multiplier_centi=multiplier)
+    stressed = seen[-1]
+    for field in dataclasses.fields(event_simulator.TransactionCostModel):
+        before, after = getattr(plain, field.name), getattr(stressed, field.name)
+        assert before > 0 and after == before * (multiplier / 100), field.name
+
+
+def test_dearer_costs_end_poorer():
+    compiled = _compiled()
+    data = prices(compiled.tickers, bars=400)
+    growth = [_growth(compiled.run(data, 100_000.0, full_returns=True, cost_multiplier_centi=m))
+              for m in (100, 200, 1_000)]
+    assert growth[0] > growth[1] > growth[2]
+
+
+def test_doubling_no_costs_changes_nothing():
+    compiled = _compiled("zero_cost")
+    data = prices(compiled.tickers, bars=400)
+    plain = compiled.run(data, 100_000.0, full_returns=True)
+    doubled = compiled.run(data, 100_000.0, full_returns=True, cost_multiplier_centi=200)
+    np.testing.assert_array_equal(doubled.pop("returns"), plain.pop("returns"))
+    assert doubled == plain
+
+
+@pytest.mark.parametrize("multiplier", [0, -100, True, 200.0, "200", None])
+def test_a_multiplier_that_is_not_a_positive_integer_is_refused(multiplier):
+    compiled = _compiled()
+    with pytest.raises(ValueError, match="cost_multiplier_centi"):
+        compiled.run(prices(compiled.tickers, bars=400), 100_000.0, cost_multiplier_centi=multiplier)
 
 
 # --------------------------------------------------------------------------

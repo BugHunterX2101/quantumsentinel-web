@@ -70,6 +70,10 @@ class JobKind:
     # (the job process has none) and returns it, a dict the task takes as its
     # second argument. A TaskError fails the job before it runs.
     prepare: str | None = None
+    # The kind grades a strategy on its holdout (R1-5b): only the research
+    # evaluator claims it, and the evaluator claims nothing else
+    # (claimable_kinds).
+    evaluator: bool = False
 
 
 _TASKS = "backend.services.research_tasks"
@@ -123,6 +127,36 @@ KINDS: dict[str, JobKind] = {
                                    "STRATEGY_VALIDATION", f"{_VALIDATION}:finalize_validation_job",
                                    market_data=True, prepare=f"{_MATRIX}:matrix_inputs"),
 }
+
+
+# The process roles (config.PROCESS_ROLE) whose workers run research. The API
+# runs one (its embedded worker inherits the API's environment) and so does
+# the research-worker service; the research evaluator runs the evaluator
+# kinds, which see the holdout the others never may.
+EVALUATOR_ROLE = "research-evaluator"
+_RESEARCH_ROLES = ("api", "research-worker")
+
+
+def claimable_kinds(role: str) -> tuple[str, ...]:
+    """The job kinds a worker running as ``role`` may claim.
+
+    Fail-closed: a role not named here claims nothing, and no role claims a
+    kind this code does not know (a newer release's job stays queued for a
+    worker that knows it, instead of being failed by one that does not).
+    """
+    if role == EVALUATOR_ROLE:
+        return tuple(sorted(name for name, kind in KINDS.items() if kind.evaluator))
+    if role in _RESEARCH_ROLES:
+        return tuple(sorted(name for name, kind in KINDS.items() if not kind.evaluator))
+    return ()
+
+
+def _pool(kind_name: str) -> tuple[str, ...]:
+    """The kinds claimed by the same workers as ``kind_name``."""
+    kind = KINDS.get(kind_name)
+    if kind is None:
+        return (kind_name,)
+    return claimable_kinds(EVALUATOR_ROLE if kind.evaluator else "research-worker")
 
 
 class QueueFull(Exception):
@@ -284,9 +318,11 @@ def view(db: Session, job: models.ResearchJob, include_result: bool = True) -> d
     if job.status in ACTIVE:
         out["workers_online"] = workers_online(db)
     if job.status == QUEUED:
+        # Only jobs the same workers claim are ahead of this one.
         out["queue_position"] = 1 + int(db.execute(
             select(func.count()).select_from(models.ResearchJob).where(
                 models.ResearchJob.status == QUEUED,
+                models.ResearchJob.kind.in_(_pool(job.kind)),
                 models.ResearchJob.created_at < job.created_at)
         ).scalar() or 0)
     if job.status == FAILED:
@@ -317,12 +353,20 @@ def queue_stats(db: Session) -> dict:
 # Worker side
 # --------------------------------------------------------------------------
 
-def claim_next(db: Session, worker_id: str, lease_seconds: float) -> models.ResearchJob | None:
-    """Atomically take the oldest queued job, or return None."""
+def claim_next(db: Session, worker_id: str, lease_seconds: float,
+               role: str) -> models.ResearchJob | None:
+    """Atomically take the oldest queued job a worker running as ``role`` may
+    run (claimable_kinds), or return None."""
+    kinds = claimable_kinds(role)
+    if not kinds:
+        return None
     for _ in range(5):
         # SKIP LOCKED: workers polling together each take a different job
-        # instead of queueing on the same row.
-        query = (select(models.ResearchJob.id).where(models.ResearchJob.status == QUEUED)
+        # instead of queueing on the same row. The kind filter is part of the
+        # locking read, so a job another role runs is never claimed, not even
+        # briefly: a claim spends one of the job's attempts.
+        query = (select(models.ResearchJob.id).where(models.ResearchJob.status == QUEUED,
+                                                     models.ResearchJob.kind.in_(kinds))
                  .order_by(models.ResearchJob.created_at).limit(1).with_for_update(skip_locked=True))
         job_id = db.execute(query).scalar()
         if job_id is None:

@@ -238,7 +238,7 @@ class Worker:
                  lease_seconds: float = RESEARCH_JOB_LEASE_SECONDS,
                  timeout_seconds: float = RESEARCH_JOB_TIMEOUT_SECONDS,
                  poll_seconds: float = RESEARCH_WORKER_POLL_SECONDS,
-                 session_factory=SessionLocal):
+                 session_factory=SessionLocal, role: str = PROCESS_ROLE):
         self.hostname = socket.gethostname()
         self.pid = os.getpid()
         # Fits research_workers.id (128) whatever the hostname's length.
@@ -248,6 +248,8 @@ class Worker:
         self.timeout_seconds = timeout_seconds
         self.poll_seconds = poll_seconds
         self.session_factory = session_factory
+        # Decides which job kinds this worker claims (research_jobs.claimable_kinds).
+        self.role = role
         self.stop_event = threading.Event()
         self._last_heartbeat = 0.0
         self._last_purge = 0.0
@@ -279,8 +281,11 @@ class Worker:
         db = self.session_factory()
         try:
             self._heartbeat(db, None)
-            self._housekeeping(db)
-            job = research_jobs.claim_next(db, self.id, self.lease_seconds)
+            if self.role != research_jobs.EVALUATOR_ROLE:
+                # Reaping and purging act on every kind's jobs; the evaluator
+                # touches only the jobs it claims.
+                self._housekeeping(db)
+            job = research_jobs.claim_next(db, self.id, self.lease_seconds, self.role)
             if job is None:
                 return False
             self._execute(db, job)
@@ -293,8 +298,12 @@ class Worker:
         job_id, attempt = job.id, job.attempts
         kind = research_jobs.KINDS.get(job.kind)
         log.info("running research job %s (%s), attempt %d", job.id, job.kind, attempt)
-        if kind is None:
-            research_jobs.fail(db, job, self.id, attempt, 500, "Unknown research job kind")
+        if kind is None or job.kind not in research_jobs.claimable_kinds(self.role):
+            # claim_next never hands out such a job; if one arrives anyway,
+            # give it back unrun, without spending the attempt.
+            log.error("research job %s (%s) is not this worker's to run (role %s); released",
+                      job.id, job.kind, self.role)
+            research_jobs.release(db, job, self.id, attempt)
             return
         self._heartbeat(db, job.id, force=True)
         renew_every = max(1.0, self.lease_seconds / 3)

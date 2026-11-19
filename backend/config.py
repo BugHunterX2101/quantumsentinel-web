@@ -16,12 +16,13 @@ def _setting(name: str, default: str | None = None) -> str | None:
 
 ENVIRONMENT = _setting("ENVIRONMENT", "development").lower()
 # Which process this is. In production each requires only the secrets it
-# uses: the API all of them; a research worker its database URL and the
-# server signing key; a research job process none, and its worker starts it
-# with none (backend/worker.py).
+# uses: the API all of them; a research worker or the research evaluator its
+# database URL and the server signing key; a research job process none, and
+# its worker starts it with none (backend/worker.py). The role also decides
+# which job kinds a worker claims (research_jobs.claimable_kinds).
 PROCESS_ROLE = _setting("QS_PROCESS_ROLE", "api")
-if PROCESS_ROLE not in ("api", "research-worker", "research-job"):
-    raise RuntimeError("QS_PROCESS_ROLE must be one of: api, research-worker, research-job")
+if PROCESS_ROLE not in ("api", "research-worker", "research-evaluator", "research-job"):
+    raise RuntimeError("QS_PROCESS_ROLE must be one of: api, research-worker, research-evaluator, research-job")
 # The commit the image was built from (the Dockerfile's QS_CODE_COMMIT build
 # argument, set by CI and the deployment); strategy validation manifests
 # record it (services/validation_manifest.py).
@@ -172,7 +173,8 @@ ALLOWED_HOSTS = [host.strip() for host in os.getenv(
 ).split(",") if host.strip()]
 
 if ENVIRONMENT == "production" and PROCESS_ROLE != "research-job":
-    # The API and research workers: both sign audit events and use the database.
+    # The API, research workers and the research evaluator: all sign audit
+    # events and use the database.
     if not SERVER_DSA_PRIVATE_KEY or not SERVER_DSA_PUBLIC_KEY:
         raise RuntimeError("SERVER_DSA_PRIVATE_KEY and SERVER_DSA_PUBLIC_KEY are required in production")
     if not _setting("DATABASE_URL"):

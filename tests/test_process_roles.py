@@ -1,6 +1,7 @@
 """QS_PROCESS_ROLE (backend/config.py): in production each process requires
-only the secrets it uses. The API requires all of them, a research worker its
-database URL and the server signing key, a research job process none. Each
+only the secrets it uses. The API requires all of them, a research worker or
+the research evaluator its database URL and the server signing key, a
+research job process none. Each
 check imports the code in a fresh interpreter with a controlled environment;
 none of them connects to a database (port 1 refuses anything)."""
 import os
@@ -35,6 +36,17 @@ def test_a_research_worker_starts_without_the_apis_secrets():
     assert result.stdout.strip() == "research-worker"
 
 
+def test_the_research_evaluator_needs_what_a_research_worker_needs():
+    """Its database URL and the server signing key, and none of the API's secrets."""
+    evaluator = {**WORKER, "QS_PROCESS_ROLE": "research-evaluator"}
+    result = run("import backend.config as c; print(c.PROCESS_ROLE)", evaluator)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "research-evaluator"
+    without_key = {name: value for name, value in evaluator.items() if name != "SERVER_DSA_PRIVATE_KEY"}
+    result = run("import backend.config", without_key)
+    assert result.returncode != 0 and "SERVER_DSA_PRIVATE_KEY and SERVER_DSA_PUBLIC_KEY are required" in result.stderr
+
+
 @pytest.mark.parametrize("missing,message", [
     ("SERVER_DSA_PRIVATE_KEY", "SERVER_DSA_PRIVATE_KEY and SERVER_DSA_PUBLIC_KEY are required"),
     ("DATABASE_URL", "DATABASE_URL is required"),
@@ -66,11 +78,11 @@ def test_an_unknown_role_is_refused():
     assert result.returncode != 0 and "QS_PROCESS_ROLE must be one of" in result.stderr
 
 
-def test_the_api_refuses_to_run_as_a_research_process():
-    result = run("import backend.main", {"QS_PROCESS_ROLE": "research-worker",
-                                         "DATABASE_URL": WORKER["DATABASE_URL"]})
+@pytest.mark.parametrize("role", ["research-worker", "research-evaluator"])
+def test_the_api_refuses_to_run_as_a_research_process(role):
+    result = run("import backend.main", {"QS_PROCESS_ROLE": role, "DATABASE_URL": WORKER["DATABASE_URL"]})
     assert result.returncode != 0
-    assert "the API cannot run as QS_PROCESS_ROLE=research-worker" in result.stderr
+    assert f"the API cannot run as QS_PROCESS_ROLE={role}" in result.stderr
 
 
 def test_a_worker_refuses_to_run_as_a_job_process():

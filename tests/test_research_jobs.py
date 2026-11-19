@@ -320,7 +320,7 @@ class TestWorkerExecution:
         order = []
         for _ in range(3):
             s = Session()
-            job = research_jobs.claim_next(s, w.id, 60)
+            job = research_jobs.claim_next(s, w.id, 60, "research-worker")
             order.append(job.id)
             s.close()
         assert order == ids
@@ -344,7 +344,7 @@ class TestLeases:
             s = Session()
             try:
                 while True:
-                    job = research_jobs.claim_next(s, f"worker-{n}", 60)
+                    job = research_jobs.claim_next(s, f"worker-{n}", 60, "research-worker")
                     if job is None:
                         return
                     with lock:
@@ -363,14 +363,14 @@ class TestLeases:
         db = Session()
         user = make_user(db)
         job_id = research_jobs.enqueue(db, user.id, "stat_test", {}).id
-        first = research_jobs.claim_next(db, "worker-a", 60)
+        first = research_jobs.claim_next(db, "worker-a", 60, "research-worker")
         # worker-a stops renewing; its lease lapses and the reaper requeues the job.
         db.query(models.ResearchJob).filter_by(id=job_id).update(
             {"lease_expires_at": research_jobs.utcnow() - pd.Timedelta(seconds=1)})
         db.commit()
         assert research_jobs.reap_expired(db) == 1
         assert state(Session, job_id)["status"] == "queued"
-        second = research_jobs.claim_next(db, "worker-b", 60)
+        second = research_jobs.claim_next(db, "worker-b", 60, "research-worker")
         assert second.attempts == 2
 
         assert research_jobs.renew_lease(db, first, "worker-a", 1, 60) == "lost"
@@ -387,7 +387,7 @@ class TestLeases:
         db = Session()
         user = make_user(db)
         job_id = research_jobs.enqueue(db, user.id, "stat_test", {}).id
-        first = research_jobs.claim_next(db, "worker-a", 60)
+        first = research_jobs.claim_next(db, "worker-a", 60, "research-worker")
         # Another worker naming the current attempt does not hold the lease.
         assert research_jobs.renew_lease(db, first, "worker-b", 1, 60) == "lost"
         assert research_jobs.complete(db, first, "worker-b", 1, {"intruder": True}, {}, None) is False
@@ -400,7 +400,7 @@ class TestLeases:
             {"lease_expires_at": research_jobs.utcnow() - pd.Timedelta(seconds=1)})
         db.commit()
         assert research_jobs.reap_expired(db) == 1
-        second = research_jobs.claim_next(db, "worker-a", 60)
+        second = research_jobs.claim_next(db, "worker-a", 60, "research-worker")
         assert second.attempts == 2
         assert research_jobs.renew_lease(db, first, "worker-a", 1, 60) == "lost"
         assert research_jobs.complete(db, first, "worker-a", 1, {"stale": True}, {}, None) is False
@@ -435,7 +435,7 @@ class TestLeases:
         db = Session()
         user = make_user(db)
         job_id = research_jobs.enqueue(db, user.id, "correlation", {}).id
-        research_jobs.claim_next(db, "worker-a", 60)
+        research_jobs.claim_next(db, "worker-a", 60, "research-worker")
         assert research_jobs.reap_expired(db) == 0
         assert state(Session, job_id)["status"] == "running"
         db.close()
@@ -464,6 +464,131 @@ class TestLeases:
         assert research_jobs.purge_finished(db, retention_days=7) == 1
         remaining = {j.id for j in db.execute(select(models.ResearchJob)).scalars()}
         assert remaining == {recent, active}
+        db.close()
+
+
+# ── 3b. Which worker claims which kind ──────────────────────────────────────────
+
+def untouched(Session, job_id):
+    """Still queued, never claimed: no attempt spent, no worker, no result."""
+    s = state(Session, job_id)
+    return (s["status"], s["attempts"], s["worker_id"], s["result"]) == ("queued", 0, None, None)
+
+
+class TestKindRouting:
+    """Which worker claims which job kind (research_jobs.claimable_kinds).
+
+    An evaluator kind grades a strategy on its holdout, so the API's embedded
+    worker and the research-worker service must never claim one, not even
+    to reject it: a claim spends one of the job's attempts.
+    """
+
+    @pytest.fixture
+    def evaluator_kind(self, monkeypatch):
+        monkeypatch.setitem(research_jobs.KINDS, "test_holdout_grade", research_jobs.JobKind(
+            dict, "research_job_helpers:echo_task", "TEST_JOB", evaluator=True))
+        register_kind(monkeypatch, "test_echo", "echo_task")
+        return "test_holdout_grade"
+
+    def queued(self, db, kind):
+        user = db.query(models.User).first() or make_user(db)
+        return research_jobs.enqueue(db, user.id, kind, {"n": 1}).id
+
+    @pytest.mark.parametrize("role", ["api", "research-worker"])
+    def test_research_workers_never_claim_an_evaluator_kind(self, Session, evaluator_kind, role):
+        db = Session()
+        job_id = self.queued(db, evaluator_kind)
+        assert research_jobs.claim_next(db, "worker-a", 60, role) is None
+        assert make_worker(Session, role=role).run_once() is False
+        assert untouched(Session, job_id)
+        db.close()
+
+    def test_the_evaluator_claims_only_evaluator_kinds(self, Session, evaluator_kind):
+        db = Session()
+        ordinary = self.queued(db, "test_echo")
+        graded = self.queued(db, evaluator_kind)
+        # The ordinary job is older, and still not the evaluator's.
+        job = research_jobs.claim_next(db, "evaluator", 60, research_jobs.EVALUATOR_ROLE)
+        assert job.id == graded
+        assert research_jobs.claim_next(db, "evaluator", 60, research_jobs.EVALUATOR_ROLE) is None
+        assert untouched(Session, ordinary)
+        # ...which a research worker then runs.
+        assert make_worker(Session, role="research-worker").run_once() is True
+        assert state(Session, ordinary)["status"] == "succeeded"
+        db.close()
+
+    def test_an_evaluator_worker_runs_its_job_and_nothing_else(self, Session, evaluator_kind):
+        db = Session()
+        ordinary = self.queued(db, "test_echo")
+        graded = self.queued(db, evaluator_kind)
+        evaluator = make_worker(Session, role=research_jobs.EVALUATOR_ROLE)
+        assert evaluator.run_once() is True
+        assert evaluator.run_once() is False
+        assert state(Session, graded)["status"] == "succeeded"
+        assert untouched(Session, ordinary)
+        db.close()
+
+    @pytest.mark.parametrize("role", ["research-job", "admin", ""])
+    def test_any_other_role_claims_nothing(self, Session, evaluator_kind, role):
+        db = Session()
+        ids = [self.queued(db, "test_echo"), self.queued(db, evaluator_kind)]
+        assert research_jobs.claimable_kinds(role) == ()
+        assert research_jobs.claim_next(db, "worker-a", 60, role) is None
+        assert all(untouched(Session, i) for i in ids)
+        db.close()
+
+    def test_a_kind_this_code_does_not_know_stays_queued(self, Session):
+        """A newer release's job waits for a worker that knows its kind."""
+        db = Session()
+        job_id = self.queued(db, "stat_test")
+        db.query(models.ResearchJob).filter_by(id=job_id).update({"kind": "from_a_newer_release"})
+        db.commit()
+        for role in ("api", "research-worker", research_jobs.EVALUATOR_ROLE):
+            assert make_worker(Session, role=role).run_once() is False
+        assert untouched(Session, job_id)
+        db.close()
+
+    def test_the_roles_split_every_kind_between_them(self):
+        research = set(research_jobs.claimable_kinds("research-worker"))
+        assert research == set(research_jobs.claimable_kinds("api"))
+        evaluator = set(research_jobs.claimable_kinds(research_jobs.EVALUATOR_ROLE))
+        assert research.isdisjoint(evaluator)
+        assert research | evaluator == set(research_jobs.KINDS)
+
+    def test_the_evaluator_leaves_other_workers_jobs_alone(self, Session, evaluator_kind):
+        """No reaping or purging: it touches only the jobs it claims."""
+        db = Session()
+        job_id = self.queued(db, "test_echo")
+        db.query(models.ResearchJob).filter_by(id=job_id).update(
+            {"status": "running", "worker_id": "gone", "attempts": 1,
+             "lease_expires_at": research_jobs.utcnow() - pd.Timedelta(seconds=1)})
+        db.commit()
+        assert make_worker(Session, role=research_jobs.EVALUATOR_ROLE).run_once() is False
+        assert state(Session, job_id)["status"] == "running"
+        assert make_worker(Session, role="research-worker").run_once() is True  # reaps, then runs it
+        assert state(Session, job_id)["status"] == "succeeded"
+        db.close()
+
+    def test_a_job_outside_the_role_is_released_unrun(self, Session, evaluator_kind):
+        """claim_next never hands one out; if one arrives anyway, the worker
+        gives it back without spending the attempt."""
+        db = Session()
+        job_id = self.queued(db, evaluator_kind)
+        job = research_jobs.claim_next(db, "worker-a", 60, research_jobs.EVALUATOR_ROLE)
+        w = make_worker(Session, role="research-worker")
+        w.id = "worker-a"
+        w._execute(db, job)
+        assert untouched(Session, job_id)
+        db.close()
+
+    def test_queue_position_counts_only_jobs_the_same_workers_claim(self, Session, evaluator_kind):
+        db = Session()
+        user = make_user(db)
+        self.queued(db, "test_echo")
+        graded = self.queued(db, evaluator_kind)
+        ordinary = self.queued(db, "test_echo")
+        assert main.get_research_job(graded, user=user, db=db)["queue_position"] == 1
+        assert main.get_research_job(ordinary, user=user, db=db)["queue_position"] == 2
         db.close()
 
 

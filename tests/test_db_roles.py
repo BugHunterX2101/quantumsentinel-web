@@ -116,6 +116,8 @@ def assert_exactly_provisioned(c: Cluster) -> None:
         name: set(privileges) for name, privileges in db_roles.APP_TABLE_PRIVILEGES.items()}
     assert table_privileges(su, c.schema, roles.research_worker) == {
         name: set(db_roles.WORKER_TABLE_PRIVILEGES.get(name, ())) for name in tables}
+    assert table_privileges(su, c.schema, roles.evaluator) == {
+        name: set(db_roles.EVALUATOR_TABLE_PRIVILEGES.get(name, ())) for name in tables}
     assert table_privileges(su, c.schema, roles.backup) == {name: {"SELECT"} for name in tables}
     for role in (roles.migrator, "public"):
         assert table_privileges(su, c.schema, role) == {name: set() for name in tables}, role
@@ -123,8 +125,8 @@ def assert_exactly_provisioned(c: Cluster) -> None:
         "SELECT has_schema_privilege(%s, %s, 'USAGE'), has_schema_privilege(%s, %s, 'CREATE')",
         (role, c.schema, role, c.schema)).fetchone()) for role in (*roles.logins, "public")}
     assert schema_privileges == {roles.migrator: (True, False), roles.app: (True, False),
-                                 roles.research_worker: (True, False), roles.backup: (True, False),
-                                 "public": (False, False)}
+                                 roles.research_worker: (True, False), roles.evaluator: (True, False),
+                                 roles.backup: (True, False), "public": (False, False)}
     assert su.execute(
         "SELECT count(*) FROM pg_class c WHERE c.relnamespace = %s::regnamespace"
         " AND c.relowner <> %s::regrole", (c.schema, roles.owner)).fetchone()[0] == 0
@@ -136,7 +138,7 @@ def assert_exactly_provisioned(c: Cluster) -> None:
         ([roles.owner, *roles.logins],))}
     assert attributes == {roles.owner: (False, False, False), roles.migrator: (False, True, False),
                           roles.app: (False, True, True), roles.research_worker: (False, True, True),
-                          roles.backup: (False, True, True)}
+                          roles.evaluator: (False, True, True), roles.backup: (False, True, True)}
     names = [roles.owner, *roles.logins]
     memberships = su.execute(
         "SELECT m.member::regrole::text, m.roleid::regrole::text FROM pg_auth_members m"
@@ -338,6 +340,74 @@ def test_the_research_worker_cannot_reach_trading_or_identity(provisioned):
                       *(s.format(app=roles.research_worker, owner=roles.owner) for s in REFUSED)):
         with pytest.raises(errors.InsufficientPrivilege):
             research_worker.execute(statement)
+
+
+def test_the_evaluator_allow_list_is_a_subset_that_neither_queues_nor_deletes_jobs():
+    for table, privileges in db_roles.EVALUATOR_TABLE_PRIVILEGES.items():
+        assert set(privileges) <= set(db_roles.APP_TABLE_PRIVILEGES[table]), table
+    assert not set(db_roles.EVALUATOR_TABLE_PRIVILEGES) & TRADING_AND_IDENTITY
+    assert set(db_roles.EVALUATOR_TABLE_PRIVILEGES["research_jobs"]) == {"SELECT", "UPDATE"}
+
+
+def test_the_evaluator_runs_its_jobs_as_its_own_role(provisioned, monkeypatch):
+    """The research evaluator's worker loop, connected as qs_evaluator: its
+    startup (schema revision, signing key), heartbeat, the claim of an
+    evaluator job, the job's signed audit event and its removal on stop. It
+    leaves the ordinary job queued, and each job counts only the workers
+    that can run it."""
+    monkeypatch.setitem(research_jobs.KINDS, "test_holdout_grade", research_jobs.JobKind(
+        dict, "research_job_helpers:echo_task", "TEST_HOLDOUT_GRADE", evaluator=True))
+    monkeypatch.setitem(research_jobs.KINDS, "test_echo", research_jobs.JobKind(
+        dict, "research_job_helpers:echo_task", "TEST_JOB"))
+    roles = provisioned.roles
+    api = sessionmaker(bind=provisioned.engine_as(roles.app))()
+    evaluator_sessions = sessionmaker(bind=provisioned.engine_as(roles.evaluator))
+    identity = security_service.server_identity
+    monkeypatch.setattr(identity, "_registered", False)
+    with evaluator_sessions() as db:
+        assert db.execute(text("SELECT current_user")).scalar() == roles.evaluator
+        assert current_revision(db.connection()) == head_revision()
+        identity.ensure_registered(db)
+    user = models.User(email="evaluator-role@example.com", password_hash="x", role="user")
+    api.add(user)
+    api.commit()
+    ordinary = research_jobs.enqueue(api, user.id, "test_echo", {"n": 1})
+    graded = research_jobs.enqueue(api, user.id, "test_holdout_grade", {"n": 2})
+    runner = worker.Worker(job_process=InlineJobProcess(), session_factory=evaluator_sessions,
+                           lease_seconds=60, timeout_seconds=60, poll_seconds=0.1,
+                           role="research-evaluator")
+    assert runner.run_once() is True
+    assert runner.run_once() is False
+    api.expire_all()
+    assert research_jobs.view(api, api.get(models.ResearchJob, graded.id))["status"] == "succeeded"
+    left = research_jobs.view(api, api.get(models.ResearchJob, ordinary.id))
+    assert (left["status"], left["attempts"], left["workers_online"]) == ("queued", 0, 0)
+    stats = research_jobs.queue_stats(api)
+    assert (stats["workers_online"], stats["evaluators_online"]) == (0, 1)
+    assert api.execute(text("SELECT role FROM research_workers")).scalars().all() == ["research-evaluator"]
+    status = security_service.audit_chain_status(api, full=True)
+    assert status["valid"] and status["links"] == 1, status
+    with evaluator_sessions() as db:
+        research_jobs.remove_worker(db, runner.id)
+    assert api.execute(text("SELECT count(*) FROM research_workers")).scalar() == 0
+    api.close()
+
+
+def test_the_evaluator_cannot_reach_beyond_its_jobs(provisioned):
+    """Nothing of users, trading, keys or tokens, no research results, and it
+    can neither queue nor delete a job, nor rewrite the audit trail."""
+    roles = provisioned.roles
+    evaluator = provisioned.connect(roles.evaluator)
+    for table in sorted(set(db_roles.APP_TABLE_PRIVILEGES) - set(db_roles.EVALUATOR_TABLE_PRIVILEGES)):
+        with pytest.raises(errors.InsufficientPrivilege):
+            evaluator.execute(f'SELECT 1 FROM "{table}" LIMIT 1')
+    for statement in ("INSERT INTO research_jobs (id) VALUES ('x')", "DELETE FROM research_jobs",
+                      "UPDATE audit_logs SET action = 'x'", "DELETE FROM audit_chain_links",
+                      "DELETE FROM server_signing_keys", "INSERT INTO dataset_holdouts (family) VALUES ('x')",
+                      "INSERT INTO research_trials (id) VALUES ('x')",
+                      *(s.format(app=roles.evaluator, owner=roles.owner) for s in REFUSED)):
+        with pytest.raises(errors.InsufficientPrivilege):
+            evaluator.execute(statement)
 
 
 def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(provisioned, tmp_path):
@@ -609,20 +679,23 @@ def test_migrations_run_as_the_owner_and_restore_exact_grants(provisioned, monke
     assert_exactly_provisioned(provisioned)
 
 
-def test_a_schema_provisioned_before_a_role_existed_still_migrates(provisioned):
-    """A deployment provisioned before qs_research_worker was added has no such
-    role. The next release's migration still reapplies the grants of the roles
-    it has, and running provision-roles again creates the missing one."""
+@pytest.mark.parametrize("missing, revision", [("research_worker", "0002"), ("evaluator", "0009")])
+def test_a_schema_provisioned_before_a_role_existed_still_migrates(provisioned, missing, revision):
+    """A deployment provisioned before qs_research_worker (or qs_evaluator) was
+    added has no such role. The next release's migration still reapplies the
+    grants of the roles it has, and running provision-roles again creates the
+    missing one."""
     roles = provisioned.roles
-    provisioned.migrate_as_owner("0002")
+    role = getattr(roles, missing)
+    provisioned.migrate_as_owner(revision)
     su = provisioned.connect()
-    su.execute(f'DROP OWNED BY "{roles.research_worker}"')
-    su.execute(f'DROP ROLE "{roles.research_worker}"')
+    su.execute(f'DROP OWNED BY "{role}"')
+    su.execute(f'DROP ROLE "{role}"')
     su.execute(f'GRANT TRUNCATE ON trades TO "{roles.app}"')
     assert migrate(provisioned.engine_as(roles.migrator), roles) == head_revision()
     assert table_privileges(su, provisioned.schema, roles.app) == {
         name: set(p) for name, p in db_roles.APP_TABLE_PRIVILEGES.items()}
-    assert provisioned.provision()["created"] == [roles.research_worker]
+    assert provisioned.provision()["created"] == [role]
     assert_exactly_provisioned(provisioned)
 
 
@@ -806,7 +879,7 @@ def test_passwords_reach_the_server_only_as_scram_verifiers(cluster):
 def test_the_provision_roles_command(cluster, monkeypatch, capsys):
     settings = {cluster.roles.migrator: "DB_MIGRATOR_PASSWORD", cluster.roles.app: "DB_APP_PASSWORD",
                 cluster.roles.research_worker: "DB_RESEARCH_WORKER_PASSWORD",
-                cluster.roles.backup: "DB_BACKUP_PASSWORD"}
+                cluster.roles.evaluator: "DB_EVALUATOR_PASSWORD", cluster.roles.backup: "DB_BACKUP_PASSWORD"}
     for role, name in settings.items():
         monkeypatch.setenv(name, cluster.passwords[role])
     assert manage._provision_roles(cluster.engine, cluster.roles) == 0

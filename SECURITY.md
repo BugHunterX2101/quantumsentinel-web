@@ -13,7 +13,8 @@
   deployment handling real financial assets without a reviewed provider
   such as `liboqs` (via `python-oqs`) or a hardware-backed equivalent.
 - **The production provider setting is a startup gate only.** With
-  `ENVIRONMENT=production` the API and the research worker refuse to start,
+  `ENVIRONMENT=production` the API, the research worker and the research
+  evaluator refuse to start,
   and every PQC operation raises, unless `PQC_PROVIDER` is set to something
   other than `reference` and `PQC_PROVIDER_URL` is set
   (`backend/config.py`, `backend/crypto/pqc.py`). Nothing calls that URL yet:
@@ -30,7 +31,8 @@
   failure refuses the handshake instead of falling back to a per-process
   check.
 - **Server identity pinning**: when `TRUSTED_SERVER_DSA_FINGERPRINT` is set,
-  the API and the research worker refuse to start unless the server's
+  the API, the research worker and the research evaluator refuse to start
+  unless the server's
   ML-DSA-65 key has exactly that fingerprint (SHA-256 of the public key).
   The browser additionally pins the first fingerprint it sees in
   `localStorage`; a later mismatch marks the handshake untrusted (hard
@@ -167,14 +169,17 @@
 
 - Dockerfile runs as non-root `app` user (UID 10001).
 - Production compose: the application services (`quantumsentinel`,
-  `research-worker`, `migrate`, `provision`) share `read_only: true` (with
+  `research-worker`, `research-evaluator`, `migrate`, `provision`) share
+  `read_only: true` (with
   tmpfs for `/tmp` and `/var/run`), `security_opt: ["no-new-privileges:true"]`
   and `cap_drop: ["ALL"]`. `postgres`, `redis`, `nginx` and the backup
   services also run with `no-new-privileges` and every capability dropped;
   nginx adds back only `NET_BIND_SERVICE`, `CHOWN`, `SETUID` and `SETGID`.
-- Memory limits: `mem_limit: 2g` for the API and `1g` for the research worker.
+- Memory limits: `mem_limit: 2g` for the API and `1g` each for the research
+  worker and the research evaluator.
 - The database is on an internal network with no route out, and nginx is not
-  on it.
+  on it. The research evaluator, which grades strategies on sealed holdout
+  data, is on that network alone and mounts the dataset blobs read-only.
 
 ## CI security pipeline
 

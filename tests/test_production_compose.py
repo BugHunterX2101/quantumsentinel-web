@@ -1,6 +1,7 @@
 """docker-compose.production.yml: which service holds which database credential.
 
-The API connects as qs_app, migrations run as qs_migrator, backups as
+The API connects as qs_app, research workers as qs_research_worker, the
+research evaluator as qs_evaluator, migrations run as qs_migrator, backups as
 qs_backup; only postgres and the one-off provision service see the bootstrap
 superuser's password. Services that load the production env file blank every
 database password variable, so the file cannot leak one into them.
@@ -17,9 +18,10 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE = ROOT / "docker-compose.production.yml"
-PASSWORDS = ("POSTGRES_PASSWORD", "DB_APP_PASSWORD", "DB_RESEARCH_WORKER_PASSWORD", "DB_MIGRATOR_PASSWORD",
-             "DB_BACKUP_PASSWORD")
-# Secrets only the API uses (backend/config.py); a research worker holds none.
+PASSWORDS = ("POSTGRES_PASSWORD", "DB_APP_PASSWORD", "DB_RESEARCH_WORKER_PASSWORD", "DB_EVALUATOR_PASSWORD",
+             "DB_MIGRATOR_PASSWORD", "DB_BACKUP_PASSWORD")
+# Secrets only the API uses (backend/config.py); a research worker or the
+# research evaluator holds none.
 API_SECRETS = ("JWT_PRIVATE_KEY", "JWT_PUBLIC_KEY", "WEBHOOK_ENCRYPTION_KEY", "PRIVATE_KEY_ENCRYPTION_KEY",
                "REFRESH_TOKEN_SECRET", "CSRF_SECRET", "REDIS_URL")
 # The services allowed to receive each password.
@@ -27,6 +29,7 @@ HOLDERS = {
     "POSTGRES_PASSWORD": {"postgres", "provision"},
     "DB_APP_PASSWORD": {"quantumsentinel", "provision"},
     "DB_RESEARCH_WORKER_PASSWORD": {"research-worker", "provision"},
+    "DB_EVALUATOR_PASSWORD": {"research-evaluator", "provision"},
     "DB_MIGRATOR_PASSWORD": {"migrate", "provision"},
     "DB_BACKUP_PASSWORD": {"backup", "provision"},
 }
@@ -47,6 +50,7 @@ def test_each_service_connects_as_its_own_role(services):
     assert url("quantumsentinel").startswith("postgresql+psycopg://qs_app:${DB_APP_PASSWORD")
     assert url("research-worker").startswith(
         "postgresql+psycopg://qs_research_worker:${DB_RESEARCH_WORKER_PASSWORD")
+    assert url("research-evaluator").startswith("postgresql+psycopg://qs_evaluator:${DB_EVALUATOR_PASSWORD")
     assert url("migrate").startswith("postgresql+psycopg://qs_migrator:${DB_MIGRATOR_PASSWORD")
     assert url("provision").startswith("postgresql+psycopg://quantumsentinel:${POSTGRES_PASSWORD")
     backup = services["backup"]["environment"]
@@ -64,7 +68,7 @@ def test_services_that_load_the_env_file_blank_every_password_variable(services)
     """Their own password reaches them inside DATABASE_URL; the variables
     themselves would otherwise come straight from the env file."""
     loading = [name for name, service in services.items() if "env_file" in service and name != "provision"]
-    assert loading == ["migrate", "quantumsentinel", "research-worker"]
+    assert loading == ["migrate", "quantumsentinel", "research-worker", "research-evaluator"]
     for name in loading:
         for password in PASSWORDS:
             assert services[name]["environment"].get(password) == "", (name, password)
@@ -90,26 +94,31 @@ def test_every_service_can_start_with_every_capability_dropped(services):
     assert set(services["nginx"]["cap_add"]) == {"NET_BIND_SERVICE", "CHOWN", "SETUID", "SETGID"}
 
 
-def test_research_runs_in_its_own_service(services):
+@pytest.mark.parametrize("name", ["research-worker", "research-evaluator"])
+def test_research_runs_in_its_own_services(services, name):
     assert services["quantumsentinel"]["environment"]["RESEARCH_WORKER_MODE"] == "external"
-    assert services["research-worker"]["command"] == ["python", "-m", "backend.worker"]
-    assert services["research-worker"]["depends_on"]["migrate"] == {"condition": "service_completed_successfully"}
+    assert services[name]["command"] == ["python", "-m", "backend.worker"]
+    assert services[name]["depends_on"]["migrate"] == {"condition": "service_completed_successfully"}
+    assert services[name]["restart"] == "unless-stopped"
 
 
-def test_the_research_worker_holds_none_of_the_apis_secrets(services):
-    environment = services["research-worker"]["environment"]
-    assert environment["QS_PROCESS_ROLE"] == "research-worker"
-    for name in (*API_SECRETS, "REDIS_PASSWORD"):
-        assert environment.get(name) == "", name
-    for name in API_SECRETS:
-        assert environment.get(f"{name}_FILE") == "", name
+@pytest.mark.parametrize("name", ["research-worker", "research-evaluator"])
+def test_research_services_hold_none_of_the_apis_secrets(services, name):
+    environment = services[name]["environment"]
+    assert environment["QS_PROCESS_ROLE"] == name
+    for secret in (*API_SECRETS, "REDIS_PASSWORD"):
+        assert environment.get(secret) == "", secret
+    for secret in API_SECRETS:
+        assert environment.get(f"{secret}_FILE") == "", secret
 
 
 def test_the_database_has_no_route_out_and_no_route_from_nginx():
     compose = yaml.safe_load(COMPOSE.read_text())
     services = compose["services"]
     assert compose["networks"]["data"] == {"internal": True}
-    for name in ("postgres", "redis", "migrate", "provision", "backup"):
+    # The research evaluator grades on the sealed holdout and needs no market
+    # data: nothing it runs can send the holdout anywhere.
+    for name in ("postgres", "redis", "migrate", "provision", "backup", "research-evaluator"):
         assert services[name]["networks"] == ["data"], name
     assert services["nginx"]["networks"] == ["edge"]
     for name in ("quantumsentinel", "research-worker"):
@@ -118,7 +127,8 @@ def test_the_database_has_no_route_out_and_no_route_from_nginx():
 
 def test_backups_include_the_dataset_blobs_and_cannot_change_them(services):
     """deploy/backup.sh dumps the database, then copies the blobs; the API
-    reads no blob, so only the worker and a restore write the volume."""
+    reads no blob, so only the worker and a restore write the volume; the
+    research evaluator reads it."""
     assert services["backup"]["entrypoint"] == ["/bin/sh", "/backup.sh", "backup"]
     assert "command" not in services["backup"]
     assert set(services["backup"]["volumes"]) == {
@@ -126,6 +136,7 @@ def test_backups_include_the_dataset_blobs_and_cannot_change_them(services):
     mounting = {name: volume for name, service in services.items() for volume in service.get("volumes", [])
                 if volume.startswith("datasets:")}
     assert mounting == {"research-worker": "datasets:/data/datasets", "backup": "datasets:/data/datasets:ro",
+                        "research-evaluator": "datasets:/data/datasets:ro",
                         "restore-datasets": "datasets:/data/datasets"}
 
 
@@ -208,9 +219,9 @@ def test_resolved_configuration_confines_each_password(tmp_path):
         held = {password for password, mark in marks.items() if mark in text}
         allowed = {password for password, holders in HOLDERS.items() if name in holders}
         assert held <= allowed, (name, held - allowed)
-        if name == "research-worker":
+        if name in ("research-worker", "research-evaluator"):
             assert "apimark" not in text and "markredis" not in text
         if name == "quantumsentinel":  # the env file does reach the services that load it
             assert all(api_marks[secret] in text for secret in API_SECRETS if secret != "REDIS_URL")
         seen.add(name)
-    assert {"quantumsentinel", "research-worker", "migrate", "provision", "backup"} <= seen
+    assert {"quantumsentinel", "research-worker", "research-evaluator", "migrate", "provision", "backup"} <= seen

@@ -151,6 +151,11 @@ def claimable_kinds(role: str) -> tuple[str, ...]:
     return ()
 
 
+def claiming_roles(kind_name: str) -> tuple[str, ...]:
+    """The worker roles that claim jobs of this kind (none for an unknown kind)."""
+    return tuple(role for role in (*_RESEARCH_ROLES, EVALUATOR_ROLE) if kind_name in claimable_kinds(role))
+
+
 def _pool(kind_name: str) -> tuple[str, ...]:
     """The kinds claimed by the same workers as ``kind_name``."""
     kind = KINDS.get(kind_name)
@@ -294,11 +299,14 @@ def request_cancel(db: Session, user_id: str, job_id: str) -> models.ResearchJob
     return job
 
 
-def workers_online(db: Session) -> int:
+def workers_online(db: Session, roles: tuple[str, ...]) -> int:
+    """Live workers that run as one of ``roles``."""
+    if not roles:
+        return 0
     cutoff = utcnow() - dt.timedelta(seconds=WORKER_ONLINE_SECONDS)
     return int(db.execute(
         select(func.count()).select_from(models.ResearchWorker)
-        .where(models.ResearchWorker.last_seen_at >= cutoff)
+        .where(models.ResearchWorker.last_seen_at >= cutoff, models.ResearchWorker.role.in_(roles))
     ).scalar() or 0)
 
 
@@ -316,7 +324,9 @@ def view(db: Session, job: models.ResearchJob, include_result: bool = True) -> d
         "poll_url": f"/api/research/jobs/{job.id}",
     }
     if job.status in ACTIVE:
-        out["workers_online"] = workers_online(db)
+        # Only the workers that may claim it: no evaluator runs an ordinary
+        # job, and nothing runs a kind this build does not know.
+        out["workers_online"] = workers_online(db, claiming_roles(job.kind))
     if job.status == QUEUED:
         # Only jobs the same workers claim are ahead of this one.
         out["queue_position"] = 1 + int(db.execute(
@@ -345,7 +355,8 @@ def queue_stats(db: Session) -> dict:
         "queued": int(counts.get(QUEUED, 0)),
         "running": int(counts.get(RUNNING, 0)),
         "oldest_queued_seconds": round((utcnow() - oldest).total_seconds(), 1) if oldest else None,
-        "workers_online": workers_online(db),
+        "workers_online": workers_online(db, _RESEARCH_ROLES),
+        "evaluators_online": workers_online(db, (EVALUATOR_ROLE,)),
     }
 
 
@@ -531,15 +542,16 @@ def reap_expired(db: Session) -> int:
 
 
 def heartbeat_worker(db: Session, worker_id: str, hostname: str, pid: int,
-                     current_job_id: str | None) -> None:
+                     current_job_id: str | None, role: str) -> None:
     now = utcnow()
     touched = db.execute(
         update(models.ResearchWorker).execution_options(**_UNSYNCED).where(models.ResearchWorker.id == worker_id)
-        .values(last_seen_at=now, current_job_id=current_job_id)
+        .values(last_seen_at=now, current_job_id=current_job_id, role=role)
     ).rowcount
     if not touched:
         db.add(models.ResearchWorker(id=worker_id, hostname=hostname[:255], pid=pid,
-                                     started_at=now, last_seen_at=now, current_job_id=current_job_id))
+                                     started_at=now, last_seen_at=now, current_job_id=current_job_id,
+                                     role=role))
     db.commit()
 
 

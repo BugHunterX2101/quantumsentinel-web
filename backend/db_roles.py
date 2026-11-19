@@ -4,7 +4,7 @@ Connected as the cluster's bootstrap superuser (the role POSTGRES_USER
 creates), the application bypasses every grant, row-level security policy and
 trigger, and any SQL it runs can drop the schema, read server files or start
 programs (COPY ... TO PROGRAM). ``python -m backend.manage provision-roles``,
-run as that superuser, hands the schema to five roles:
+run as that superuser, hands the schema to six roles:
 
     qs_owner            NOLOGIN. Owns the schema and every object in it.
     qs_migrator         LOGIN, a NOINHERIT member of qs_owner: it holds no
@@ -19,12 +19,16 @@ run as that superuser, hands the schema to five roles:
                         exactly WORKER_TABLE_PRIVILEGES, the job queue,
                         research results and the audit trail, and nothing of
                         users, accounts, orders, positions, keys or tokens.
+    qs_evaluator        LOGIN. The research evaluator (QS_PROCESS_ROLE
+                        research-evaluator), which grades strategies on the
+                        holdout: exactly EVALUATOR_TABLE_PRIVILEGES.
     qs_backup           LOGIN. pg_read_all_data, for pg_dump.
 
-The two privilege maps are allow-lists. A table missing from
+The privilege maps are allow-lists. A table missing from
 APP_TABLE_PRIVILEGES gets no privilege at all, and tests/test_db_roles.py
 fails until it is listed, so a new table is deny-by-default; one missing from
-WORKER_TABLE_PRIVILEGES is simply out of the worker's reach.
+WORKER_TABLE_PRIVILEGES or EVALUATOR_TABLE_PRIVILEGES is simply out of that
+role's reach.
 ``database.migrate`` reapplies the grants after every migration that changes
 the schema revision.
 
@@ -135,6 +139,25 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "validation_manifests": ("SELECT", "INSERT"),
 }
 
+# The research evaluator's privileges: the worker loop (backend/worker.py) as
+# QS_PROCESS_ROLE research-evaluator, which claims only holdout evaluation
+# jobs and does no housekeeping. Each table is here for code it runs today;
+# the evaluation itself adds what it reads and records (R1-5b-2).
+EVALUATOR_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
+    # The worker waits at startup until the schema is at its code's revision.
+    "alembic_version": ("SELECT",),
+    # Signed audit events for finished jobs; the chain is append-only here.
+    "audit_chain_links": ("SELECT", "INSERT"),
+    "audit_logs": ("SELECT", "INSERT"),
+    # Claim, lease, finish and release its own jobs. It never enqueues a job
+    # (the API does) or deletes one (the research worker purges).
+    "research_jobs": ("SELECT", "UPDATE"),
+    # Its heartbeat row, removed when it stops.
+    "research_workers": DML,
+    # The worker registers the server key it signs audit events with.
+    "server_signing_keys": ("SELECT", "INSERT"),
+}
+
 _ROLE_ATTRIBUTES = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
 # Objects an extension installed into the schema belong to the extension.
 _NOT_EXTENSION_MEMBER = ("NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = {oid}"
@@ -171,12 +194,17 @@ class Roles:
         return f"{self.prefix}_research_worker"
 
     @property
-    def logins(self) -> tuple[str, str, str, str]:
-        return (self.migrator, self.app, self.research_worker, self.backup)
+    def evaluator(self) -> str:
+        return f"{self.prefix}_evaluator"
+
+    @property
+    def logins(self) -> tuple[str, ...]:
+        return (self.migrator, self.app, self.research_worker, self.evaluator, self.backup)
 
     def table_privileges(self) -> tuple[tuple[str, dict[str, tuple[str, ...]]], ...]:
         """Each role that holds table privileges, with its allow-list."""
-        return ((self.app, APP_TABLE_PRIVILEGES), (self.research_worker, WORKER_TABLE_PRIVILEGES))
+        return ((self.app, APP_TABLE_PRIVILEGES), (self.research_worker, WORKER_TABLE_PRIVILEGES),
+                (self.evaluator, EVALUATOR_TABLE_PRIVILEGES))
 
 
 ROLES = Roles()
@@ -281,7 +309,7 @@ def _provision_attempt(conn: Connection, roles: Roles, passwords: dict[str, str]
     # USAGE alone reaches no table; the migrator needs it to resolve the
     # schema at all (without it current_schema() is NULL).
     conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema_id, sql.SQL(", ").join(
-        map(sql.Identifier, (roles.app, roles.research_worker, roles.migrator)))))
+        map(sql.Identifier, (roles.app, roles.research_worker, roles.evaluator, roles.migrator)))))
     unlisted = apply_grants(conn, roles)
     return {"schema": schema, "created": created, "ownership_moved": moved, "unlisted": unlisted}
 
@@ -331,7 +359,7 @@ def apply_grants(conn: Connection, roles: Roles = ROLES) -> list[str]:
 def _ensure_roles(conn: Connection, roles: Roles, passwords: dict[str, str]) -> list[str]:
     created = []
     for role, login in ((roles.owner, False), (roles.migrator, True), (roles.app, True),
-                        (roles.research_worker, True), (roles.backup, True)):
+                        (roles.research_worker, True), (roles.evaluator, True), (roles.backup, True)):
         name = sql.Identifier(role)
         exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone()
         if not exists:
@@ -353,7 +381,7 @@ def _ensure_roles(conn: Connection, roles: Roles, passwords: dict[str, str]) -> 
 
 def _ensure_memberships(conn: Connection, roles: Roles) -> None:
     """Exactly: the migrator in the owner role (no inheritance), the backup
-    role in pg_read_all_data, and nothing else for any of the four."""
+    role in pg_read_all_data, and nothing else for the owner or any login role."""
     pg16 = conn.info.server_version >= 160000
     for member in (roles.owner, *roles.logins):
         for granted, grantor in conn.execute(

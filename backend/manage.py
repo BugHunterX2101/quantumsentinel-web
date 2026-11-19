@@ -30,8 +30,8 @@ previous check.
 (backend/db_roles.py) and hands the schema to them. Run it as the database
 superuser, with DATABASE_URL naming that superuser. A role that does not
 exist yet takes its password from DB_MIGRATOR_PASSWORD, DB_APP_PASSWORD,
-DB_RESEARCH_WORKER_PASSWORD or DB_BACKUP_PASSWORD (or the matching *_FILE
-setting); given for a role that
+DB_RESEARCH_WORKER_PASSWORD, DB_EVALUATOR_PASSWORD or DB_BACKUP_PASSWORD (or
+the matching *_FILE setting); given for a role that
 exists, the password is changed. It is safe to run again: it repairs any
 drift from the intended privileges. It is safe while the application runs:
 it takes the table locks it needs all at once or not at all, so it cannot
@@ -193,7 +193,8 @@ def _provision_roles(target_engine=None, roles=None) -> int:
     migrate(target, roles)
     passwords = {role: _setting(name) for role, name in (
         (roles.migrator, "DB_MIGRATOR_PASSWORD"), (roles.app, "DB_APP_PASSWORD"),
-        (roles.research_worker, "DB_RESEARCH_WORKER_PASSWORD"), (roles.backup, "DB_BACKUP_PASSWORD"))}
+        (roles.research_worker, "DB_RESEARCH_WORKER_PASSWORD"), (roles.evaluator, "DB_EVALUATOR_PASSWORD"),
+        (roles.backup, "DB_BACKUP_PASSWORD"))}
     try:
         with target.begin() as connection:
             summary = db_roles.provision(connection.connection.driver_connection, roles,
@@ -205,7 +206,8 @@ def _provision_roles(target_engine=None, roles=None) -> int:
           f"objects given to {roles.owner}: {summary['ownership_moved']}; "
           f"passwords set: {', '.join(role for role, pw in passwords.items() if pw) or 'none'}")
     print(f"connect the application as {roles.app}, a separate research worker as "
-          f"{roles.research_worker}, migrations as {roles.migrator}, backups as {roles.backup}")
+          f"{roles.research_worker}, the research evaluator as {roles.evaluator}, "
+          f"migrations as {roles.migrator}, backups as {roles.backup}")
     if summary["unlisted"]:
         print("tables missing from db_roles.APP_TABLE_PRIVILEGES, which the application cannot use: "
               + ", ".join(summary["unlisted"]), file=sys.stderr)

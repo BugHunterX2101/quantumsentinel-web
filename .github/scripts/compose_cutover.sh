@@ -4,7 +4,8 @@
 #   A. the superuser-era stack (the API wired as in 205de7b's compose file), with data in it
 #   B. `up` with the current file before provisioning: migrate cannot log in
 #   C. provision (while the API runs), then `up`: migrate as qs_migrator, API as qs_app
-#   D. who is connected, what the API's environment holds, data from era A, research jobs
+#   D. who is connected, what the API's environment holds, data from era A, research jobs,
+#      the research evaluator's network, dataset access and heartbeat role
 #   E. the backup service dumps as qs_backup and copies the dataset blobs;
 #      the blobs are restored onto an empty datasets volume
 #   F. the API restarts as qs_app
@@ -30,10 +31,10 @@ sessions() {
   "${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -Atc \
     "SELECT string_agg(DISTINCT usename, ',' ORDER BY usename) FROM pg_stat_activity WHERE application_name = 'quantumsentinel'"
 }
-# The API and the research worker each connect as their own role.
-both_roles() {
+# The API, the research worker and the research evaluator each connect as their own role.
+all_roles() {
   for _ in $(seq 1 60); do
-    [ "$(sessions)" = "qs_app,qs_research_worker" ] && return 0
+    [ "$(sessions)" = "qs_app,qs_evaluator,qs_research_worker" ] && return 0
     sleep 2
   done
   echo "sessions: $(sessions)"
@@ -89,7 +90,7 @@ def token(): return secrets.token_urlsafe(32)
 settings = {
     "ENVIRONMENT": "production",
     "POSTGRES_PASSWORD": token(), "REDIS_PASSWORD": token(),
-    "DB_APP_PASSWORD": token(), "DB_RESEARCH_WORKER_PASSWORD": token(),
+    "DB_APP_PASSWORD": token(), "DB_RESEARCH_WORKER_PASSWORD": token(), "DB_EVALUATOR_PASSWORD": token(),
     "DB_MIGRATOR_PASSWORD": token(), "DB_BACKUP_PASSWORD": token(),
     "REDIS_URL": "redis://:REPLACED_BY_COMPOSE@redis:6379/0",
     "REFRESH_TOKEN_SECRET": token(), "CSRF_SECRET": token(),
@@ -161,12 +162,12 @@ ready
 echo "::endgroup::"
 
 echo "::group::D. checks"
-both_roles
+all_roles
 echo "sessions: $(sessions)"
 test "$("${NEW[@]}" ps -a --format '{{.ExitCode}}' migrate)" = "0"
 "${NEW[@]}" logs migrate 2>&1 | tail -1
 superuser_password=$(grep '^POSTGRES_PASSWORD=' .env.production | cut -d= -f2-)
-for service in quantumsentinel research-worker migrate; do
+for service in quantumsentinel research-worker research-evaluator migrate; do
   if "${NEW[@]}" run --rm --no-deps --entrypoint env "$service" | grep -qF "$superuser_password"; then
     echo "$service holds the superuser password"; exit 1
   fi
@@ -174,30 +175,41 @@ done
 if "${NEW[@]}" exec -T quantumsentinel env | grep -qF "$superuser_password"; then
   echo "the running API holds the superuser password"; exit 1
 fi
-echo "the API, research-worker and migrate containers do not hold the superuser password"
+echo "the API, research-worker, research-evaluator and migrate containers do not hold the superuser password"
 python3 .github/scripts/compose_smoke.py verify era-a@example.com
 # The image records the commit it was built from (validation manifests name it).
 commit=$("${NEW[@]}" exec -T research-worker python -c \
   "from backend.services.validation_manifest import code_commit; print(code_commit())" | tr -d '\r')
 echo "the research worker records code commit $commit"
 test "$commit" = "$QS_CODE_COMMIT"
-# The jobs ran in the research-worker container: worker ids start with its hostname.
+# The jobs ran in the research-worker container (worker ids start with its
+# hostname), none in the research evaluator, which claims only holdout grades.
 worker_host=$("${NEW[@]}" exec -T research-worker python -c "import socket; print(socket.gethostname())" | tr -d '\r')
 ran_on=$("${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -Atc \
   "SELECT string_agg(DISTINCT split_part(worker_id, ':', 1), ',') FROM research_jobs WHERE status = 'succeeded'")
 echo "research jobs ran on: $ran_on (research-worker container: $worker_host)"
 test "$ran_on" = "$worker_host"
-# The research worker holds none of the API's secrets, and its job process
-# (alive after those jobs, kept for the next one) holds no secret at all.
-for secret in JWT_PRIVATE_KEY WEBHOOK_ENCRYPTION_KEY PRIVATE_KEY_ENCRYPTION_KEY REFRESH_TOKEN_SECRET \
-              CSRF_SECRET REDIS_PASSWORD; do
-  value=$(grep "^$secret=" .env.production | cut -d= -f2-)
-  test -n "$value"
-  if "${NEW[@]}" exec -T research-worker env | grep -qF -- "$value"; then
-    echo "research-worker holds $secret"; exit 1
-  fi
+# The research worker and the research evaluator hold none of the API's
+# secrets, and the worker's job process (alive after those jobs, kept for the
+# next one) holds no secret at all.
+for service in research-worker research-evaluator; do
+  for secret in JWT_PRIVATE_KEY WEBHOOK_ENCRYPTION_KEY PRIVATE_KEY_ENCRYPTION_KEY REFRESH_TOKEN_SECRET \
+                CSRF_SECRET REDIS_PASSWORD; do
+    value=$(grep "^$secret=" .env.production | cut -d= -f2-)
+    test -n "$value"
+    if "${NEW[@]}" exec -T "$service" env | grep -qF -- "$value"; then
+      echo "$service holds $secret"; exit 1
+    fi
+  done
+  echo "$service holds none of the API's secrets"
 done
-echo "research-worker holds none of the API's secrets"
+# The research evaluator's heartbeat records its role, so a job's view counts
+# only the workers that can run it.
+evaluator_host=$("${NEW[@]}" exec -T research-evaluator python -c "import socket; print(socket.gethostname())" | tr -d '\r')
+evaluator_role=$("${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -Atc \
+  "SELECT string_agg(role, ',') FROM research_workers WHERE split_part(id, ':', 1) = '$evaluator_host'")
+echo "research-evaluator ($evaluator_host) heartbeats as: $evaluator_role"
+test "$evaluator_role" = "research-evaluator"
 "${NEW[@]}" exec -T research-worker python - <<'EOF'
 from pathlib import Path
 
@@ -263,6 +275,37 @@ for service in quantumsentinel research-worker; do
     "import urllib.request; urllib.request.urlopen('https://example.com', timeout=15)"
   echo "$service reaches the internet"
 done
+# The research evaluator, which will read sealed holdout data, has no route
+# out: the same request that just succeeded from the research worker fails.
+if out=$("${NEW[@]}" exec -T research-evaluator python -c \
+    "import urllib.request; urllib.request.urlopen('https://example.com', timeout=15)" 2>&1 | tr -d '\r'); then
+  echo "research-evaluator reached the internet"; exit 1
+fi
+echo "research-evaluator -> internet: $(echo "$out" | tail -1)"
+case "$out" in *URLError*) ;; *) exit 1 ;; esac
+echo "research-evaluator has no route to the internet"
+# It reads the blob the research worker stored, and cannot write the volume.
+"${NEW[@]}" exec -T -e DATASET_ID="$dataset_id" -e DATASET_SHA="$dataset_sha" research-evaluator python - <<'EOF'
+import errno
+import os
+import tempfile
+from backend.config import DATASET_ROOT
+from backend.services.dataset_store import DatasetStore
+
+store = DatasetStore(DATASET_ROOT)
+store.get(os.environ["DATASET_ID"], os.environ["DATASET_SHA"])
+shard = store.path_for(os.environ["DATASET_ID"]).parent
+for directory in (DATASET_ROOT, shard):
+    try:
+        fd, name = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    except OSError as error:
+        assert error.errno == errno.EROFS, (str(directory), error)
+    else:
+        os.close(fd)
+        os.unlink(name)
+        raise SystemExit(f"research-evaluator wrote to {directory}")
+EOF
+echo "research-evaluator reads $dataset_id and cannot write the datasets volume"
 # The API keys the /api/auth/* rate limit, login lockout and audit records on
 # the client's address, which it takes from X-Forwarded-For. Through nginx a
 # client must not be able to choose it: 11 requests to one /api/auth/ path,
@@ -305,12 +348,13 @@ assert not (shard / ".tmp-ci-planted").exists(), "the unfinished write was backe
 EOF
 echo "the backup holds $dataset_id, verified against its hash, and not the unfinished write"
 # Restore drill: lose the datasets volume, restore it from the backup, and
-# the worker reads the blob and can still write next to it.
-"${NEW[@]}" --profile backup rm -sf research-worker backup
+# the worker reads the blob and can still write next to it. Every container
+# that mounts the volume goes first, or it cannot be removed.
+"${NEW[@]}" --profile backup rm -sf research-worker research-evaluator backup
 docker volume rm qsci_datasets
 "${NEW[@]}" --profile restore run --rm restore-datasets 2>&1 | tr -d '\r' | tee "$RUNNER_TEMP/restore.log"
 grep -qE 'restore ok: [1-9][0-9]* dataset blobs copied' "$RUNNER_TEMP/restore.log"
-"${NEW[@]}" up -d --no-deps research-worker
+"${NEW[@]}" up -d --no-deps research-worker research-evaluator
 "${NEW[@]}" exec -T -e DATASET_ID="$dataset_id" -e DATASET_SHA="$dataset_sha" research-worker python - <<'EOF'
 import os
 import tempfile
@@ -330,10 +374,20 @@ echo "restored $dataset_id onto an empty datasets volume; the worker owns every 
 "${NEW[@]}" --profile backup up -d backup
 echo "::endgroup::"
 
-echo "::group::F. the API and the research worker restart as their own roles"
-"${NEW[@]}" restart quantumsentinel research-worker
+echo "::group::F. the API, the research worker and the research evaluator restart as their own roles"
+"${NEW[@]}" restart quantumsentinel research-worker research-evaluator
 ready
-both_roles
+all_roles
+# The research evaluator started, shut down on the restart's SIGTERM and
+# started again, all as qs_evaluator, with no statement refused to it.
+"${NEW[@]}" logs --no-log-prefix research-evaluator 2>&1 | tr -d '\r' > "$RUNNER_TEMP/evaluator.log"
+grep -E 'research worker .* (started|stopped)' "$RUNNER_TEMP/evaluator.log"
+test "$(grep -cE 'research worker .* started' "$RUNNER_TEMP/evaluator.log")" -ge 2
+grep -qE 'research worker .* stopped' "$RUNNER_TEMP/evaluator.log"
+if grep -iE 'permission denied|InsufficientPrivilege|Traceback' "$RUNNER_TEMP/evaluator.log"; then
+  echo "research-evaluator logged an error"; exit 1
+fi
+echo "research-evaluator restarted cleanly as qs_evaluator"
 "${NEW[@]}" exec -T research-worker python -c \
   "from backend.config import DATASET_ROOT; from backend.services.dataset_store import DatasetStore; DatasetStore(DATASET_ROOT).get('$dataset_id')"
 echo "the dataset blob survived the restart and still verifies"
@@ -429,7 +483,7 @@ echo "::group::H. a fresh install, as the README deploys it"
 backup_pass
 "${NEW[@]}" up -d
 ready
-both_roles
+all_roles
 read -r fresh_id fresh_sha < <(store_blob)
 test -n "$fresh_sha"
 echo "research-worker stored $fresh_id in a datasets volume the backup service mounted first"

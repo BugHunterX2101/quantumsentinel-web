@@ -259,7 +259,8 @@ class Worker:
         from .services import research_jobs
         now = time.monotonic()
         if force or now - self._last_heartbeat >= WORKER_HEARTBEAT_SECONDS:
-            research_jobs.heartbeat_worker(db, self.id, self.hostname, self.pid, current_job_id)
+            research_jobs.heartbeat_worker(db, self.id, self.hostname, self.pid, current_job_id,
+                                           self.role)
             self._last_heartbeat = now
 
     def _housekeeping(self, db) -> None:

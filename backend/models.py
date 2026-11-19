@@ -530,6 +530,9 @@ class ResearchWorker(Base):
     started_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_seen_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     current_job_id = Column(String, nullable=True)
+    # The QS_PROCESS_ROLE it runs as, which decides the job kinds it claims.
+    role = Column(String(32), nullable=False, default="research-worker",
+                  server_default="research-worker")
 
 
 class AuditChainLink(Base):

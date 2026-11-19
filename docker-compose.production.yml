@@ -1,5 +1,6 @@
 # Database credentials (backend/db_roles.py). The API connects as qs_app,
 # research jobs run in the `research-worker` service as qs_research_worker,
+# holdout grading runs in the `research-evaluator` service as qs_evaluator,
 # migrations run as qs_migrator in the one-off `migrate` service, backups run
 # as qs_backup, and only `postgres` and `provision` see the bootstrap
 # superuser's password. Every service that loads PRODUCTION_ENV_FILE blanks
@@ -9,7 +10,8 @@
 #
 # Networks: postgres and redis sit only on `data`, which has no route out, so
 # the database cannot reach the internet and nginx cannot reach the database.
-# The API and the research worker also join `edge` for market data.
+# The API and the research worker also join `edge` for market data; the
+# research evaluator stays on `data` alone, with no route to the internet.
 x-app: &app
   # QS_CODE_COMMIT: the commit being deployed (`export QS_CODE_COMMIT=$(git
   # rev-parse HEAD)` before building), baked into the image for manifests.
@@ -30,10 +32,11 @@ x-no-db-passwords: &no-db-passwords
   POSTGRES_PASSWORD: ""
   DB_APP_PASSWORD: ""
   DB_RESEARCH_WORKER_PASSWORD: ""
+  DB_EVALUATOR_PASSWORD: ""
   DB_MIGRATOR_PASSWORD: ""
   DB_BACKUP_PASSWORD: ""
 
-# The API's own secrets, which a research worker never uses. Each is blanked
+# The API's own secrets, which a research worker or evaluator never uses. Each is blanked
 # along with its *_FILE form, which backend/config.py reads in its place.
 x-no-api-secrets: &no-api-secrets
   JWT_PRIVATE_KEY: ""
@@ -109,6 +112,7 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       DB_APP_PASSWORD: ${DB_APP_PASSWORD:?Set DB_APP_PASSWORD}
       DB_RESEARCH_WORKER_PASSWORD: ${DB_RESEARCH_WORKER_PASSWORD:?Set DB_RESEARCH_WORKER_PASSWORD}
+      DB_EVALUATOR_PASSWORD: ${DB_EVALUATOR_PASSWORD:?Set DB_EVALUATOR_PASSWORD}
       DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:?Set DB_MIGRATOR_PASSWORD}
       DB_BACKUP_PASSWORD: ${DB_BACKUP_PASSWORD:?Set DB_BACKUP_PASSWORD}
     networks: [data]
@@ -116,8 +120,8 @@ services:
       postgres:
         condition: service_healthy
 
-  # Applies pending schema migrations as qs_migrator and exits; the API and
-  # the research worker start only once it has succeeded.
+  # Applies pending schema migrations as qs_migrator and exits; the API, the
+  # research worker and the research evaluator start only once it has succeeded.
   migrate:
     <<: *app
     restart: "no"
@@ -195,6 +199,32 @@ services:
         condition: service_completed_successfully
     # One worker and its job process peaked at about 260 MB on the largest
     # research inputs; the limits keep research from starving the API.
+    mem_limit: 1g
+    cpus: "1.0"
+
+  # Runs only the jobs that grade a strategy on its sealed holdout, as
+  # qs_evaluator: it claims and finishes those jobs and writes the audit
+  # trail, and can neither queue nor delete a job nor read any user, account,
+  # key or research-result table. No route to the internet, and the dataset
+  # blobs read-only. Ordinary research workers never claim its jobs
+  # (backend/services/research_jobs.py).
+  research-evaluator:
+    <<: *app
+    restart: unless-stopped
+    command: ["python", "-m", "backend.worker"]
+    environment:
+      <<: [*no-db-passwords, *no-api-secrets]
+      ENVIRONMENT: production
+      QS_PROCESS_ROLE: research-evaluator
+      DATABASE_URL: postgresql+psycopg://qs_evaluator:${DB_EVALUATOR_PASSWORD:?Set DB_EVALUATOR_PASSWORD}@postgres:5432/quantumsentinel
+    volumes:
+      - datasets:/data/datasets:ro
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     mem_limit: 1g
     cpus: "1.0"
 

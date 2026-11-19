@@ -684,6 +684,22 @@ class StrategyValidationJob(ValidationMatrixJob):
     worker against the validation policy."""
 
 
+class FinalEvaluationJob(BaseModel):
+    """A queued holdout evaluation (services/holdout_evaluation.py), which
+    only an operator queues: the passing verdict it grades, named by the job
+    that recorded it, with the period and initial capital its evaluation ran
+    with (the evaluation keeps only their hash). The datasets are the
+    evaluation's own."""
+    validation: str = Field(min_length=1, max_length=64)
+    period: str
+    initial_capital: float = Field(ge=1000.0, le=100_000_000.0)
+
+    @field_validator("period")
+    @classmethod
+    def valid_period(cls, value: str) -> str:
+        return _trailing_period(value)
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: Alpha Research & Factor Modeling Schemas
 # ---------------------------------------------------------------------------

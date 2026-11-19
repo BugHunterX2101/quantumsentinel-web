@@ -64,7 +64,8 @@ class TestMigrations:
             conn.execute(text("DROP TABLE dataset_holdouts"))
             # And revision 0010 this column.
             conn.execute(text("ALTER TABLE research_workers DROP COLUMN role"))
-            # And revision 0009 this one; then 0008's; then 0007's; then 0006's.
+            # And revision 0011 these; then 0009's; then 0008's; then 0007's; then 0006's.
+            conn.execute(text("DROP TABLE holdout_evaluations, holdout_attempts"))
             conn.execute(text("DROP TABLE validation_manifests"))
             conn.execute(text("DROP TABLE strategy_validations, trial_matrices"))
             conn.execute(text("DROP TABLE research_trial_evaluations"))

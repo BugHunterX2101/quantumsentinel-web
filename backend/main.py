@@ -2204,6 +2204,16 @@ def get_strategy_validation_manifest(job_id: str, user: models.User = Depends(ge
     return validation_manifest.view(db, row)
 
 
+@app.get("/api/research/holdout-evaluations")
+def list_holdout_evaluations(limit: int = Query(20, ge=1, le=100),
+                             user: models.User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    """The caller's holdout attempts, newest first, and whether each graded
+    one passed. An operator queues them (manage final-evaluate); no figure of
+    the holdout is shown."""
+    from .services import holdout_evaluation
+    return holdout_evaluation.owner_view(db, user.id, limit)
+
 @app.get("/api/research/jobs")
 def list_research_jobs(limit: int = Query(20, ge=1, le=100),
                        user: models.User = Depends(get_current_user),

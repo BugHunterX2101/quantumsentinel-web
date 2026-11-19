@@ -370,7 +370,13 @@ class Worker:
         elif status == "cancelled":
             research_jobs.mark_cancelled(db, job, self.id, attempt)
         elif status == "shutdown":
-            research_jobs.release(db, job, self.id, attempt)
+            if kind.evaluator:
+                # Its attempt was spent before it read any data (holdout_
+                # evaluation.inputs); handing the job back would run it again.
+                from .services.holdout_evaluation import SHUTDOWN_DETAIL
+                research_jobs.fail(db, job, self.id, attempt, 500, SHUTDOWN_DETAIL)
+            else:
+                research_jobs.release(db, job, self.id, attempt)
         elif status == "lost":
             log.warning("research job %s: lease lost; stopped its computation", job.id)
         log.info("research job %s -> %s in %.1f s", job.id, status, elapsed)

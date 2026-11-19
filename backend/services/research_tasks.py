@@ -418,6 +418,80 @@ def strategy_validation(params: dict, prepared: dict) -> TaskOutput:
     return TaskOutput(result, audit)
 
 
+class _NoSnapshots:
+    """The provider of a holdout evaluation's market data sessions: it reads
+    only the evaluation's stored datasets, so any snapshot is refused."""
+
+    def snapshot(self, request):
+        raise market_data.MarketDataError("a holdout evaluation reads only the evaluation's datasets")
+
+
+# A trailing period long enough to hold every session of a dataset.
+_ALL_SESSIONS = "99y"
+
+
+def final_evaluation(params: dict, prepared: dict) -> TaskOutput:
+    """The holdout run of a holdout evaluation (services/holdout_evaluation.py),
+    in the research evaluator's job process. The worker spent the attempt and
+    passes, as ``prepared``, the version's spec, the evaluation, its period
+    and capital, and the dataset family's holdout start.
+
+    1. Re-run the evaluation on its datasets cut at the holdout start. It must
+       reproduce the evaluation's return series, or the evaluation saw data
+       the cut hides, and the job is refused.
+    2. Run the version on the same datasets uncut, from the first session of
+       that re-run through the end of the data, and report the returns of the
+       sessions from the holdout start on.
+
+    The worker grades the report. Any failure of step 2 raises the same
+    message, which carries no figure of the holdout."""
+    import datetime as dt
+    from dataclasses import replace
+    from . import historical_data, strategy_spec
+    from .holdout_evaluation import HOLDOUT_RUN_FAILED
+
+    schemas.FinalEvaluationJob.model_validate(params)
+    spec = strategy_spec.parse(prepared["spec"])
+    if strategy_spec.version_id(spec) != prepared["strategy_version_id"]:
+        raise TaskError(500, "The research job was given another strategy than the one it names")
+    evaluation = prepared["evaluation"]
+    dataset_ids = list(evaluation["dataset_ids"])
+    if not dataset_ids:
+        raise TaskError(500, "The research job was given no datasets")
+    family, start = prepared["dataset_family"], dt.date.fromisoformat(prepared["holdout_start"])
+    compiled = strategy_spec.compile_spec(spec)
+    tickers = list(compiled.tickers)
+
+    with market_data.session(dataset_ids, holdouts={family: start}, provider=_NoSnapshots()) as cut:
+        panel = _strategy_panel(tickers, prepared["period"])
+        run = _run_strategy(compiled, panel, prepared["initial_capital"])
+    if research_trials.returns_id(run["returns"]) != evaluation["returns_sha256"]:
+        raise TaskError(409, "The candidate's evaluation does not reproduce on its datasets cut at the holdout "
+                             "start, so it cannot be graded on the holdout")
+    first = panel.dates[0]
+    used = sorted(cut.used)
+
+    try:
+        with market_data.session(dataset_ids, holdouts={}, provider=_NoSnapshots()):
+            raw = market_data.download(tickers, _ALL_SESSIONS)
+        whole = historical_data.aligned_panel(raw, tickers)
+        if [t for t in tickers if t not in whole.tickers]:
+            raise TaskError(422, "a symbol has no data")
+        keep = whole.dates >= first
+        window = replace(whole, dates=whole.dates[keep], close=whole.close[keep], high=whole.high[keep],
+                         low=whole.low[keep], volume=whole.volume[keep])
+        quanta = research_trials.quantise(_run_strategy(compiled, window, prepared["initial_capital"])["returns"])
+    except (TaskError, market_data.MarketDataError, ValueError, KeyError) as exc:
+        log.error("holdout run failed: %s", exc)
+        raise TaskError(422, HOLDOUT_RUN_FAILED) from exc
+    holdout = [(d, q) for d, q in zip(window.date_strings(), quanta) if d >= start.isoformat()]
+    report = {"holdout_start": start.isoformat(), "reproduced": evaluation["returns_sha256"], "datasets": used,
+              "window_first_session": first.strftime("%Y-%m-%d"),
+              "dates": [d for d, _ in holdout], "returns": [q for _, q in holdout]}
+    return TaskOutput({"holdout": report}, {"validation": params["validation"]})
+
+
+
 def _family_matrix(req: schemas.ValidationMatrixJob, prepared: dict,
                    cost_multiplier_centi: int | None = None) -> tuple[dict, dict, dict, list[int] | None]:
     """The trial matrix of the candidate's family (result, audit), the

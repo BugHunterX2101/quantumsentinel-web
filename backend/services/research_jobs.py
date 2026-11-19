@@ -74,6 +74,9 @@ class JobKind:
     # evaluator claims it, and the evaluator claims nothing else
     # (claimable_kinds).
     evaluator: bool = False
+    # Attempts a job of the kind gets, or None for RESEARCH_JOB_MAX_ATTEMPTS.
+    # A holdout evaluation gets one: its attempt is spent once it starts.
+    max_attempts: int | None = None
 
 
 _TASKS = "backend.services.research_tasks"
@@ -81,6 +84,7 @@ _EXPERIMENTS = "backend.services.experiment_registry"
 _STRATEGIES = "backend.services.strategy_registry"
 _MATRIX = "backend.services.trial_matrix"
 _VALIDATION = "backend.services.strategy_validation"
+_HOLDOUT = "backend.services.holdout_evaluation"
 KINDS: dict[str, JobKind] = {
     "ma_backtest": JobKind(schemas.BacktestRequest, f"{_TASKS}:ma_backtest", "BACKTEST_COMPLETED",
                            market_data=True),
@@ -126,6 +130,11 @@ KINDS: dict[str, JobKind] = {
     "strategy_validation": JobKind(schemas.StrategyValidationJob, f"{_TASKS}:strategy_validation",
                                    "STRATEGY_VALIDATION", f"{_VALIDATION}:finalize_validation_job",
                                    market_data=True, prepare=f"{_MATRIX}:matrix_inputs"),
+    # Not market_data: it reads only the evaluation's stored datasets, sets
+    # its own cut, and the worker hands it no holdout starts.
+    "final_evaluation": JobKind(schemas.FinalEvaluationJob, f"{_TASKS}:final_evaluation", "HOLDOUT_EVALUATION",
+                                f"{_HOLDOUT}:finalize_job", prepare=f"{_HOLDOUT}:inputs", evaluator=True,
+                                max_attempts=1),
 }
 
 
@@ -248,8 +257,8 @@ def enqueue(db: Session, user_id: str, kind: str, params: dict,
                 ).scalar() or 0)
                 if active >= RESEARCH_MAX_ACTIVE_JOBS_PER_USER:
                     raise QueueFull(active, RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
-                job = models.ResearchJob(user_id=user_id, kind=kind, params_json=params,
-                                         status=QUEUED, max_attempts=RESEARCH_JOB_MAX_ATTEMPTS)
+                job = models.ResearchJob(user_id=user_id, kind=kind, params_json=params, status=QUEUED,
+                                         max_attempts=KINDS[kind].max_attempts or RESEARCH_JOB_MAX_ATTEMPTS)
                 db.add(job)
             db.commit()
         except Exception:

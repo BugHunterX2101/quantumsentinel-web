@@ -381,6 +381,57 @@ class ValidationManifest(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class HoldoutAttempt(Base):
+    """One attempt at grading a validated strategy version on its dataset
+    family's sealed holdout (services/holdout_evaluation.py). The research
+    evaluator writes it when it claims the ``final_evaluation`` job, before it
+    reads any data, so a run that then fails has still spent it. One per
+    user, version, dataset family and holdout start. The rows of a research
+    family count as trials of that family (trial_matrix.family_state).
+
+    Immutable: migration 0011 adds triggers that refuse UPDATE, DELETE and
+    TRUNCATE."""
+    __tablename__ = "holdout_attempts"
+    __table_args__ = (
+        UniqueConstraint("user_id", "strategy_version_id", "dataset_family", "holdout_start",
+                         name="uq_holdout_attempts_once_per_holdout"),
+        Index("ix_holdout_attempts_family", "user_id", "family_hash"),
+    )
+
+    job_id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    validation_job_id = Column(String, ForeignKey("strategy_validations.job_id"), nullable=False)
+    strategy_version_id = Column(String(80), ForeignKey("strategy_versions.version_id"), nullable=False)
+    family_hash = Column(String(64), nullable=False)
+    dataset_family = Column(String(64), nullable=False)
+    holdout_start = Column(Date, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class HoldoutEvaluation(Base):
+    """The grade of one holdout attempt, with every figure it rests on, and
+    its signed manifest (services/holdout_evaluation.py). Nothing else holds
+    the figures: the job's result and audit event carry ids and pass/fail
+    only, and the research worker cannot read this table (db_roles.py).
+
+    Immutable: migration 0011 adds triggers that refuse UPDATE, DELETE and
+    TRUNCATE, and CHECKs that hold the policy id and manifest id to their
+    hashes, ``passed`` to the grade and the manifest, and the manifest to its
+    row (PostgreSQL SQL, so they live in the migration only)."""
+    __tablename__ = "holdout_evaluations"
+
+    job_id = Column(String, ForeignKey("holdout_attempts.job_id"), primary_key=True)
+    policy_id = Column(String(96), nullable=False)
+    policy_canonical = Column(LargeBinary, nullable=False)
+    passed = Column(Boolean, nullable=False)
+    grade = Column(JSON, nullable=False)
+    manifest_id = Column(String(96), nullable=False, unique=True)
+    canonical = Column(LargeBinary, nullable=False)
+    signature = Column(Text, nullable=False)
+    signing_key_id = Column(String, ForeignKey("server_signing_keys.key_id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 class ResearchJob(Base):
     """A research computation queued by the API and run by a worker process.
 

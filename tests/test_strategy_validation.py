@@ -775,7 +775,7 @@ def test_the_schema_refuses_a_matrix_stored_under_another_id(db, stored):
 
 @pytest.mark.parametrize("statement", [
     "UPDATE strategy_validations SET passed = true", "DELETE FROM strategy_validations",
-    "TRUNCATE strategy_validations", "UPDATE trial_matrices SET canonical = canonical",
+    "TRUNCATE strategy_validations CASCADE", "UPDATE trial_matrices SET canonical = canonical",
     "DELETE FROM trial_matrices", "TRUNCATE trial_matrices CASCADE",
 ])
 def test_verdicts_and_matrices_are_immutable_even_for_the_owner(db, stored, statement):

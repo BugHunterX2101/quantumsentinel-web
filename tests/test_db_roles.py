@@ -430,6 +430,11 @@ def test_the_research_worker_runs_a_strategy_backtest_as_its_own_role(provisione
     # The worker validates the evaluation as its own role too, and records the
     # matrix and the verdict.
     capital = api.get(models.ResearchJob, view["job_id"]).params_json["initial_capital"]
+    # A server key not yet registered: the worker registers it, as its own
+    # role, in the transaction that records the verdict and its manifest.
+    for name, value in (("dsa_pk", None), ("dsa_sk", None), ("fingerprint", None), ("key_id", None),
+                        ("_registered", False)):
+        monkeypatch.setattr(security_service.server_identity, name, value)
     validation = main.validate_strategy(schemas.StrategyValidationRequest(
         evaluation=view["job_id"], period="1y", initial_capital=capital), user=user, db=api)
     assert runner.run_once() is True
@@ -437,6 +442,9 @@ def test_the_research_worker_runs_a_strategy_backtest_as_its_own_role(provisione
     validated = research_jobs.view(api, api.get(models.ResearchJob, json.loads(validation.body)["job_id"]))
     assert validated["status"] == "succeeded", validated
     assert validated["result"]["validation"]["passed"] is False
+    manifest = main.get_strategy_validation_manifest(validated["job_id"], user=user, db=api)
+    assert manifest["signature_valid"] is True and manifest["matches_verdict"] is True
+    assert manifest["signature"].startswith("ml-dsa:")
     assert security_service.audit_chain_status(api, full=True)["valid"]
     api.close()
     research_worker = provisioned.connect(roles.research_worker)
@@ -451,7 +459,9 @@ def test_the_research_worker_runs_a_strategy_backtest_as_its_own_role(provisione
         for statement in ("UPDATE research_trial_evaluations SET sharpe = 9",
                           "DELETE FROM research_trial_evaluations", "TRUNCATE research_trial_evaluations",
                           "UPDATE strategy_validations SET passed = true", "DELETE FROM strategy_validations",
-                          "TRUNCATE strategy_validations", "DELETE FROM trial_matrices", "TRUNCATE trial_matrices"):
+                          "TRUNCATE strategy_validations", "DELETE FROM trial_matrices", "TRUNCATE trial_matrices",
+                          "UPDATE validation_manifests SET signature = signature",
+                          "DELETE FROM validation_manifests", "TRUNCATE validation_manifests"):
             with pytest.raises(errors.InsufficientPrivilege):
                 conn.execute(statement)
     owner = provisioned.connect()
@@ -460,6 +470,9 @@ def test_the_research_worker_runs_a_strategy_backtest_as_its_own_role(provisione
     assert owner.execute("SELECT job_id, evaluation_job_id, passed FROM strategy_validations").fetchall() == \
         [(validated["job_id"], view["job_id"], False)]
     assert owner.execute("SELECT count(*) FROM trial_matrices").fetchone() == (1,)
+    assert owner.execute("SELECT v.job_id, k.fingerprint FROM validation_manifests v"
+                         " JOIN server_signing_keys k ON k.key_id = v.signing_key_id").fetchall() == \
+        [(validated["job_id"], security_service.server_identity.fingerprint)]
 
 
 def test_the_research_worker_runs_a_dataset_snapshot_as_its_own_role(provisioned, monkeypatch, tmp_path):

@@ -37,6 +37,12 @@ from .strategy_signals import ma_crossover_series
 
 log = logging.getLogger(__name__)
 
+# The engine's version, recorded in strategy validation manifests
+# (services/validation_manifest.py). Bump it whenever what a strategy run
+# computes changes (fills, costs, sizing, the returns it reports), so a
+# verdict names the engine that reached it.
+ENGINE_VERSION = "qs-event-engine-1"
+
 
 # ---------------------------------------------------------------------------
 # Event types

@@ -28,6 +28,11 @@ RUN chown -R app:app /app
 # of this directory, so it is created owned by app and stays writable.
 RUN mkdir -p /data/datasets && chown app:app /data/datasets
 ENV DATASET_ROOT=/data/datasets
+# The commit this image is built from, which strategy validation manifests
+# record (CI and docker-compose.production.yml pass it; unset, it is empty
+# and manifests record no commit). Last, so a new commit reuses every layer above.
+ARG QS_CODE_COMMIT=
+ENV QS_CODE_COMMIT=${QS_CODE_COMMIT}
 EXPOSE 8000
 USER app
 # FORWARDED_ALLOW_IPS controls which immediate peers' X-Forwarded-For/X-Real-IP

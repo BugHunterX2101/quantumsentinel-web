@@ -11,7 +11,12 @@
 # the database cannot reach the internet and nginx cannot reach the database.
 # The API and the research worker also join `edge` for market data.
 x-app: &app
-  build: .
+  # QS_CODE_COMMIT: the commit being deployed (`export QS_CODE_COMMIT=$(git
+  # rev-parse HEAD)` before building), baked into the image for manifests.
+  build: &build
+    context: .
+    args:
+      QS_CODE_COMMIT: ${QS_CODE_COMMIT:-}
   image: quantumsentinel-web:production
   env_file: ${PRODUCTION_ENV_FILE:-.env.production}
   security_opt: ["no-new-privileges:true"]
@@ -242,7 +247,7 @@ services:
   # volume lacks back from the backup. It runs as the image's app user, so the
   # research worker can still write into the directories it creates.
   restore-datasets:
-    build: .
+    build: *build
     image: quantumsentinel-web:production
     profiles: ["restore"]
     restart: "no"

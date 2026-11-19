@@ -359,6 +359,28 @@ class StrategyValidation(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
+class ValidationManifest(Base):
+    """The signed manifest (v3) of one strategy validation's verdict
+    (services/validation_manifest.py), stored once under its id: the hash
+    of ``canonical``, the manifest's canonical JSON, which ``signature``
+    signs with the key ``signing_key_id`` names (None for the HMAC that only
+    a non-production deployment may use). Verdicts recorded before manifests
+    existed have none.
+
+    Immutable: migration 0009 adds triggers that refuse UPDATE, DELETE and
+    TRUNCATE, and CHECKs that hold the id to the hash, the manifest's job and
+    key to the row's, and the signature to its form (PostgreSQL SQL, so they
+    live in the migration only)."""
+    __tablename__ = "validation_manifests"
+
+    manifest_id = Column(String(96), primary_key=True)
+    job_id = Column(String, ForeignKey("strategy_validations.job_id"), nullable=False, unique=True)
+    canonical = Column(LargeBinary, nullable=False)
+    signature = Column(Text, nullable=False)
+    signing_key_id = Column(String, ForeignKey("server_signing_keys.key_id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
 class ResearchJob(Base):
     """A research computation queued by the API and run by a worker process.
 

@@ -22,6 +22,10 @@ ENVIRONMENT = _setting("ENVIRONMENT", "development").lower()
 PROCESS_ROLE = _setting("QS_PROCESS_ROLE", "api")
 if PROCESS_ROLE not in ("api", "research-worker", "research-job"):
     raise RuntimeError("QS_PROCESS_ROLE must be one of: api, research-worker, research-job")
+# The commit the image was built from (the Dockerfile's QS_CODE_COMMIT build
+# argument, set by CI and the deployment); strategy validation manifests
+# record it (services/validation_manifest.py).
+CODE_COMMIT = _setting("QS_CODE_COMMIT")
 JWT_ALGORITHM = "RS256"
 _jwt_private_pem = _setting("JWT_PRIVATE_KEY")
 _jwt_public_pem = _setting("JWT_PUBLIC_KEY")

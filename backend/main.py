@@ -61,7 +61,7 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, integration_service, order_security
 from .services import (dataset_registry, paper_broker, research_jobs, research_trials, strategy_registry,
-                       strategy_validation, trial_matrix)
+                       strategy_validation, trial_matrix, validation_manifest)
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -2190,6 +2190,18 @@ def get_strategy_validation_matrix(job_id: str, user: models.User = Depends(get_
     if row is None:
         raise HTTPException(404, "Validation not found")
     return strategy_validation.matrix_of(db, row)
+
+
+@app.get("/api/research/strategy-validations/{job_id}/manifest")
+def get_strategy_validation_manifest(job_id: str, user: models.User = Depends(get_current_user),
+                                     db: Session = Depends(get_db)):
+    """The signed manifest (v3) of one of the caller's verdicts, with whether
+    its signature verifies and whether it names this verdict. A verdict
+    recorded before manifests existed reports none."""
+    row = strategy_validation.get_for_user(db, user.id, job_id)
+    if row is None:
+        raise HTTPException(404, "Validation not found")
+    return validation_manifest.view(db, row)
 
 
 @app.get("/api/research/jobs")

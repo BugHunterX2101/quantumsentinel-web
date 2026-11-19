@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -461,6 +461,7 @@ def run_event_backtest(
     *,
     full_returns: bool = False,
     risk_metrics: bool = False,
+    cost_multiplier_centi: int = 100,
 ) -> dict:
     """Run the event-driven backtester.
 
@@ -489,7 +490,15 @@ def run_event_backtest(
         either of those points (a share of non-positive equity has no
         meaning, so such points count here instead). Fills never raise
         equity, so the drawdown needs only the marks after them.
+    cost_multiplier_centi : every parameter of the cost model (commission
+        rate, minimum commission, spread, market impact and borrow rate)
+        multiplied by this many hundredths, a positive integer; 100, the
+        default, leaves the model as it is, and 200 doubles every cost (the
+        validation policy's cost stress).
     """
+    if (isinstance(cost_multiplier_centi, bool) or not isinstance(cost_multiplier_centi, int)
+            or cost_multiplier_centi < 1):
+        raise ValueError("cost_multiplier_centi must be a positive integer")
     params = strategy_params or {}
 
     # Build strategy
@@ -517,6 +526,14 @@ def run_event_backtest(
         "institutional": TransactionCostModel(0.0002, 1.0, 0.5, 0.005, 0.5),
     }
     cost_model = cost_presets.get(cost_model_name, cost_presets["retail"])
+    if cost_multiplier_centi != 100:
+        scale = cost_multiplier_centi / 100
+        cost_model = replace(cost_model,
+                             commission_pct=cost_model.commission_pct * scale,
+                             spread_bps=cost_model.spread_bps * scale,
+                             market_impact_bps=cost_model.market_impact_bps * scale,
+                             borrow_rate_annual=cost_model.borrow_rate_annual * scale,
+                             min_commission=cost_model.min_commission * scale)
 
     # Position sizer
     if sizing_method == "volatility_target":

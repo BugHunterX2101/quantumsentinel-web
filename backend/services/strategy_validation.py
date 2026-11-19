@@ -1,14 +1,16 @@
 """QuantumSentinel — strategy validations (R3-4).
 
 A strategy validation judges one strategy evaluation against the validation
-policy (``validation_policy.evaluate``): the risk gate on the candidate's
-re-run, and the statistical gates on its research family's trial matrix
-(``trial_matrix``).
+policy (``validation_policy.evaluate``, under ``CURRENT_POLICY``): the risk
+gate on the candidate's re-run, the statistical gates on its research
+family's trial matrix (``trial_matrix``), and the cost stress gate on the
+candidate re-run with every cost multiplied.
 
 The ``strategy_validation`` job runs in two parts. The job process builds
 the matrix exactly as the ``validation_matrix`` job does (it re-runs every
 strategy version evaluated in the family on the candidate's datasets) and
-reports the candidate's risk measurements beside it. The worker then
+reports the candidate's risk measurements beside it, with the returns of the
+candidate re-run once more under the policy's cost multiplier. The worker then
 accepts the matrix as it accepts a validation matrix
 (``trial_matrix.accept_matrix``: the evaluation's datasets, a family that did
 not change meanwhile, a well-formed matrix with every evaluated version),
@@ -17,8 +19,10 @@ computes the verdict itself from the matrix it accepted, the family's trials
 as the ledger holds them, and the candidate's spec as the registry holds it.
 Nothing the job process says about the verdict is kept; only its
 measurements are used, and those it cannot misstate without the matrix's id
-or the evaluation's hash giving it away, apart from the risk measurements,
-which the risk gate takes as the engine reported them.
+or the evaluation's hash giving it away, apart from the risk measurements
+and the stressed run's returns, which the risk and cost stress gates take as
+the engine reported them (the verdict records the stressed series' hash,
+not the series).
 
 The verdict and the matrix are stored in the transaction that stores the
 job's result (migration 0008): the matrix once under its id, the verdict once
@@ -61,9 +65,16 @@ def finalize_validation_job(db: Session, job: models.ResearchJob, result: dict, 
     except strategy_registry.StrategyRegistryError as exc:
         raise TaskError(422, str(exc)) from exc
 
-    policy = validation_policy.POLICY_V1
+    policy = validation_policy.CURRENT_POLICY
+    stressed = None
+    if policy.cost_stress_multiplier_centi is not None:
+        stress = result.get("cost_stress")
+        if not isinstance(stress, dict) or stress.get("multiplier_centi") != policy.cost_stress_multiplier_centi:
+            raise TaskError(500, "The research job did not stress the candidate's costs as the policy says")
+        stressed = stress.get("returns")
     verdict = validation_policy.evaluate(matrix, version_id, state, spec.universe.family, spec.risk_limits,
-                                         result.get("risk"), policy)
+                                         result.get("risk"), policy, cost_model=spec.cost_model,
+                                         stressed=stressed)
     try:
         json.dumps(verdict, allow_nan=False)
     except ValueError as exc:
@@ -81,7 +92,7 @@ def finalize_validation_job(db: Session, job: models.ResearchJob, result: dict, 
         created_at=now))
     db.flush()
 
-    result = {key: value for key, value in result.items() if key not in ("matrix", "risk")}
+    result = {key: value for key, value in result.items() if key not in ("matrix", "risk", "cost_stress")}
     result.update(matrix_id=matrix["id"], validation=verdict)
     audit = {**audit, "policy": verdict["policy"], "passed": verdict["passed"],
              "failed_gates": sorted(name for name, gate in verdict["gates"].items() if not gate["passed"])}

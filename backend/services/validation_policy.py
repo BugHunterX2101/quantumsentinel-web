@@ -46,19 +46,35 @@ variant tried in its research family, from the trial matrix
 * ``backtest_length``: the backtest is at least the minimum backtest length
   for the family's trials.
 
+The cost stress gate (``cost_stress_gate``, from policy v2) re-applies the
+Sharpe ratio's thresholds to the candidate re-run with every cost multiplied
+by ``cost_stress_multiplier_centi`` / 100:
+
+* ``haircut_sharpe`` and ``t_statistic`` must still pass with the stressed
+  series in place of the candidate's column. The other trials keep their
+  unstressed series, and the deflated Sharpe, overfitting and backtest
+  length gates are judged on the unstressed matrix only;
+* a candidate that declares the zero-cost model fails: twice nothing is
+  nothing, so the stress would test nothing.
+
 A Sharpe ratio is annualised only to compare it with a yearly threshold,
 with the sessions a year of the strategy's dataset family
 (``sessions_per_year``); a family the policy does not list fails the gates
 that need it. A verdict is pre-holdout: it says whether the candidate may go
-on to the one-shot holdout evaluation, not that it passed it. Cost stress is
-not part of this policy.
+on to the one-shot holdout evaluation, not that it passed it.
+
+Policies. ``POLICY_V1`` has no cost stress; its id, which stored verdicts
+name, is unchanged by the field that v2 added (a policy without cost stress
+leaves the field out of its canonical JSON). ``POLICY_V2`` is v1 with a 2x
+cost stress, and ``CURRENT_POLICY`` is the one new verdicts are reached
+under.
 """
 from __future__ import annotations
 
 import hashlib
 import math
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping
 
 from .dataset_format import canonical_json
@@ -111,6 +127,9 @@ class ValidationPolicy:
     # Sessions a year by dataset family, as (family, sessions) pairs ordered
     # by family.
     sessions_per_year: tuple[tuple[str, int], ...]
+    # The cost stress: every cost multiplied by this many hundredths (above
+    # 100), or None for a policy without it.
+    cost_stress_multiplier_centi: int | None = None
 
     def __post_init__(self):
         from .validation_stats import METHODS
@@ -134,6 +153,9 @@ class ValidationPolicy:
                            and _integer(p[1]) and 1 <= p[1] <= 366 for p in pairs)
                 or [p[0] for p in pairs] != sorted({p[0] for p in pairs})):
             raise ValueError("sessions_per_year is (family, sessions in 1..366) pairs, one per family, in order")
+        stress = self.cost_stress_multiplier_centi
+        if stress is not None and not (_integer(stress) and 101 <= stress <= 1_000):
+            raise ValueError("cost_stress_multiplier_centi is None or an integer in 101..1000")
 
 
 POLICY_V1 = ValidationPolicy(
@@ -154,9 +176,18 @@ POLICY_V1 = ValidationPolicy(
 )
 
 
+POLICY_V2 = replace(POLICY_V1, name="qs-validation-policy-v2", cost_stress_multiplier_centi=200)
+CURRENT_POLICY = POLICY_V2
+
+
 def policy_canonical(policy: ValidationPolicy) -> bytes:
-    """The canonical JSON of the policy, which its id hashes."""
-    return canonical_json(asdict(policy))
+    """The canonical JSON of the policy, which its id hashes. A policy
+    without cost stress leaves that field out, so policy v1, from before the
+    field existed, keeps its id."""
+    fields = asdict(policy)
+    if fields["cost_stress_multiplier_centi"] is None:
+        del fields["cost_stress_multiplier_centi"]
+    return canonical_json(fields)
 
 
 def policy_id(policy: ValidationPolicy) -> str:
@@ -348,9 +379,43 @@ def backtest_length_gate(columns, candidate: int, ledger: Mapping[str, Any]) -> 
             "n_trials": ledger.get("trials")}
 
 
+def cost_stress_gate(columns, candidate: int, stressed, ledger: Mapping[str, Any], family: str,
+                     cost_model: str, policy: ValidationPolicy) -> dict:
+    """The candidate re-run with every cost multiplied by the policy's
+    multiplier (``stressed``, its returns quantised as the matrix's are)
+    still passes the haircut Sharpe ratio and t-statistic gates, with the
+    stressed series in place of its column and the other trials as they
+    are."""
+    from . import research_trials
+
+    multiplier = policy.cost_stress_multiplier_centi
+    gate = {"multiplier_centi": multiplier,
+            "description": "The Sharpe ratio still passes its thresholds with every cost multiplied"}
+    if multiplier is None:
+        return _refused(gate, "the policy has no cost stress")
+    if not isinstance(cost_model, str) or not cost_model:
+        return _refused(gate, "the strategy's cost model is not known")
+    if cost_model == "zero_cost":
+        return _refused(gate, "the strategy declares no costs, so multiplying them tests nothing")
+    try:
+        stressed = list(stressed)
+        series_id = research_trials.quantised_returns_id(stressed)
+    except (TypeError, ValueError) as exc:
+        return _refused(gate, f"the stressed run's returns are not a series ({exc})")
+    if len(stressed) != len(columns[candidate]):
+        return _refused(gate, f"the stressed run has {len(stressed)} returns for "
+                              f"{len(columns[candidate])} sessions")
+    stressed_columns = [stressed if index == candidate else column for index, column in enumerate(columns)]
+    checks = {"haircut_sharpe": haircut_sharpe_gate(stressed_columns, candidate, ledger, family, policy),
+              "t_statistic": t_statistic_gate(stressed_columns, candidate, policy)}
+    return {**gate, "passed": all(check["passed"] for check in checks.values()),
+            "returns_sha256": series_id, "checks": checks}
+
+
 def evaluate(matrix: Mapping[str, Any], candidate_version: str, ledger: Mapping[str, Any], family: str,
              limits: RiskLimits, risk: Mapping[str, Any] | None,
-             policy: ValidationPolicy = POLICY_V1) -> dict:
+             policy: ValidationPolicy = POLICY_V1, *, cost_model: str | None = None,
+             stressed=None) -> dict:
     """The policy's verdict on a candidate strategy version: every gate, and
     whether all of them passed.
 
@@ -358,14 +423,17 @@ def evaluate(matrix: Mapping[str, Any], candidate_version: str, ledger: Mapping[
     checks its id), ``ledger`` the family's trials it was built from
     (trial_matrix.family_state), ``family`` the candidate's dataset family,
     and ``limits`` and ``risk`` its declared risk limits and its re-run's
-    risk measurements. The verdict is pre-holdout: it does not include the
-    one-shot holdout evaluation."""
+    risk measurements. Under a policy with cost stress, ``cost_model`` is the
+    candidate's declared cost model and ``stressed`` its stressed re-run's
+    quantised returns (``cost_stress_gate``). The verdict is pre-holdout: it
+    does not include the one-shot holdout evaluation."""
     columns = [column["returns"] for column in matrix["columns"]]
     candidate = next((index for index, column in enumerate(matrix["columns"])
                       if candidate_version in column["strategy_version_ids"]), None)
     gates = {"risk_limits": risk_gate(limits, risk, policy)}
+    names = STATISTICAL_GATES + (("cost_stress",) if policy.cost_stress_multiplier_centi is not None else ())
     if candidate is None:
-        for name in STATISTICAL_GATES:
+        for name in names:
             gates[name] = _refused({}, "the candidate is not in the matrix")
     else:
         gates.update({
@@ -375,5 +443,8 @@ def evaluate(matrix: Mapping[str, Any], candidate_version: str, ledger: Mapping[
             "t_statistic": t_statistic_gate(columns, candidate, policy),
             "backtest_length": backtest_length_gate(columns, candidate, ledger),
         })
+        if "cost_stress" in names:
+            gates["cost_stress"] = cost_stress_gate(columns, candidate, stressed, ledger, family, cost_model,
+                                                    policy)
     return {"policy": policy_id(policy), "stage": "pre-holdout", "candidate": candidate_version,
             "passed": all(gate["passed"] for gate in gates.values()), "gates": gates}

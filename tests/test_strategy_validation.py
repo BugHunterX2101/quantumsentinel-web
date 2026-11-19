@@ -8,6 +8,7 @@ inapplicable (which fails it), on its own. The job is tested end to end on
 the synthetic market of test_trial_evaluations, whose small families can
 only fail (fewer distinct series than PBO needs).
 """
+import dataclasses
 import hashlib
 import json
 
@@ -21,7 +22,7 @@ from sqlalchemy.exc import DBAPIError
 from backend import main, models, schemas
 from backend.services import (research_trials, strategy_registry, strategy_spec, strategy_validation,
                               trial_matrix, validation_policy, validation_stats)
-from backend.services.validation_policy import POLICY_V1, evaluate, policy_id
+from backend.services.validation_policy import CURRENT_POLICY, POLICY_V1, POLICY_V2, evaluate, policy_id
 from research_job_helpers import run_queued
 from test_trial_evaluations import Session, db, make_user, market, strategy  # noqa: F401
 from test_trial_matrix import FAMILY, MisreportsItsResult, evaluated, trial_count
@@ -31,6 +32,7 @@ V = ["qs-sv-sha256-v1:" + f"{i:064x}" for i in range(1, 41)]
 CANDIDATE = V[0]
 LIMITS = strategy_spec.RiskLimits(max_drawdown_bps=2_500, max_position_bps=2_500)
 RISK = {"max_drawdown": 0.10, "max_position_share": 0.20, "equity_exhausted": False}
+CURRENT_ID = policy_id(CURRENT_POLICY)
 
 
 def family(sessions=504, strategies=10, drift=0.003, seed=7, twins=()):
@@ -297,6 +299,109 @@ def test_the_verdict_uses_the_policy_it_is_given():
 
 
 # --------------------------------------------------------------------------
+# The cost stress gate (policy v2)
+# --------------------------------------------------------------------------
+
+def candidate_column(matrix):
+    return list(matrix["columns"][trial_matrix.column_of(matrix, CANDIDATE)]["returns"])
+
+
+def stressed_verdict(matrix, stressed, cost_model="retail", policy=POLICY_V2, candidate=CANDIDATE):
+    return evaluate(matrix, candidate, ledger(10), "EQUITY_EOD", LIMITS, RISK, policy,
+                    cost_model=cost_model, stressed=stressed)
+
+
+def test_policy_v2_is_the_current_policy_and_adds_the_cost_stress_gate():
+    assert CURRENT_POLICY is POLICY_V2 and POLICY_V2.cost_stress_multiplier_centi == 200
+    matrix = family()
+    found = stressed_verdict(matrix, candidate_column(matrix))
+    assert set(found["gates"]) == {"risk_limits", *validation_policy.STATISTICAL_GATES, "cost_stress"}
+    assert found["policy"] == policy_id(POLICY_V2) != POLICY_V1_ID
+    # Policy v1 has no such gate, whatever it is given.
+    assert "cost_stress" not in stressed_verdict(matrix, candidate_column(matrix), policy=POLICY_V1)["gates"]
+
+
+def test_a_candidate_whose_edge_survives_dearer_costs_passes_the_cost_stress():
+    matrix = family()
+    stressed = [q - 200_000_000 for q in candidate_column(matrix)]  # 2bp a day lost to the doubled costs
+    found = stressed_verdict(matrix, stressed)
+    assert found["passed"] is True, found
+    gate = found["gates"]["cost_stress"]
+    assert gate["passed"] is True and gate["multiplier_centi"] == 200
+    assert gate["returns_sha256"] == research_trials.quantised_returns_id(stressed)
+    assert gate["checks"]["t_statistic"]["value"] < found["gates"]["t_statistic"]["value"]
+
+
+def test_a_candidate_whose_edge_is_eaten_by_dearer_costs_fails_only_the_cost_stress():
+    matrix = family()
+    stressed = [q - 3_000_000_000 for q in candidate_column(matrix)]  # the 0.3% daily drift, gone
+    found = stressed_verdict(matrix, stressed)
+    assert found["passed"] is False
+    assert [name for name, gate in found["gates"].items() if not gate["passed"]] == ["cost_stress"]
+    checks = found["gates"]["cost_stress"]["checks"]
+    assert checks["haircut_sharpe"]["passed"] is False and checks["t_statistic"]["passed"] is False
+    # The other gates are those of the unstressed matrix.
+    plain = stressed_verdict(matrix, candidate_column(matrix))
+    assert {k: g for k, g in found["gates"].items() if k != "cost_stress"} == \
+        {k: g for k, g in plain["gates"].items() if k != "cost_stress"}
+
+
+def test_the_cost_stress_fails_when_either_of_its_checks_fails():
+    """5bp a day lost: the haircut Sharpe still clears its bar but t falls
+    below 3, so the gate fails though one of its two checks passes."""
+    matrix = family()
+    stressed = [q - 500_000_000 for q in candidate_column(matrix)]
+    found = stressed_verdict(matrix, stressed)
+    checks = found["gates"]["cost_stress"]["checks"]
+    assert checks["haircut_sharpe"]["passed"] is True and checks["t_statistic"]["passed"] is False
+    assert found["gates"]["cost_stress"]["passed"] is False and found["passed"] is False
+
+
+def test_the_cost_stress_replaces_only_the_candidates_column():
+    """The haircut's other p-values are the other trials' unstressed columns."""
+    matrix = family()
+    stressed = [q - 200_000_000 for q in candidate_column(matrix)]
+    columns = [list(c["returns"]) for c in matrix["columns"]]
+    index = trial_matrix.column_of(matrix, CANDIDATE)
+    expected = validation_policy.haircut_sharpe_gate(
+        [stressed if i == index else c for i, c in enumerate(columns)], index, ledger(10), "EQUITY_EOD", POLICY_V2)
+    assert stressed_verdict(matrix, stressed)["gates"]["cost_stress"]["checks"]["haircut_sharpe"] == expected
+
+
+@pytest.mark.parametrize("cost_model, stressed, reason", [
+    ("zero_cost", "same", "declares no costs"),
+    (None, "same", "cost model is not known"),
+    ("", "same", "cost model is not known"),
+    ("retail", None, "not a series"),
+    ("retail", "floats", "not a series"),
+    ("retail", "short", "returns for"),
+    ("retail", "long", "returns for"),
+])
+def test_a_cost_stress_that_cannot_be_judged_fails_closed(cost_model, stressed, reason):
+    matrix = family()
+    column = candidate_column(matrix)
+    series = {"same": column, None: None, "floats": [q / 1e12 for q in column],
+              "short": column[:-1], "long": column + [0]}[stressed]
+    found = stressed_verdict(matrix, series, cost_model=cost_model)
+    gate = found["gates"]["cost_stress"]
+    assert failed_closed(gate) and reason in gate["reason"], gate
+    assert found["passed"] is False
+
+
+def test_a_policy_without_cost_stress_refuses_to_judge_one():
+    matrix = family()
+    columns = [c["returns"] for c in matrix["columns"]]
+    gate = validation_policy.cost_stress_gate(columns, 0, columns[0], ledger(10), "EQUITY_EOD", "retail", POLICY_V1)
+    assert failed_closed(gate) and "no cost stress" in gate["reason"]
+
+
+def test_a_candidate_missing_from_the_matrix_fails_the_cost_stress_too():
+    matrix = family()
+    found = stressed_verdict(matrix, candidate_column(matrix), candidate=V[-1])
+    assert failed_closed(found["gates"]["cost_stress"])
+
+
+# --------------------------------------------------------------------------
 # The job, end to end
 # --------------------------------------------------------------------------
 
@@ -332,19 +437,20 @@ def test_a_validation_judges_the_candidate_and_records_the_verdict_and_the_matri
     assert done["status"] == "succeeded", done
     result = done["result"]
     found = result["validation"]
-    assert (found["policy"], found["stage"], found["candidate"]) == (POLICY_V1_ID, "pre-holdout", candidate)
+    assert (found["policy"], found["stage"], found["candidate"]) == (CURRENT_ID, "pre-holdout", candidate)
+    assert set(found["gates"]) == {"risk_limits", *validation_policy.STATISTICAL_GATES, "cost_stress"}
     # Two distinct series: PBO cannot be computed, so the verdict fails.
     assert found["passed"] is False
     assert "2 distinct return series, fewer than 10" in found["gates"]["overfitting"]["reason"]
-    assert "matrix" not in result and "risk" not in result
+    assert "matrix" not in result and "risk" not in result and "cost_stress" not in result
     assert result["ledger"]["trials"] == 3 and trial_count(db, user) == before == 3
 
     [row] = rows(db, models.StrategyValidation)
     assert (row.job_id, row.user_id, row.evaluation_job_id, row.strategy_version_id) == \
         (done["job_id"], user.id, view["job_id"], candidate)
     assert (row.family_hash, row.matrix_id, row.policy_id, row.passed) == \
-        (FAMILY, result["matrix_id"], POLICY_V1_ID, False)
-    assert row.policy_canonical == validation_policy.policy_canonical(POLICY_V1)
+        (FAMILY, result["matrix_id"], CURRENT_ID, False)
+    assert row.policy_canonical == validation_policy.policy_canonical(CURRENT_POLICY)
     assert row.verdict == found
 
     [stored] = rows(db, models.TrialMatrix)
@@ -357,14 +463,17 @@ def test_a_validation_judges_the_candidate_and_records_the_verdict_and_the_matri
     # The worker's verdict is the policy's on the stored matrix, the ledger
     # and the candidate's spec.
     spec = strategy_registry.spec_of(strategy_registry.get_for_user(db, user.id, candidate))
-    again = evaluate(matrix, candidate, result["ledger"], spec.universe.family, spec.risk_limits, None)
-    assert {k: g for k, g in again["gates"].items() if k != "risk_limits"} == \
-        {k: g for k, g in found["gates"].items() if k != "risk_limits"}
+    # The stressed series is not stored, so its gate is left out here (a
+    # later test checks it against the series the job process reported).
+    again = evaluate(matrix, candidate, result["ledger"], spec.universe.family, spec.risk_limits, None,
+                     CURRENT_POLICY, cost_model=spec.cost_model)
+    assert {k: g for k, g in again["gates"].items() if k not in ("risk_limits", "cost_stress")} == \
+        {k: g for k, g in found["gates"].items() if k not in ("risk_limits", "cost_stress")}
     assert found["gates"]["risk_limits"]["checks"]["drawdown_within_declared"]["value_bps"] is not None
 
     [audit] = db.execute(select(models.AuditLog).where(models.AuditLog.action == "STRATEGY_VALIDATION")).scalars()
     assert (audit.resource_type, audit.resource_id) == ("strategy_version", candidate)
-    assert audit.metadata_json["policy"] == POLICY_V1_ID and audit.metadata_json["passed"] is False
+    assert audit.metadata_json["policy"] == CURRENT_ID and audit.metadata_json["passed"] is False
     assert "overfitting" in audit.metadata_json["failed_gates"]
     assert audit.metadata_json["matrix_id"] == row.matrix_id
 
@@ -396,7 +505,8 @@ def test_the_verdicts_can_be_read_by_their_owner_only(db, market):
     assert first["status"] == second["status"] == "succeeded"
     listed = main.list_strategy_validations(limit=20, user=owner, db=db)
     assert {v["job_id"] for v in listed} == {first["job_id"], second["job_id"]}
-    assert listed[0]["policy"]["id"] == POLICY_V1_ID and listed[0]["policy"]["min_dsr_bps"] == 9_500
+    assert listed[0]["policy"]["id"] == CURRENT_ID and listed[0]["policy"]["min_dsr_bps"] == 9_500
+    assert listed[0]["policy"]["cost_stress_multiplier_centi"] == 200
     one = main.get_strategy_validation(first["job_id"], user=owner, db=db)
     assert one["verdict"] == first["result"]["validation"] and one["evaluation"] == view["job_id"]
     assert main.get_strategy_validation_matrix(first["job_id"], user=owner, db=db)["id"] == one["matrix_id"]
@@ -439,7 +549,96 @@ def test_the_worker_keeps_its_own_verdict_not_the_job_processs(db, market):
     assert done["result"]["validation"]["passed"] is False
     [row] = rows(db, models.StrategyValidation)
     assert row.passed is False and row.verdict == done["result"]["validation"]
-    assert set(row.verdict["gates"]) == {"risk_limits", *validation_policy.STATISTICAL_GATES}
+    assert set(row.verdict["gates"]) == {"risk_limits", *validation_policy.STATISTICAL_GATES, "cost_stress"}
+
+
+def test_the_verdict_judges_the_stressed_re_run_and_records_its_hash_not_its_series(db, market):
+    user = make_user(db)
+    candidate, view = evaluated(db, user)
+    reported = {}
+    done = validate(db, user, view["job_id"], MisreportsItsResult(lambda r: reported.update(r["cost_stress"])))
+    assert done["status"] == "succeeded", done
+    assert "cost_stress" not in done["result"]
+    gate = done["result"]["validation"]["gates"]["cost_stress"]
+    assert reported["multiplier_centi"] == gate["multiplier_centi"] == 200
+    stressed = reported["returns"]
+    assert gate["returns_sha256"] == research_trials.quantised_returns_id(stressed)
+    assert set(gate["checks"]) == {"haircut_sharpe", "t_statistic"}
+    # The stressed series is the candidate's re-run with dearer costs: as
+    # long as its evaluation, and ending poorer.
+    [row] = rows(db, models.StrategyValidation)
+    matrix = strategy_validation.matrix_of(db, row)
+    plain = matrix["columns"][trial_matrix.column_of(matrix, candidate)]["returns"]
+    assert len(stressed) == len(plain) and stressed != plain
+    assert np.prod([1 + q / 1e12 for q in stressed]) < np.prod([1 + q / 1e12 for q in plain])
+    # The gate is the policy's on that series in place of the candidate's.
+    spec = strategy_registry.spec_of(strategy_registry.get_for_user(db, user.id, candidate))
+    again = evaluate(matrix, candidate, done["result"]["ledger"], spec.universe.family, spec.risk_limits, None,
+                     CURRENT_POLICY, cost_model=spec.cost_model, stressed=stressed)
+    assert again["gates"]["cost_stress"] == gate
+    assert row.verdict["gates"]["cost_stress"] == gate
+
+
+def test_a_zero_cost_candidate_fails_the_cost_stress_in_the_job_too(db, market):
+    """The worker judges the cost model the registry holds for the candidate."""
+    user = make_user(db)
+    _, view = evaluated(db, user, strategy(cost_model="zero_cost"))
+    done = validate(db, user, view["job_id"])
+    assert done["status"] == "succeeded", done
+    gate = done["result"]["validation"]["gates"]["cost_stress"]
+    assert failed_closed(gate) and "declares no costs" in gate["reason"], gate
+
+
+def test_the_job_stresses_by_the_multiplier_the_current_policy_names(db, market, monkeypatch):
+    """Not a fixed 2x: under a policy with a 3x stress the job process re-runs
+    the candidate at 3x, which ends poorer than at 2x, and the verdict says 3x."""
+    user = make_user(db)
+    _, view = evaluated(db, user)
+    doubled, tripled = {}, {}
+    done = validate(db, user, view["job_id"], MisreportsItsResult(lambda r: doubled.update(r["cost_stress"])))
+    assert done["status"] == "succeeded", done
+    policy = dataclasses.replace(POLICY_V2, name="qs-validation-policy-test-3x", cost_stress_multiplier_centi=300)
+    monkeypatch.setattr(validation_policy, "CURRENT_POLICY", policy)
+    done = validate(db, user, view["job_id"], MisreportsItsResult(lambda r: tripled.update(r["cost_stress"])))
+    assert done["status"] == "succeeded", done
+    assert done["result"]["validation"]["policy"] == policy_id(policy)
+    assert (doubled["multiplier_centi"], tripled["multiplier_centi"]) == (200, 300)
+    assert done["result"]["validation"]["gates"]["cost_stress"]["multiplier_centi"] == 300
+    assert len(tripled["returns"]) == len(doubled["returns"])
+    assert np.prod([1 + q / 1e12 for q in tripled["returns"]]) < np.prod([1 + q / 1e12 for q in doubled["returns"]])
+
+
+@pytest.mark.parametrize("change", [
+    lambda r: r.pop("cost_stress"),
+    lambda r: r.update(cost_stress=None),
+    lambda r: r["cost_stress"].update(multiplier_centi=100),
+    lambda r: r["cost_stress"].pop("multiplier_centi"),
+], ids=["missing", "not-a-dict", "other-multiplier", "no-multiplier"])
+def test_a_job_that_did_not_stress_as_the_policy_says_fails_and_records_nothing(db, market, change):
+    user = make_user(db)
+    _, view = evaluated(db, user)
+    done = validate(db, user, view["job_id"], MisreportsItsResult(change))
+    assert done["status"] == "failed"
+    assert done["error"] == {"status_code": 500,
+                             "detail": "The research job did not stress the candidate's costs as the policy says"}
+    assert rows(db, models.StrategyValidation) == [] and rows(db, models.TrialMatrix) == []
+
+
+@pytest.mark.parametrize("change, reason", [
+    (lambda s: s.pop("returns"), "not a series"),
+    (lambda s: s.update(returns=None), "not a series"),
+    (lambda s: s.update(returns=[r / 1e12 for r in s["returns"]]), "not a series"),
+    (lambda s: s.update(returns=[True] * len(s["returns"])), "not a series"),
+    (lambda s: s.update(returns=s["returns"][:-1]), "returns for"),
+], ids=["missing", "none", "floats", "bools", "short"])
+def test_stressed_returns_that_are_not_the_candidates_series_fail_the_gate_closed(db, market, change, reason):
+    user = make_user(db)
+    _, view = evaluated(db, user)
+    done = validate(db, user, view["job_id"], MisreportsItsResult(lambda r: change(r["cost_stress"])))
+    assert done["status"] == "succeeded", done
+    gate = done["result"]["validation"]["gates"]["cost_stress"]
+    assert failed_closed(gate) and reason in gate["reason"], gate
+    assert done["result"]["validation"]["passed"] is False
 
 
 def test_risk_measurements_the_job_process_leaves_out_fail_the_risk_gate(db, market):

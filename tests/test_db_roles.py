@@ -342,12 +342,25 @@ def test_the_research_worker_cannot_reach_trading_or_identity(provisioned):
             research_worker.execute(statement)
 
 
+HOLDOUT_TABLES = ("holdout_attempts", "holdout_evaluations")
+
+
 def test_the_evaluator_allow_list_is_a_subset_that_neither_queues_nor_deletes_jobs():
     for table, privileges in db_roles.EVALUATOR_TABLE_PRIVILEGES.items():
-        assert set(privileges) <= set(db_roles.APP_TABLE_PRIVILEGES[table]), table
+        if table not in HOLDOUT_TABLES:
+            assert set(privileges) <= set(db_roles.APP_TABLE_PRIVILEGES[table]), table
     assert not set(db_roles.EVALUATOR_TABLE_PRIVILEGES) & TRADING_AND_IDENTITY
     assert set(db_roles.EVALUATOR_TABLE_PRIVILEGES["research_jobs"]) == {"SELECT", "UPDATE"}
 
+
+
+def test_only_the_evaluator_writes_the_holdout_tables_and_the_research_worker_never_sees_a_grade():
+    for table in HOLDOUT_TABLES:
+        assert db_roles.EVALUATOR_TABLE_PRIVILEGES[table] == ("SELECT", "INSERT"), table
+        assert db_roles.APP_TABLE_PRIVILEGES[table] == ("SELECT",), table
+    # The worker counts attempts as trials, and reads no grade.
+    assert db_roles.WORKER_TABLE_PRIVILEGES["holdout_attempts"] == ("SELECT",)
+    assert "holdout_evaluations" not in db_roles.WORKER_TABLE_PRIVILEGES
 
 def test_the_evaluator_runs_its_jobs_as_its_own_role(provisioned, monkeypatch):
     """The research evaluator's worker loop, connected as qs_evaluator: its
@@ -405,6 +418,10 @@ def test_the_evaluator_cannot_reach_beyond_its_jobs(provisioned):
                       "UPDATE audit_logs SET action = 'x'", "DELETE FROM audit_chain_links",
                       "DELETE FROM server_signing_keys", "INSERT INTO dataset_holdouts (family) VALUES ('x')",
                       "INSERT INTO research_trials (id) VALUES ('x')",
+                      "INSERT INTO strategy_validations (job_id) VALUES ('x')",
+                      "INSERT INTO strategy_versions (version_id) VALUES ('x')",
+                      "UPDATE holdout_attempts SET holdout_start = holdout_start", "DELETE FROM holdout_attempts",
+                      "UPDATE holdout_evaluations SET passed = passed", "DELETE FROM holdout_evaluations",
                       *(s.format(app=roles.evaluator, owner=roles.owner) for s in REFUSED)):
         with pytest.raises(errors.InsufficientPrivilege):
             evaluator.execute(statement)
@@ -544,6 +561,90 @@ def test_the_research_worker_runs_a_strategy_backtest_as_its_own_role(provisione
                          " JOIN server_signing_keys k ON k.key_id = v.signing_key_id").fetchall() == \
         [(validated["job_id"], security_service.server_identity.fingerprint)]
 
+
+def test_the_evaluator_grades_a_strategy_on_its_holdout_as_its_own_role(provisioned, monkeypatch, tmp_path):
+    """The whole holdout evaluation under the production roles: the API sets
+    the holdout and queues the jobs (qs_app), the research worker backtests
+    and validates (qs_research_worker), the evaluator spends the attempt,
+    reads the holdout, grades and signs it (qs_evaluator). The research
+    worker counts the attempt but never reads a grade, and what it can read
+    of the job and its audit event carries no figure of the holdout."""
+    import datetime as dt
+
+    import numpy as np
+    import pandas as pd
+
+    from backend.services import dataset_holdouts, holdout_evaluation, trial_matrix, validation_policy
+    from market_helpers import fake_market
+    from test_trial_evaluations import strategy
+
+    days = pd.bdate_range("2023-01-02", periods=300)
+    rng = np.random.default_rng(5)
+    fake_market(monkeypatch, tmp_path, pd.DataFrame(
+        {("Close", t): 100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(days)))) for t in ("AAA", "BBB", "CCC")},
+        index=days))
+    real = validation_policy.evaluate  # the synthetic market cannot pass the real gates
+    monkeypatch.setattr(validation_policy, "evaluate", lambda *a, **k: {**real(*a, **k), "passed": True})
+    monkeypatch.setattr(security_service.server_identity, "_registered", False)
+    roles = provisioned.roles
+    api = sessionmaker(bind=provisioned.engine_as(roles.app))()
+    worker_sessions = sessionmaker(bind=provisioned.engine_as(roles.research_worker))
+    evaluator_sessions = sessionmaker(bind=provisioned.engine_as(roles.evaluator))
+    with worker_sessions() as db:
+        security_service.server_identity.ensure_registered(db)
+    dataset_holdouts.set_start(api, "EQUITY_EOD", dt.date(2023, 11, 1), set_by="ops", reason="test")
+    user = models.User(email="holdout-role@example.com", password_hash="x", role="user")
+    api.add(user)
+    api.commit()
+    main.register_strategy(schemas.StrategyRegisterRequest(spec=strategy(), tag="v1"), user=user, db=api)
+    research = worker.Worker(job_process=InlineJobProcess(), session_factory=worker_sessions,
+                             lease_seconds=60, timeout_seconds=300, poll_seconds=0.1)
+    backtest = main.strategy_backtest(schemas.StrategyBacktestRequest(strategy="v1", period="1y"), user=user, db=api)
+    assert research.run_once() is True
+    evaluation = json.loads(backtest.body)["job_id"]
+    capital = api.get(models.ResearchJob, evaluation).params_json["initial_capital"]
+    validation = main.validate_strategy(schemas.StrategyValidationRequest(
+        evaluation=evaluation, period="1y", initial_capital=capital), user=user, db=api)
+    assert research.run_once() is True
+    validation_id = json.loads(validation.body)["job_id"]
+    api.expire_all()
+    assert api.get(models.ResearchJob, validation_id).status == "succeeded"
+
+    job = holdout_evaluation.queue(api, validation_id, "1y", capital)
+    # The research worker leaves it; the evaluator, as qs_evaluator, runs it.
+    assert research.run_once() is False
+    graded = worker.Worker(job_process=InlineJobProcess(), session_factory=evaluator_sessions,
+                           lease_seconds=60, timeout_seconds=300, poll_seconds=0.1,
+                           role=research_jobs.EVALUATOR_ROLE)
+    assert graded.run_once() is True
+    api.expire_all()
+    view = research_jobs.view(api, api.get(models.ResearchJob, job.id))
+    assert view["status"] == "succeeded", view
+    [row] = api.query(models.HoldoutEvaluation).all()
+    assert holdout_evaluation.signature_valid(api, row) and row.grade["sessions"] >= 63
+    assert view["result"]["passed"] is row.passed
+    attempt = api.get(models.HoldoutAttempt, job.id)
+    assert trial_matrix.family_state(api, user.id, attempt.family_hash)["holdout_queries"] == 1
+    assert security_service.audit_chain_status(api, full=True)["valid"]
+    api.close()
+
+    research_worker = provisioned.connect(roles.research_worker)
+    assert research_worker.execute("SELECT count(*) FROM holdout_attempts").fetchone() == (1,)
+    with pytest.raises(errors.InsufficientPrivilege):
+        research_worker.execute("SELECT 1 FROM holdout_evaluations")
+    research_worker = provisioned.connect(roles.research_worker)
+    [(result, error)] = research_worker.execute(
+        "SELECT result_json::text, error_detail FROM research_jobs WHERE id = %s", (job.id,)).fetchall()
+    audits = [r[0] for r in research_worker.execute(
+        "SELECT row_to_json(a)::text FROM audit_logs a WHERE action = 'HOLDOUT_EVALUATION'").fetchall()]
+    assert len(audits) == 1 and error is None
+    for figure in ("sharpe", "sessions", "returns", "first_session"):
+        assert figure not in result and figure not in audits[0]
+    evaluator = provisioned.connect(roles.evaluator)
+    for statement in ("UPDATE holdout_evaluations SET passed = NOT passed", "DELETE FROM holdout_attempts",
+                      "TRUNCATE holdout_evaluations"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            evaluator.execute(statement)
 
 def test_the_research_worker_runs_a_dataset_snapshot_as_its_own_role(provisioned, monkeypatch, tmp_path):
     """The snapshot finalizer reads the blobs back and registers them as

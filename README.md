@@ -433,6 +433,34 @@ and are kept from jobs by this code path, not by storage permissions; and since
 Yahoo's prices are split-adjusted when fetched, a split after the start still
 scales earlier price levels (returns are unchanged).
 
+The holdout is read once per strategy, by the holdout evaluation
+([`holdout_evaluation.py`](backend/services/holdout_evaluation.py), migration
+0011). An operator queues it for a strategy whose validation passed
+(`manage final-evaluate`). Only the research evaluator runs it, as
+`qs_evaluator`:
+
+- **It spends the attempt first.** Before it reads any data, it writes and
+  commits a `holdout_attempts` row. One attempt is allowed per user, strategy
+  version, dataset family and holdout start. The job has a single attempt,
+  and is never handed back on shutdown, so a crash or a data error still
+  spends it.
+- **It grades only a strategy chosen without the holdout.** The verdict's
+  signed manifest must name the current holdout start. The evaluation must
+  then reproduce exactly when re-run on its datasets cut at that start.
+- **The holdout run.** The strategy then runs on the uncut data from the
+  evaluation's first session, and only the returns from the start on are
+  graded.
+- **The grade.** The holdout policy (`qs-holdout-policy-v1`) passes a
+  strategy if and only if it has at least 63 holdout sessions and an
+  annualised Sharpe ratio of at least 0.5. Anything else fails closed.
+- **Where the figures go.** The grade, its figures and its signed manifest
+  are kept only in `holdout_evaluations`, which the research worker cannot
+  read. The job's result, its audit event and the owner's view say only
+  whether it passed.
+- **The holdout counts as a trial.** Each attempt counts as one more trial
+  of the strategy's research family, so a strategy picked after a holdout
+  grade is deflated for it.
+
 ### Research Engine
 
 | Module | Capabilities |
@@ -499,6 +527,7 @@ quantumsentinel-web/
 │       ├── dataset_providers.py         ← Provider interface · yfinance (personal use only) · dataset families
 │       ├── dataset_registry.py          ← Immutable dataset_versions rows · who holds which dataset
 │       ├── dataset_holdouts.py          ← Sealed holdout start per dataset family · only moves later
+│       ├── holdout_evaluation.py        ← One-shot holdout grade of a passing strategy · research evaluator only
 │       ├── market_data.py               ← Research prices from frozen datasets · total return · trailing windows
 │       ├── security_service.py          ← server identity · signed audit hash chain · key health
 │       ├── integration_service.py       ← Scoped API keys · SSRF-guarded signed webhooks
@@ -686,6 +715,7 @@ Research runs as background jobs, never inside the request. The dashboard backte
 | `GET`  | `/api/research/datasets/{dataset_id}` | One of the caller's datasets |
 | `POST` | `/api/research/latency-benchmark` | Per-stage p50/p99 latency profile + C++ vs Python speedup benchmark |
 | `GET`  | `/api/research/cpp-status` | C++ extension load status · kernel names · active mode |
+| `GET`  | `/api/research/holdout-evaluations` | The caller's holdout attempts, newest first, and whether each graded one passed; no figure of the holdout (`?limit=`, up to 100) |
 | `GET`  | `/api/research/jobs` | The caller's recent research jobs, newest first, without results (`?limit=`, up to 100) |
 | `GET`  | `/api/research/jobs/{job_id}` | One job's status and queue position; its result or error once finished |
 | `POST` | `/api/research/jobs/{job_id}/cancel` | Cancel a queued job, or stop a running one (its process is killed) |
@@ -874,6 +904,13 @@ PostgreSQL 16 or newer is the only supported database; any other `DATABASE_URL` 
 - **Duplicate positions** (deployments upgraded from earlier releases): two fills for one user at the same moment could leave the `positions` table with more than one row per asset, overstating holdings and equity. Fills now rebuild positions inside their own transaction, and each user's next fill corrects their rows; `python -m backend.manage repair-positions` corrects every affected user at once and is safe to run while the API serves orders.
 - **Audit chain verification.** `GET /api/security/audit-chain` checks only the links added since that API process last verified the chain, which took under a second at 1M links on the laptop below; nearly all of that is counting events that have no link. A process's first check, and any check after the chain failed one, verifies every link. A full check verifies an ML-DSA signature per link (about 11 s per 50,000 links on the same laptop), and it is the only check that sees rows edited behind the newest verified link, so run `python -m backend.manage verify-audit-chain` on a schedule; it exits 1 if any link fails. `?full=true` runs a full check from the API.
 - **Dataset holdouts.** `python -m backend.manage set-holdout EQUITY_EOD 2025-01-01 --by <who> --reason <why>` keeps a dataset family's data from that date on away from research jobs (families: `EQUITY_EOD`, `FUND_NAV_EOD`, `INDEX_EOD`, `CRYPTO_SPOT_EOD`, `FX_SPOT_EOD`, `FUTURES_CONTINUOUS_EOD`). The date can only move later; moving it later releases the old holdout to research. Each change is an audit event (`DATASET_HOLDOUT_SET`). `python -m backend.manage holdouts` prints the current starts. A job that is running when a start is set fails with 409 and can be run again.
+- **Holdout evaluation.** Set the family's holdout before the strategy's first backtest. Once the strategy's validation passes, queue its one holdout grade with `python -m backend.manage final-evaluate <validation job id> --period <its evaluation's period> --capital <its initial capital> --by <who> --reason <why>`. The command refuses:
+  - a verdict that did not pass;
+  - a verdict reached under another holdout start;
+  - the wrong period or capital;
+  - an attempt already spent.
+
+  The research evaluator must be running. Queueing is an audit event (`HOLDOUT_EVALUATION_QUEUED`), and so is the grade (`HOLDOUT_EVALUATION`, pass or fail only).
 - **Connection budget.** Every API process, research worker and research evaluator has its own pool: keep (processes) × (`DB_POOL_SIZE` + `DB_MAX_OVERFLOW`) below the server's `max_connections` (100 by default), leaving room for maintenance sessions. The default of 20 per process fits, for example, two API processes, one research worker and one research evaluator (80 connections).
 - **Large tables.** The indexes added by migration `0002` are created `IF NOT EXISTS`; on a large `trades` or `audit_logs` table, build them first with `CREATE INDEX CONCURRENTLY` under the same names to avoid blocking writes during the upgrade.
 - **Connection poolers.** Each session is configured when it connects (UTC, statement/lock/idle timeouts) and the order sweeper uses a session-level advisory lock, so a PgBouncer in front of the database must use session pooling, not transaction pooling.
@@ -888,7 +925,7 @@ Connected as the superuser that the `postgres` image creates from `POSTGRES_USER
 | `qs_migrator` | Yes | None of its own. Migrations run after `SET LOCAL ROLE qs_owner`, so everything they create is owned by `qs_owner` |
 | `qs_app` | Yes | The API (and the research worker it embeds, outside Docker production): exactly the table privileges in `APP_TABLE_PRIVILEGES` (`SELECT` only on `alembic_version`). No DDL or `TRUNCATE`; it cannot change roles, ownership or triggers |
 | `qs_research_worker` | Yes | A research worker run as its own service: exactly `WORKER_TABLE_PRIVILEGES`. That covers the job queue, research results, the server signing key, backtest history (insert only) and the audit trail (read and append only). It has nothing on users, accounts, orders, positions, API keys, user keys, refresh tokens or webhooks |
-| `qs_evaluator` | Yes | The research evaluator, which grades strategies on their sealed holdout: exactly `EVALUATOR_TABLE_PRIVILEGES`. It reads and updates jobs (to claim and finish its own) but cannot queue or delete one, registers its heartbeat and the server signing key, and reads and appends to the audit trail. It reaches no user, account, order, key, strategy, dataset or research-result table |
+| `qs_evaluator` | Yes | The research evaluator, which grades strategies on their sealed holdout: exactly `EVALUATOR_TABLE_PRIVILEGES`. It reads and updates jobs (to claim and finish its own) but cannot queue or delete one, registers its heartbeat and the server signing key, and reads and appends to the audit trail. It reads what it grades: the verdict and its manifest, the evaluation, the strategy version and the holdout start. It is the only role that writes `holdout_attempts` and `holdout_evaluations`. It reaches no user, account, order or key table, and writes no strategy, dataset, trial or verdict |
 | `qs_backup` | Yes | `pg_read_all_data`, for `pg_dump` |
 
 The privilege maps are allow-lists. A table `APP_TABLE_PRIVILEGES` does not name gets no privilege, and the test suite fails until the table is listed; a table `WORKER_TABLE_PRIVILEGES` or `EVALUATOR_TABLE_PRIVILEGES` does not name is out of that role's reach. Tests run every kind of research job through a worker connected as `qs_research_worker`, and a holdout grade through an evaluator connected as `qs_evaluator`, and check that every other table and every privileged statement is refused to each. Grants are reapplied after every migration that changes the schema revision.
@@ -924,6 +961,8 @@ docker compose -f docker-compose.production.yml --env-file .env.production up -d
 The first command runs while the API keeps serving. The second replaces the API container; in CI the API was back about 18 s later. Run them in this order. `up` before `provision` takes the API down: Compose replaces the API container, then `migrate` cannot log in (`password authentication failed for user "qs_migrator"`), so the new API never starts. Running the two commands then restores it; that took 19 s in CI.
 
 A deployment that already runs on these roles, provisioned before `qs_research_worker` existed, takes the same two commands after `DB_RESEARCH_WORKER_PASSWORD` is added. Without that variable Compose refuses to start; with it but before `provision`, the `research-worker` service cannot log in. It retries every 2 s (`database not reachable yet` in its log), so research jobs wait in the queue and start once `provision` has run.
+
+Upgrading also applies migration `0011`, which adds the append-only holdout tables, and `provision` grants them: `qs_app` reads both, `qs_research_worker` reads only the attempts (it counts them as trials), and only `qs_evaluator` writes them.
 
 The same holds for `qs_evaluator`: a deployment provisioned before it existed adds `DB_EVALUATOR_PASSWORD` to `.env.production` and runs the same two commands, `provision` first. Until then Compose refuses to start, or, with the variable set but before `provision`, the `research-evaluator` service retries its login every 2 s; holdout grades wait in the queue meanwhile, and no other job does. Upgrading also applies migration `0010`, which records each worker's role in `research_workers`, so a job's status counts only the workers that can run it.
 

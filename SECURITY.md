@@ -180,6 +180,11 @@
 - The database is on an internal network with no route out, and nginx is not
   on it. The research evaluator, which grades strategies on sealed holdout
   data, is on that network alone and mounts the dataset blobs read-only.
+- A holdout grade is kept only in `holdout_evaluations`, which only the
+  research evaluator writes and the research worker cannot read. The job
+  result and the audit event, which the research worker can read, carry
+  pass or fail only. Each strategy version gets one attempt per holdout
+  start, spent before any data is read.
 
 ## CI security pipeline
 

@@ -14,10 +14,11 @@ can only move later (the migration's trigger enforces this for every writer).
 Moving it later releases the old holdout to research, which is how a holdout
 is rolled forward once it has been used.
 
-Not yet: the data from the start on is still inside the dataset blobs the
-worker reads, and is kept from tasks by this code path, not by storage
-permissions. A final-evaluation job that alone reads it, under a role that
-alone can, comes with immutable strategy versions (plan R1-5b, after R2).
+The data from the start on is still inside the dataset blobs, and research
+tasks are kept from it by this code path, not by storage permissions. Only
+the holdout evaluation reads it (holdout_evaluation.py). That is a job only
+the research evaluator runs, as its own database role, once per strategy
+version and holdout start.
 """
 from __future__ import annotations
 

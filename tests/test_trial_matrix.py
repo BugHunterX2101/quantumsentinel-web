@@ -216,8 +216,8 @@ def test_the_matrix_re_runs_every_version_evaluated_in_the_family_on_the_candida
                                    "returns_sha256": view["result"]["evaluation"]["returns_sha256"],
                                    "column": trial_matrix.column_of(matrix, first)}
     assert result["family"] == FAMILY
-    assert result["ledger"] == {"trials": 3, "evaluated_trials": 3, "every_trial_evaluated": True,
-                                "strategy_version_ids": sorted([first, second, twin])}
+    assert result["ledger"] == {"trials": 3, "research_trials": 3, "holdout_queries": 0, "evaluated_trials": 3,
+                                "every_trial_evaluated": True, "strategy_version_ids": sorted([first, second, twin])}
     assert sorted(result["market_data"]["datasets"]) == sorted(datasets)
     # Building the matrix records no trial and no evaluation.
     assert "trial_family" not in result and trial_count(db, user) == before == 3
@@ -261,7 +261,8 @@ def test_trials_without_an_evaluation_leave_the_matrix_incomplete(db, market, mo
 
     partial = build(db, user, view["job_id"])
     assert partial["status"] == "succeeded", partial
-    assert partial["result"]["ledger"] == {"trials": 3, "evaluated_trials": 1, "every_trial_evaluated": False,
+    assert partial["result"]["ledger"] == {"trials": 3, "research_trials": 3, "holdout_queries": 0,
+                                           "evaluated_trials": 1, "every_trial_evaluated": False,
                                            "strategy_version_ids": [candidate]}
     assert trial_count(db, user, family) == 3
 

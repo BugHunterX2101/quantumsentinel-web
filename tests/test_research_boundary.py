@@ -29,7 +29,7 @@ RESEARCH_TASKS = "backend.services.research_tasks"
 # statement leads to them: each is a root of the closure below in its own right.
 FINALIZERS = {"backend.services.experiment_registry", "backend.services.dataset_registry",
               "backend.services.strategy_registry", "backend.services.trial_matrix",
-              "backend.services.strategy_validation"}
+              "backend.services.strategy_validation", "backend.services.holdout_evaluation"}
 
 
 def _path(module: str) -> Path | None:

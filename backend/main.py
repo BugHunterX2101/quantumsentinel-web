@@ -1899,9 +1899,12 @@ def statistical_tests(req: schemas.StatTestRequest,
         raise HTTPException(422, "Every return observation must be a finite number")
 
     # The Deflated Sharpe discount uses at least every configuration the
-    # server evaluated for this research family (counted now, when the test
-    # is queued), whatever is declared.
-    server_counted = research_trials.count(db, user.id, trial_family) if trial_family else 0
+    # server evaluated for this research family, and every holdout attempt
+    # spent in it (counted now, when the test is queued), whatever is
+    # declared.
+    from .services.holdout_evaluation import holdout_queries
+    server_counted = (research_trials.count(db, user.id, trial_family) + holdout_queries(db, user.id, trial_family)
+                      if trial_family else 0)
     n_trials = max(req.n_strategies_tested, server_counted)
     return _queue_job(db, user, "stat_test", {
         "returns": [float(r) for r in returns], "n_trials": n_trials,
@@ -2203,6 +2206,16 @@ def get_strategy_validation_manifest(job_id: str, user: models.User = Depends(ge
         raise HTTPException(404, "Validation not found")
     return validation_manifest.view(db, row)
 
+
+@app.get("/api/research/holdout-evaluations")
+def list_holdout_evaluations(limit: int = Query(20, ge=1, le=100),
+                             user: models.User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    """The caller's holdout attempts, newest first, and whether each graded
+    one passed. An operator queues them (manage final-evaluate); no figure of
+    the holdout is shown."""
+    from .services import holdout_evaluation
+    return holdout_evaluation.owner_view(db, user.id, limit)
 
 @app.get("/api/research/jobs")
 def list_research_jobs(limit: int = Query(20, ge=1, le=100),

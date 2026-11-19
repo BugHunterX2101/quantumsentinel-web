@@ -60,6 +60,13 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "dataset_holdouts": ("SELECT", "INSERT"),
     # Immutable once written (migration 0004's triggers): no UPDATE or DELETE.
     "dataset_versions": ("SELECT", "INSERT"),
+    # Append-only (migration 0011's triggers), written only by the research
+    # evaluator. The API counts a family's holdout attempts as trials
+    # (trial_matrix.family_state), checks an attempt is unspent before
+    # ``manage final-evaluate`` queues one, and shows the owner whether a
+    # grade passed.
+    "holdout_attempts": ("SELECT",),
+    "holdout_evaluations": ("SELECT",),
     "idempotency_records": DML,
     "key_pairs": DML,
     "order_security_records": DML,
@@ -118,6 +125,10 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # the user who fetched them; both tables are insert-only.
     "dataset_versions": ("SELECT", "INSERT"),
     "user_datasets": ("SELECT", "INSERT"),
+    # A family's holdout attempts count as its trials (trial_matrix.
+    # family_state). The grades and their figures (holdout_evaluations) are
+    # out of its reach.
+    "holdout_attempts": ("SELECT",),
     # Experiment finalizers lock the experiment row and record the outcome.
     "research_experiments": ("SELECT", "UPDATE"),
     # Claim, lease, finish, reap and purge jobs; only the API enqueues them.
@@ -141,21 +152,38 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
 
 # The research evaluator's privileges: the worker loop (backend/worker.py) as
 # QS_PROCESS_ROLE research-evaluator, which claims only holdout evaluation
-# jobs and does no housekeeping. Each table is here for code it runs today;
-# the evaluation itself adds what it reads and records (R1-5b-2).
+# jobs and does no housekeeping (services/holdout_evaluation.py). Each
+# table is here for code it runs.
 EVALUATOR_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # The worker waits at startup until the schema is at its code's revision.
     "alembic_version": ("SELECT",),
     # Signed audit events for finished jobs; the chain is append-only here.
     "audit_chain_links": ("SELECT", "INSERT"),
     "audit_logs": ("SELECT", "INSERT"),
+    # The holdout start it grades from, read before it spends the attempt.
+    "dataset_holdouts": ("SELECT",),
+    # It spends an attempt when it claims the job, then records the grade
+    # with its signed manifest. Both tables are append-only.
+    "holdout_attempts": ("SELECT", "INSERT"),
+    "holdout_evaluations": ("SELECT", "INSERT"),
     # Claim, lease, finish and release its own jobs. It never enqueues a job
     # (the API does) or deletes one (the research worker purges).
     "research_jobs": ("SELECT", "UPDATE"),
+    # The evaluation the verdict judged: its datasets, period, capital and
+    # return-series hash, which the cut re-run must reproduce.
+    "research_trial_evaluations": ("SELECT",),
     # Its heartbeat row, removed when it stops.
     "research_workers": DML,
-    # The worker registers the server key it signs audit events with.
+    # The worker registers the server key it signs audit events and grades
+    # with.
     "server_signing_keys": ("SELECT", "INSERT"),
+    # The passing verdict it grades and that verdict's signed manifest,
+    # which names the holdout start the verdict was reached under.
+    "strategy_validations": ("SELECT",),
+    "validation_manifests": ("SELECT",),
+    # The graded strategy version, which the job's user must hold.
+    "strategy_versions": ("SELECT",),
+    "user_strategy_versions": ("SELECT",),
 }
 
 _ROLE_ATTRIBUTES = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"

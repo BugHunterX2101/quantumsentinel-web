@@ -9,6 +9,7 @@
     python -m backend.manage provision-roles
     python -m backend.manage set-holdout <FAMILY> <YYYY-MM-DD> --by <who> --reason <why>
     python -m backend.manage holdouts
+    python -m backend.manage final-evaluate <VALIDATION_JOB_ID> --period <P> --capital <C> --by <who> --reason <why>
 
 Roles are granted only here — out of band, by someone with shell access to
 the deployment — never through the web API, so no self-registered account
@@ -42,6 +43,12 @@ without changing anything.
 jobs see only what came before it (backend/services/dataset_holdouts.py). The
 date can only move later; moving it releases the old holdout to research.
 ``holdouts`` prints each family's current start.
+
+``final-evaluate`` queues the one-shot holdout evaluation of a passing
+strategy validation, named by the job that recorded it, with the period and
+capital its evaluation ran with (backend/services/holdout_evaluation.py). The
+research evaluator runs it and spends the attempt as it starts. The command
+prints the job id, and the owner sees only whether the grade passed.
 """
 import argparse
 import sys
@@ -79,6 +86,14 @@ def main(argv: list[str] | None = None) -> int:
     set_holdout.add_argument("--by", required=True, help="who sets it")
     set_holdout.add_argument("--reason", required=True, help="why")
     commands.add_parser("holdouts", help="print each dataset family's holdout start")
+    final_evaluate = commands.add_parser(
+        "final-evaluate", help="queue the one-shot holdout evaluation of a passing strategy validation")
+    final_evaluate.add_argument("validation", help="the job id that recorded the passing verdict")
+    final_evaluate.add_argument("--period", required=True, help="the period its evaluation ran with, e.g. 2y")
+    final_evaluate.add_argument("--capital", required=True, type=float,
+                                help="the initial capital its evaluation ran with")
+    final_evaluate.add_argument("--by", required=True, help="who queues it")
+    final_evaluate.add_argument("--reason", required=True, help="why")
     args = parser.parse_args(argv)
 
     if args.command == "generate-server-key":
@@ -103,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "holdouts":
         init_db()
         return _print_holdouts(SessionLocal)
+    if args.command == "final-evaluate":
+        init_db()
+        return _final_evaluate(SessionLocal, args.validation, args.period, args.capital, args.by, args.reason)
 
     init_db()
     db = SessionLocal()
@@ -141,6 +159,31 @@ def _set_holdout(session_factory, family: str, start, set_by: str, reason: str) 
             print(f"set-holdout: {exc}", file=sys.stderr)
             return 1
         print(f"{row.family}: research sees data before {row.holdout_start.isoformat()}")
+    return 0
+
+
+def _final_evaluate(session_factory, validation: str, period: str, capital: float, queued_by: str,
+                    reason: str) -> int:
+    from .services import holdout_evaluation, research_jobs, security_service
+
+    queued_by, reason = (queued_by or "").strip(), (reason or "").strip()
+    if not queued_by or not reason:
+        print("final-evaluate: say who queues it and why", file=sys.stderr)
+        return 1
+    with session_factory() as db:
+        try:
+            job = holdout_evaluation.queue(db, validation, period, capital)
+        except holdout_evaluation.HoldoutEvaluationError as exc:
+            print(f"final-evaluate: {exc}", file=sys.stderr)
+            return 1
+        except research_jobs.QueueFull as exc:
+            print(f"final-evaluate: the owner has too many research jobs queued or running: {exc}",
+                  file=sys.stderr)
+            return 1
+        security_service.write_audit_log(db, job.user_id, "HOLDOUT_EVALUATION_QUEUED", "research_job", job.id,
+                                         {"validation": validation, "queued_by": queued_by[:320],
+                                          "reason": reason})
+        print(f"holdout evaluation queued: job {job.id}")
     return 0
 
 

@@ -24,7 +24,10 @@ from conftest import _libpq, schema_url
 from test_research_boundary import ROOT, _chain, closure
 
 OPS = "ops@example.com"
-# What a job process may see besides CHILD_ENVIRONMENT and LC_*.
+# Names the operating system adds to every process it starts, whatever the
+# parent passed: macOS's CoreFoundation sets its text encoding at exec.
+PLATFORM_ADDED = {"__CF_USER_TEXT_ENCODING"} if sys.platform == "darwin" else set()
+# Secrets and interpreter settings a job process must never see.
 CANARIES = {
     "DATABASE_URL": "postgresql://quantumsentinel:canary@postgres/db",
     "AI_DATABASE_URL": "postgresql://qs_ai_worker:canary@postgres/db",
@@ -167,7 +170,7 @@ def test_a_job_process_inherits_only_the_allow_list():
     result = json.loads(stdout)
     names = set(result["environment"])
     locale = {name for name in names if name.upper().startswith("LC_")}
-    assert {name.upper() for name in names - locale} <= {*child.CHILD_ENVIRONMENT, "QS_PROCESS_ROLE"}
+    assert {name.upper() for name in names - locale - PLATFORM_ADDED} <= {*child.CHILD_ENVIRONMENT, "QS_PROCESS_ROLE"}
     assert not {name.upper() for name in names} & set(CANARIES)
     assert b"canary" not in stdout
     assert result["process_role"] == "ai-job"

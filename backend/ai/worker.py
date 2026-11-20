@@ -36,7 +36,7 @@ import uuid
 import psycopg
 from psycopg import sql
 
-from . import child, queue
+from . import child, ledger, queue
 from .kinds import KINDS
 from .settings import Settings, SettingsError, load
 
@@ -105,9 +105,13 @@ class AiWorker:
         with self.conn.transaction():
             self._heartbeat()
             requeued, failed = queue.reap_expired(self.conn, self.schema)
+            orphaned = ledger.reclaim_orphans(self.conn, self.schema)
         if requeued or failed:
             log.warning("reaped AI jobs of workers that stopped responding: %d requeued, %d failed",
                         requeued, failed)
+        if orphaned:
+            log.warning("%d token reservations were left open by jobs that stopped; they count in full",
+                        orphaned)
         if now - self._last_purge >= PURGE_SECONDS:
             with self.conn.transaction():
                 queue.purge_finished(self.conn, self.schema, self.settings.retention_days)

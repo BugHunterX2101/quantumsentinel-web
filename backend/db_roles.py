@@ -216,6 +216,13 @@ AI_WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "harvests": ("SELECT", "INSERT", "UPDATE"),
     # What OpenAlex and Crossref say of each document (migration 0015).
     "document_metadata": ("SELECT", "INSERT", "UPDATE"),
+    # Extracted hypotheses (migration 0016): append-only, so it records an
+    # extraction and its hypotheses and never changes either.
+    "extractions": ("SELECT", "INSERT"),
+    "hypotheses": ("SELECT", "INSERT"),
+    # The daily token budget: it reserves, then settles, releases or orphans
+    # a reservation, and never deletes one.
+    "token_reservations": ("SELECT", "INSERT", "UPDATE"),
 }
 # The application's privileges in the AI schema: ``manage set-flag`` sets the
 # flags; the application enqueues AI jobs and reads their outcome, the
@@ -229,6 +236,9 @@ APP_AI_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "sources": ("SELECT",),
     "harvests": ("SELECT",),
     "document_metadata": ("SELECT",),
+    "extractions": ("SELECT",),
+    "hypotheses": ("SELECT",),
+    "token_reservations": ("SELECT",),
 }
 # Set on qs_ai_worker itself, so they hold whatever its client sets.
 AI_WORKER_CONNECTION_LIMIT = 8

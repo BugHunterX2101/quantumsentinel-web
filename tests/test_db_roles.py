@@ -477,6 +477,13 @@ def test_the_ai_allow_lists_keep_the_ai_worker_to_its_own_jobs():
     assert set(db_roles.APP_AI_TABLE_PRIVILEGES["sources"]) == set(db_roles.APP_AI_TABLE_PRIVILEGES["harvests"])         == {"SELECT"}
     assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["document_metadata"]) == {"SELECT", "INSERT", "UPDATE"}
     assert set(db_roles.APP_AI_TABLE_PRIVILEGES["document_metadata"]) == {"SELECT"}
+    # Extractions are append-only; a token reservation is closed by UPDATE,
+    # never deleted. The app only reads them.
+    for table in ("extractions", "hypotheses"):
+        assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES[table]) == {"SELECT", "INSERT"}
+    assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["token_reservations"]) == {"SELECT", "INSERT", "UPDATE"}
+    for table in ("extractions", "hypotheses", "token_reservations"):
+        assert set(db_roles.APP_AI_TABLE_PRIVILEGES[table]) == {"SELECT"}
     for allowed in (db_roles.AI_WORKER_TABLE_PRIVILEGES, db_roles.APP_AI_TABLE_PRIVILEGES):
         assert all(p and set(p) <= set(db_roles.TABLE_PRIVILEGES) for p in allowed.values())
 
@@ -562,6 +569,59 @@ def test_the_ai_worker_records_documents_and_the_app_only_reads_them(provisioned
         == [("2611.00001", "open", True)]
     for statement in (f"UPDATE \"{ai}\".documents SET title = 'x'", f'DELETE FROM "{ai}".documents',
                       f"INSERT INTO \"{ai}\".documents (source, source_id) VALUES ('arxiv', '2611.00002')"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            app.execute(statement)
+
+
+def test_the_ai_worker_records_extractions_and_tokens_and_the_app_only_reads_them(provisioned):
+    """As qs_ai_worker an extraction is recorded and a token reservation
+    reserved and settled; it can remove neither, and the app role may read
+    them but write none."""
+    from backend.ai import documents, hypotheses, ledger
+
+    roles = provisioned.roles
+    ai = db_roles.ai_schema_for(provisioned.schema)
+    ai_worker = provisioned.connect(roles.ai_worker)
+    record = {"identifier": "oai:arXiv.org:2611.00001", "datestamp": "2026-11-02", "deleted": False,
+              "id": "2611.00001", "created": "2026-11-01", "title": "Momentum in futures",
+              "abstract": "A 12-month momentum strategy earns a Sharpe ratio of 0.85 in commodity futures.",
+              "categories": "q-fin.TR", "license": "http://creativecommons.org/licenses/by/4.0/",
+              "authors": [{"keyname": "Doe", "forenames": "Jane"}], "author_count": 1}
+    with ai_worker.transaction():
+        documents.upsert_page(ai_worker, ai, documents.clean_page(
+            {"response_date": "2026-11-20T06:47:36Z", "error": None, "resumption_token": None,
+             "token_expires": None, "records": [record]}))
+    document_id, content_hash = ai_worker.execute(f'SELECT id, content_hash FROM "{ai}".documents').fetchone()
+    prompt = hypotheses.prompt_for(record["title"], record["abstract"])
+    checked = hypotheses.check_output("end_turn", json.dumps({"hypotheses": [{
+        "statement": "Momentum earns a positive Sharpe ratio in commodity futures.",
+        "evidence_quote": "earns a Sharpe ratio of 0.85 in commodity futures", "asset_class": "futures",
+        "signal_family": "momentum", "direction": "long_short", "horizon": "monthly",
+        "reported_metric": "sharpe_ratio", "reported_value": "0.85", "model_confidence": "high",
+        "rationale": "Stated in the abstract."}]}), prompt)
+    assert len(checked.hypotheses) == 1
+    with ai_worker.transaction():
+        reservation = ledger.reserve(ai_worker, ai, job_id="job-1", attempt=1, worker_id="w1",
+                                     model="claude-opus-5-5", input_tokens=100, max_output_tokens=50,
+                                     limits=ledger.Limits(1000, 500))
+        assert hypotheses.record_extraction(
+            ai_worker, ai, job_id="job-1", document_id=document_id, content_hash=content_hash, prompt=prompt,
+            requested_model="claude-opus-5-5", response_model="claude-opus-5-5", response_id="msg_1",
+            stop_reason="end_turn", usage=ledger.Usage(90, 0, 0, 40), checked=checked)
+        assert ledger.settle(ai_worker, ai, reservation, ledger.Usage(90, 0, 0, 40))
+    for statement in (f'DELETE FROM "{ai}".extractions', f'DELETE FROM "{ai}".hypotheses',
+                      f'DELETE FROM "{ai}".token_reservations', f'TRUNCATE "{ai}".token_reservations'):
+        with pytest.raises(errors.InsufficientPrivilege):
+            ai_worker.execute(statement)
+    app = provisioned.connect(roles.app)
+    assert app.execute(f'SELECT status, hypothesis_count FROM "{ai}".extractions').fetchall() == [("ok", 1)]
+    assert app.execute(f'SELECT reported_value FROM "{ai}".hypotheses').fetchall() == [("0.85",)]
+    assert app.execute(f'SELECT status FROM "{ai}".token_reservations').fetchall() == [("settled",)]
+    for statement in (f"UPDATE \"{ai}\".token_reservations SET status = 'released'",
+                      f"INSERT INTO \"{ai}\".token_reservations (id) VALUES ('x')",
+                      f"INSERT INTO \"{ai}\".extractions (id) VALUES ('x')",
+                      f"INSERT INTO \"{ai}\".hypotheses (extraction_id) VALUES ('x')",
+                      f'DELETE FROM "{ai}".extractions', f'DELETE FROM "{ai}".token_reservations'):
         with pytest.raises(errors.InsufficientPrivilege):
             app.execute(statement)
 

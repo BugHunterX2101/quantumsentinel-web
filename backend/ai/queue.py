@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import uuid
 
-from psycopg import Connection, sql
+from psycopg import Connection, errors, sql
 from psycopg.types.json import Jsonb
 
 from . import flags
@@ -60,9 +60,14 @@ def enqueue(conn: Connection, schema: str, kind: str, payload: dict, requested_b
         raise StageOff(f"the AI stage {spec.stage!r} is switched off "
                        f"(it runs only while {flags.MASTER} and {spec.stage} are both on)")
     job_id = str(uuid.uuid4())
-    conn.execute(sql.SQL("INSERT INTO {} (id, kind, payload, requested_by, max_attempts)"
-                         " VALUES (%s, %s, %s, %s, %s)").format(_t(schema, "jobs")),
-                 (job_id, kind, Jsonb(payload), requested_by[:320], spec.max_attempts))
+    try:
+        with conn.transaction():  # a savepoint: a refusal leaves the caller's transaction usable
+            conn.execute(sql.SQL("INSERT INTO {} (id, kind, payload, requested_by, max_attempts)"
+                                 " VALUES (%s, %s, %s, %s, %s)").format(_t(schema, "jobs")),
+                         (job_id, kind, Jsonb(payload), requested_by[:320], spec.max_attempts))
+    except errors.UniqueViolation:
+        # jobs_one_arxiv_sync (migration 0014) and any later one-at-a-time index.
+        raise EnqueueError(f"an AI job of kind {kind!r} is already queued or running") from None
     return job_id
 
 

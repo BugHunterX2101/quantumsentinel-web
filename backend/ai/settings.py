@@ -17,6 +17,9 @@ from pathlib import Path
 
 WORKER_ROLE = "ai-worker"
 JOB_ROLE = "ai-job"
+# arXiv's OAI-PMH endpoint (export.arxiv.org/oai2 redirects here). Only
+# development and tests may point the harvester elsewhere.
+ARXIV_OAI_URL = "https://oaipmh.arxiv.org/oai"
 
 # Settings the AI worker must never be given: the trusted tier's database
 # URL, keys and secrets, and every database password but its own. In
@@ -75,6 +78,7 @@ class Settings:
     job_memory_bytes: int
     result_max_bytes: int
     retention_days: float
+    arxiv_oai_url: str = ARXIV_OAI_URL
 
 
 def load(environ=None) -> Settings:
@@ -95,6 +99,11 @@ def load(environ=None) -> Settings:
     schema = setting("AI_DB_SCHEMA", "ai", environ)
     if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", schema or ""):
         raise SettingsError(f"AI_DB_SCHEMA must be a plain schema name, not {schema!r}")
+    arxiv_oai_url = setting("AI_ARXIV_OAI_URL", ARXIV_OAI_URL, environ)
+    if environment == "production" and arxiv_oai_url != ARXIV_OAI_URL:
+        raise SettingsError(f"AI_ARXIV_OAI_URL may not be changed in production (it is {ARXIV_OAI_URL})")
+    if not re.fullmatch(r"https?://[!-~]+", arxiv_oai_url or "") or "?" in arxiv_oai_url:
+        raise SettingsError("AI_ARXIV_OAI_URL must be an http(s) URL without a query")
     heartbeat = _number("AI_WORKER_HEARTBEAT_SECONDS", "5", environ, 0.1)
     lease = _number("AI_JOB_LEASE_SECONDS", "60", environ, 1)
     if lease <= 2 * heartbeat:
@@ -109,4 +118,5 @@ def load(environ=None) -> Settings:
         job_memory_bytes=int(_number("AI_JOB_MEMORY_BYTES", str(1 << 30), environ, 64 << 20)),
         result_max_bytes=int(_number("AI_JOB_RESULT_MAX_BYTES", str(1 << 20), environ, 1024)),
         retention_days=_number("AI_JOB_RETENTION_DAYS", "7", environ, 0),
+        arxiv_oai_url=arxiv_oai_url,
     )

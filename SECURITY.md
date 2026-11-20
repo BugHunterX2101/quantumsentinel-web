@@ -208,6 +208,14 @@
   writes the document registry; a malformed record is dropped, not
   stored. No role may delete a document, and the application only reads
   them.
+- The arXiv harvest sends only requests the AI worker builds itself, to
+  the one OAI-PMH URL its settings name (fixed in production); a job's
+  payload names a set, a date and a page limit, never a URL. The job
+  process that fetches a page follows no redirect, uses only the proxy in
+  its environment and refuses a body over 16 MiB. Every worker shares one
+  rate slot per source, so the tier never sends arXiv more than one
+  request every 3 s, and the requests carry a generic User-Agent with no
+  operator detail.
 
 ## CI security pipeline
 

@@ -471,6 +471,10 @@ def test_the_ai_allow_lists_keep_the_ai_worker_to_its_own_jobs():
     # No role deletes a document; only the AI worker writes one.
     assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["documents"]) == {"SELECT", "INSERT", "UPDATE"}
     assert set(db_roles.APP_AI_TABLE_PRIVILEGES["documents"]) == {"SELECT"}
+    # The harvest bookkeeping: the AI worker moves it, the app reads it.
+    assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["sources"]) == {"SELECT", "UPDATE"}
+    assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["harvests"]) == {"SELECT", "INSERT", "UPDATE"}
+    assert set(db_roles.APP_AI_TABLE_PRIVILEGES["sources"]) == set(db_roles.APP_AI_TABLE_PRIVILEGES["harvests"])         == {"SELECT"}
     for allowed in (db_roles.AI_WORKER_TABLE_PRIVILEGES, db_roles.APP_AI_TABLE_PRIVILEGES):
         assert all(p and set(p) <= set(db_roles.TABLE_PRIVILEGES) for p in allowed.values())
 
@@ -601,6 +605,62 @@ def test_the_ai_worker_runs_its_jobs_as_its_own_role(provisioned, capsys):
         assert actions == ["AI_FLAG_SET", "AI_FLAG_SET", "AI_JOB_QUEUED"]
         assert db.execute(text(f'SELECT count(*) FROM "{ai}".workers')).scalar() == 1
 
+
+
+def test_the_ai_worker_harvests_arxiv_as_its_own_role(provisioned, capsys, monkeypatch):
+    """The app role queues an arXiv sync (manage ai-arxiv-sync); the AI
+    worker, as qs_ai_worker, runs it against a fake arXiv: it takes rate
+    slots, moves the set's cursor and records the papers. Neither role may
+    delete the bookkeeping, and the app role only reads it."""
+    import datetime as dt
+
+    from backend.ai import settings as ai_settings
+    from backend.ai.worker import AiWorker
+    from test_arxiv_sync import PAGES, PROXY_VARIABLES, FakeOai
+
+    for name in PROXY_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    roles = provisioned.roles
+    ai = db_roles.ai_schema_for(provisioned.schema)
+    app_sessions = sessionmaker(bind=provisioned.engine_as(roles.app))
+    for flag in ("research_intelligence", "arxiv_sync"):
+        assert manage._set_flag(app_sessions, flag, True, "ops@example.com", "role test") == 0
+    provisioned.connect().execute(f'UPDATE "{ai}".sources SET min_interval_seconds = 1')
+    start = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=10)
+    capsys.readouterr()
+    assert manage._ai_arxiv_sync(app_sessions, "q-fin", start.isoformat(), None, "ops@example.com") == 0
+    job_id = capsys.readouterr().out.strip().rsplit(": ", 1)[1]
+    fake = FakeOai()
+    fake.serve(*PAGES)
+    settings = ai_settings.load({
+        "QS_PROCESS_ROLE": "ai-worker", "AI_ARXIV_OAI_URL": fake.url,
+        "AI_DATABASE_URL": provisioned.url(roles.ai_worker).render_as_string(hide_password=False),
+        "AI_DB_SCHEMA": ai, "AI_WORKER_HEARTBEAT_SECONDS": "0.5"})
+    runner = AiWorker(settings)
+    runner.connect()
+    try:
+        assert runner.run_once() == "succeeded"
+    finally:
+        runner.close()
+        fake.close()
+    assert len(fake.requests) == 3
+    app = provisioned.connect(roles.app)
+    status, result = app.execute(f'SELECT status, result FROM "{ai}".jobs WHERE id = %s', (job_id,)).fetchone()
+    assert status == "succeeded" and result["caught_up"] is True, result
+    assert app.execute(f'SELECT pages, last_error FROM "{ai}".harvests').fetchall() == [(3, None)]
+    assert app.execute(f'SELECT count(*) FROM "{ai}".documents').fetchone() == (result["inserted"],)
+    ai_worker = provisioned.connect(roles.ai_worker)
+    for conn, statements in (
+        (ai_worker, (f'DELETE FROM "{ai}".harvests', f'DELETE FROM "{ai}".sources', f'TRUNCATE "{ai}".harvests',
+                     f"INSERT INTO \"{ai}\".sources (name, min_interval_seconds) VALUES ('arxiv', 1)")),
+        (app, (f'DELETE FROM "{ai}".harvests', f'DELETE FROM "{ai}".sources',
+               f"UPDATE \"{ai}\".sources SET min_interval_seconds = 1",
+               f"UPDATE \"{ai}\".harvests SET last_error = 'x'",
+               f"INSERT INTO \"{ai}\".harvests (source, set_spec, start_date) VALUES ('arxiv', 'math', '2026-01-01')")),
+    ):
+        for statement in statements:
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute(statement)
 
 def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(provisioned, tmp_path):
     from backend.services import dataset_registry

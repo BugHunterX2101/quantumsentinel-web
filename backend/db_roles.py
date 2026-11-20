@@ -210,6 +210,10 @@ AI_WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # The document registry (migration 0013): it records harvested papers
     # and marks deleted ones, but never deletes a row.
     "documents": ("SELECT", "INSERT", "UPDATE"),
+    # Harvest bookkeeping (migration 0014): it takes rate slots and moves
+    # the per-set cursors, and never deletes either.
+    "sources": ("SELECT", "UPDATE"),
+    "harvests": ("SELECT", "INSERT", "UPDATE"),
 }
 # The application's privileges in the AI schema: ``manage set-flag`` sets the
 # flags; the application enqueues AI jobs and reads their outcome, the
@@ -220,6 +224,8 @@ APP_AI_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "jobs": ("SELECT", "INSERT"),
     "workers": ("SELECT",),
     "documents": ("SELECT",),
+    "sources": ("SELECT",),
+    "harvests": ("SELECT",),
 }
 # Set on qs_ai_worker itself, so they hold whatever its client sets.
 AI_WORKER_CONNECTION_LIMIT = 8

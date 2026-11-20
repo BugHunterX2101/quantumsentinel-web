@@ -91,6 +91,26 @@ def test_every_kind_runs_a_function_of_the_ai_tier_in_a_known_stage():
         module, _, function = kind.target.partition(":")
         assert module.startswith("backend.ai.")
         assert callable(getattr(importlib.import_module(module), function))
+        if kind.driver is not None:
+            module, _, function = kind.driver.partition(":")
+            assert module.startswith("backend.ai.") and module != "backend.ai.child"
+            assert callable(getattr(importlib.import_module(module), function))
+        for limit in (kind.child_timeout_seconds, kind.child_output_max_bytes):
+            assert limit is None or limit > 0
+        assert kind.child_timeout_seconds is None or kind.child_timeout_seconds <= kind.timeout_seconds
+
+
+
+@pytest.mark.parametrize("fields", [{"target": "backend.main:app"}, {"driver": "backend.main:app"},
+                                    {"driver": "os:system"}, {"stage": "unknown"}])
+def test_a_kind_that_runs_code_outside_the_ai_tier_is_refused(fields):
+    from backend.ai import kinds
+
+    good = {"name": "x", "target": "backend.ai.selftest:run", "stage": "selftest", "timeout_seconds": 60}
+    kinds.check({"x": AiKind(**good)})
+    kinds.check({"x": AiKind(**good, driver="backend.ai.harvest:run")})
+    with pytest.raises(RuntimeError, match="under backend.ai"):
+        kinds.check({"x": AiKind(**{**good, **fields})})
 
 
 # -- settings -----------------------------------------------------------------
@@ -272,7 +292,7 @@ def ai(make_engine):
 
 def test_every_flag_starts_off_and_a_stage_needs_the_master_flag_too(ai):
     assert [(r["name"], r["enabled"], r["effective"]) for r in flags.listing(ai.conn, ai.schema)] == [
-        (flags.MASTER, False, False), ("selftest", False, False)]
+        (flags.MASTER, False, False), ("arxiv_sync", False, False), ("selftest", False, False)]
     with pytest.raises(queue.StageOff):
         ai.enqueue()
     ai.switch(master=False, stage=True)
@@ -285,8 +305,10 @@ def test_every_flag_starts_off_and_a_stage_needs_the_master_flag_too(ai):
     assert not flags.enabled(ai.conn, ai.schema, "no_such_stage")
     ai.switch(master=True, stage=True)
     assert ai.job(ai.enqueue())["status"] == "queued"
-    listing = flags.listing(ai.conn, ai.schema)
-    assert [(r["effective"], r["set_by"], r["reason"]) for r in listing] == [(True, OPS, "test")] * 2
+    listing = {r["name"]: r for r in flags.listing(ai.conn, ai.schema)}
+    assert [(listing[n]["effective"], listing[n]["set_by"], listing[n]["reason"]) for n in (flags.MASTER, "selftest")
+            ] == [(True, OPS, "test")] * 2
+    assert (listing["arxiv_sync"]["enabled"], listing["arxiv_sync"]["effective"]) == (False, False)
 
 
 def test_flags_are_known_and_set_by_someone_for_a_reason(ai):

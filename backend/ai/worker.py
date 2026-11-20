@@ -14,10 +14,15 @@ checks the job's stage. If the stage has been switched off it stops the job
 and hands it back to the queue, uncounted, so a switch takes effect at
 once, not when the job ends. A job that runs past its kind's timeout is
 killed and fails.
+
+A kind with a driver (backend/ai/kinds.py) is run by its driver, which
+uses ``run_child``, ``sleep`` and ``check_in`` so that its waits keep the
+lease and honour the same switches.
 """
 from __future__ import annotations
 
 import datetime as dt
+import importlib
 import logging
 import os
 import signal
@@ -38,6 +43,20 @@ from .settings import Settings, SettingsError, load
 log = logging.getLogger("backend.ai.worker")
 HOUSEKEEPING_SECONDS = 30
 PURGE_SECONDS = 3600
+
+
+class Interrupted(Exception):
+    """The running job is no longer this worker's to run; ``ended`` says
+    how, and ``release`` whether to hand it back to the queue."""
+
+    def __init__(self, ended: str, release: bool):
+        super().__init__(ended)
+        self.ended = ended
+        self.release = release
+
+
+class ChildTimeout(child.JobFailed):
+    pass
 
 
 class AiWorker:
@@ -107,42 +126,75 @@ class AiWorker:
         log.info("AI job %s %s", job["id"], ended)
         return ended
 
+    # -- running a job -------------------------------------------------------------
+
+    def check_in(self, job: dict) -> None:
+        """Renew the running job's lease and the heartbeat. Raises
+        Interrupted if the worker is stopping, the job is no longer this
+        worker's, or its stage has been switched off."""
+        if self._stopping.is_set():
+            raise Interrupted("released (worker stopping)", release=True)
+        with self.conn.transaction():
+            state = queue.renew(self.conn, self.schema, job["id"], self.id, self.settings.lease_seconds)
+            self._heartbeat()
+        if state == "lost":
+            raise Interrupted("lost (lease lapsed)", release=False)
+        if state == "off":
+            raise Interrupted("released (stage switched off)", release=True)
+
+    def sleep(self, job: dict, seconds: float) -> None:
+        """Wait while keeping the job's lease, checking in every heartbeat."""
+        until = time.monotonic() + max(0.0, seconds)
+        while (left := until - time.monotonic()) > 0:
+            self._stopping.wait(min(self.settings.heartbeat_seconds, left))
+            self.check_in(job)
+
+    def run_child(self, job: dict, target: str, payload: dict, timeout_seconds: float, max_bytes: int) -> dict:
+        """Run ``target`` in a job process and return its result. Raises
+        child.JobFailed (ChildTimeout past ``timeout_seconds``) or
+        Interrupted; either way the process has been killed."""
+        process = child.start(self.settings.job_memory_bytes, timeout_seconds)
+        deadline = time.monotonic() + timeout_seconds
+        data: bytes | None = child.request(target, payload)
+        try:
+            while True:
+                wait = max(0.0, min(self.settings.heartbeat_seconds, deadline - time.monotonic()))
+                try:
+                    stdout, stderr = process.communicate(input=data, timeout=wait)
+                    break
+                except subprocess.TimeoutExpired:
+                    data = None  # sent with the first call
+                if time.monotonic() >= deadline:
+                    raise ChildTimeout(f"ran longer than {timeout_seconds:g} s")
+                self.check_in(job)
+        except BaseException:
+            _kill(process)
+            raise
+        return child.outcome(process.returncode, stdout, stderr, max_bytes)
+
     def execute(self, job: dict) -> str:
         spec = KINDS[job["kind"]]
-        process = child.start(self.settings.job_memory_bytes, spec.timeout_seconds)
-        deadline = time.monotonic() + spec.timeout_seconds
-        data: bytes | None = child.request(spec.target, job["payload"])
-        while True:
-            wait = max(0.0, min(self.settings.heartbeat_seconds, deadline - time.monotonic()))
-            try:
-                stdout, stderr = process.communicate(input=data, timeout=wait)
-                break
-            except subprocess.TimeoutExpired:
-                data = None  # sent with the first call
-            if time.monotonic() >= deadline:
-                _kill(process)
-                with self.conn.transaction():
-                    queue.fail(self.conn, self.schema, job["id"], self.id,
-                               f"The AI job ran longer than {spec.timeout_seconds:g} s and was stopped.")
-                return "timed out"
-            if self._stopping.is_set():
-                _kill(process)
-                with self.conn.transaction():
-                    queue.release(self.conn, self.schema, job["id"], self.id)
-                return "released (worker stopping)"
-            with self.conn.transaction():
-                state = queue.renew(self.conn, self.schema, job["id"], self.id, self.settings.lease_seconds)
-                self._heartbeat()
-            if state == "lost":
-                _kill(process)
-                return "lost (lease lapsed)"
-            if state == "off":
-                _kill(process)
-                with self.conn.transaction():
-                    queue.release(self.conn, self.schema, job["id"], self.id)
-                return "released (stage switched off)"
         try:
-            result = child.outcome(process.returncode, stdout, stderr, self.settings.result_max_bytes)
+            if spec.driver:
+                module_name, _, function = spec.driver.partition(":")
+                return getattr(importlib.import_module(module_name), function)(self, job, spec)
+            return self._run_simple(job, spec)
+        except Interrupted as stop:
+            if stop.release:
+                with self.conn.transaction():
+                    queue.release(self.conn, self.schema, job["id"], self.id)
+            return stop.ended
+
+    def _run_simple(self, job: dict, spec) -> str:
+        limit = spec.child_timeout_seconds or spec.timeout_seconds
+        try:
+            result = self.run_child(job, spec.target, job["payload"], limit,
+                                    spec.child_output_max_bytes or self.settings.result_max_bytes)
+        except ChildTimeout:
+            with self.conn.transaction():
+                queue.fail(self.conn, self.schema, job["id"], self.id,
+                           f"The AI job ran longer than {limit:g} s and was stopped.")
+            return "timed out"
         except child.JobFailed as exc:
             with self.conn.transaction():
                 queue.fail(self.conn, self.schema, job["id"], self.id, f"The AI job failed: {exc}")

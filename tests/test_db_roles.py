@@ -781,6 +781,71 @@ def test_the_ai_worker_looks_up_metadata_as_its_own_role(provisioned, capsys, mo
                 conn.execute(statement)
 
 
+def test_the_ai_worker_extracts_hypotheses_as_its_own_role(provisioned, capsys):
+    """The app role queues an extraction (manage ai-extract); the AI worker,
+    as qs_ai_worker, asks the fake model about each paper, reserves and
+    settles its tokens and records the answers. The app role only reads
+    them; neither role may change or delete an extraction or a reservation."""
+    from backend.ai import documents, ledger
+    from backend.ai import settings as ai_settings
+    from backend.ai.documents import clean_page
+    from backend.ai.worker import AiWorker
+    from test_arxiv_registry import page, raw
+    from test_extract import BUDGET, SENTENCE
+
+    roles = provisioned.roles
+    ai = db_roles.ai_schema_for(provisioned.schema)
+    ai_worker = provisioned.connect(roles.ai_worker)
+    with ai_worker.transaction():
+        documents.upsert_page(ai_worker, ai, clean_page(page(
+            raw(id="2611.00001", abstract=SENTENCE, datestamp="2026-10-01"),
+            raw(id="2611.00002", abstract=SENTENCE + " [[fake:invent_quote]]", datestamp="2026-10-02"))))
+    app_sessions = sessionmaker(bind=provisioned.engine_as(roles.app))
+    for flag in ("research_intelligence", "extract"):
+        assert manage._set_flag(app_sessions, flag, True, "ops@example.com", "role test") == 0
+    capsys.readouterr()
+    assert manage._ai_extract(app_sessions, 2, "ops@example.com") == 0
+    job_id = capsys.readouterr().out.strip().rsplit(": ", 1)[1]
+    assert manage._ai_extract(app_sessions, None, "ops@example.com") == 1
+    assert "already queued or running" in capsys.readouterr().err
+    settings = ai_settings.load({
+        "QS_PROCESS_ROLE": "ai-worker", "AI_MODEL_PROVIDER": "fake", **BUDGET,
+        "AI_DATABASE_URL": provisioned.url(roles.ai_worker).render_as_string(hide_password=False),
+        "AI_DB_SCHEMA": ai, "AI_WORKER_HEARTBEAT_SECONDS": "0.5"})
+    runner = AiWorker(settings)
+    runner.connect()
+    try:
+        assert runner.run_once() == "succeeded"
+    finally:
+        runner.close()
+    app = provisioned.connect(roles.app)
+    status, result, payload = app.execute(f'SELECT status, result, payload FROM "{ai}".jobs WHERE id = %s',
+                                          (job_id,)).fetchone()
+    assert status == "succeeded" and payload == {"max_docs": 2}
+    assert (result["documents"], result["ok"], result["hypotheses"], result["rejected"]) == (2, 2, 1, 1)
+    assert app.execute(f'SELECT count(*) FROM "{ai}".hypotheses').fetchone() == (1,)
+    assert app.execute(f'SELECT status, count(*) FROM "{ai}".token_reservations GROUP BY status').fetchall() == [
+        ("settled", 2)]
+    with ai_worker.transaction():  # a request whose fate is unknown counts in full
+        reservation = ledger.reserve(ai_worker, ai, job_id=job_id, attempt=9, worker_id="w", model="m",
+                                     input_tokens=1, max_output_tokens=1, limits=ledger.Limits(10 ** 9, 10 ** 9))
+        assert ledger.abandon(ai_worker, ai, reservation) is True
+    for conn, statements in (
+        (ai_worker, (f'DELETE FROM "{ai}".token_reservations', f'TRUNCATE "{ai}".token_reservations',
+                     f'DELETE FROM "{ai}".extractions', f'UPDATE "{ai}".extractions SET status = \'ok\'',
+                     f'UPDATE "{ai}".hypotheses SET statement = \'x\'')),
+        (app, (f'UPDATE "{ai}".token_reservations SET status = \'released\'',
+               f'DELETE FROM "{ai}".extractions', f'UPDATE "{ai}".extractions SET status = \'ok\'',
+               f'INSERT INTO "{ai}".hypotheses (extraction_id, ordinal, statement, evidence_quote, asset_class,'
+               f' signal_family, direction, horizon, reported_metric, reported_value, model_confidence, rationale)'
+               f" SELECT id, 2, 's', repeat('q', 20), 'fx', 'other', 'long', 'daily', 'none', '', 'low', ''"
+               f' FROM "{ai}".extractions LIMIT 1')),
+    ):
+        for statement in statements:
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute(statement)
+
+
 def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(provisioned, tmp_path):
     from backend.services import dataset_registry
     from backend.services.dataset_store import DatasetStore

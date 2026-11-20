@@ -15,6 +15,7 @@
     python -m backend.manage ai-selftest --by <who> [--hold <seconds>]
     python -m backend.manage ai-arxiv-sync <SET> --by <who> [--from <YYYY-MM-DD>] [--max-pages <N>]
     python -m backend.manage ai-metadata-sync <openalex|crossref> --by <who> [--max-docs <N>]
+    python -m backend.manage ai-extract --by <who> [--max-docs <N>]
     python -m backend.manage ai-job <AI_JOB_ID>
 
 Roles are granted only here — out of band, by someone with shell access to
@@ -71,8 +72,12 @@ sync is queued or running at a time; schedule it daily.
 ``ai-metadata-sync`` queues lookups of the registry's documents at OpenAlex
 or Crossref (backend/ai/enrich.py): every document never looked up there,
 changed since, or due for a recheck. At most one is queued or running per
-service; schedule it daily, after the arXiv sync. ``ai-job`` prints an AI
-job's state and result.
+service; schedule it daily, after the arXiv sync. ``ai-extract`` queues a
+hypothesis extraction (backend/ai/extract.py): the AI worker asks its model
+(AI_MODEL_PROVIDER, AI_MODEL) about every document not yet extracted with
+the current prompt and model, within the daily token budget
+(AI_DAILY_INPUT_TOKENS, AI_DAILY_OUTPUT_TOKENS). At most one is queued or
+running. ``ai-job`` prints an AI job's state and result.
 """
 import argparse
 import sys
@@ -137,6 +142,9 @@ def main(argv: list[str] | None = None) -> int:
     metadata_sync.add_argument("source", help="openalex or crossref")
     metadata_sync.add_argument("--by", required=True, help="who queues it")
     metadata_sync.add_argument("--max-docs", type=int, help="stop after this many documents")
+    ai_extract = commands.add_parser("ai-extract", help="queue a hypothesis extraction from the registry's papers")
+    ai_extract.add_argument("--by", required=True, help="who queues it")
+    ai_extract.add_argument("--max-docs", type=int, help="stop after this many documents")
     ai_job = commands.add_parser("ai-job", help="print an AI job's state and result")
     ai_job.add_argument("job")
     args = parser.parse_args(argv)
@@ -181,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ai-metadata-sync":
         init_db()
         return _ai_metadata_sync(SessionLocal, args.source, args.max_docs, args.by)
+    if args.command == "ai-extract":
+        init_db()
+        return _ai_extract(SessionLocal, args.max_docs, args.by)
     if args.command == "ai-job":
         init_db()
         return _print_ai_job(SessionLocal, args.job)
@@ -367,6 +378,30 @@ def _ai_metadata_sync(session_factory, source: str, max_docs: int | None, queued
         security_service.write_audit_log(db, None, "AI_JOB_QUEUED", "ai_job", job_id,
                                          {"kind": "metadata_sync", "queued_by": queued_by.strip()[:320],
                                           **payload})
+        print(f"AI job queued: {job_id}")
+    return 0
+
+
+def _ai_extract(session_factory, max_docs: int | None, queued_by: str) -> int:
+    from .ai import extract, queue
+    from .services import security_service
+
+    payload = {} if max_docs is None else {"max_docs": max_docs}
+    try:
+        extract.check_payload(payload)
+    except ValueError as exc:
+        print(f"ai-extract: {exc}", file=sys.stderr)
+        return 1
+    with session_factory() as db:
+        conn, schema = _ai_connection(db)
+        try:
+            job_id = queue.enqueue(conn, schema, "extract", payload, queued_by)
+        except queue.EnqueueError as exc:
+            print(f"ai-extract: {exc}", file=sys.stderr)
+            return 1
+        db.commit()
+        security_service.write_audit_log(db, None, "AI_JOB_QUEUED", "ai_job", job_id,
+                                         {"kind": "extract", "queued_by": queued_by.strip()[:320], **payload})
         print(f"AI job queued: {job_id}")
     return 0
 

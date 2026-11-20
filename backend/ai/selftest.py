@@ -21,7 +21,7 @@ def trusted_modules() -> list[str]:
 
 
 def _limits() -> dict:
-    if os.name != "posix":
+    if not sys.platform.startswith("linux"):
         return {}
     import resource
 

@@ -8,7 +8,10 @@ interpreter that it starts with subprocess.Popen. The process gets:
   backend.config refuses to load;
 * no file descriptor of the worker's (close_fds), so no database socket;
 * ``python -E -s``, so no PYTHON* variable or user site directory shapes it;
-* on POSIX, limits on memory, CPU time, open files and core dumps.
+* on Linux, limits on memory, CPU time, open files and core dumps. macOS
+  refuses to lower RLIMIT_AS below the address space an arm64 interpreter
+  already reserves, so elsewhere the job runs without them; production runs
+  on Linux.
 
 The worker writes ``{"target": ..., "payload": ...}`` to its stdin. It
 answers with the result as JSON on stdout and exits 0, or exits non-zero with
@@ -53,7 +56,7 @@ def command() -> list[str]:
     return [sys.executable, "-E", "-s", "-m", "backend.ai.child"]
 
 
-def _posix_limits(memory_bytes: int, cpu_seconds: int):
+def _linux_limits(memory_bytes: int, cpu_seconds: int):
     def apply():  # runs in the child between fork and exec
         import resource
 
@@ -67,10 +70,11 @@ def _posix_limits(memory_bytes: int, cpu_seconds: int):
 def start(memory_bytes: int, timeout_seconds: float, environ=None) -> subprocess.Popen:
     """Start a job process; the caller sends its job with ``communicate``."""
     posix = os.name == "posix"
+    linux = sys.platform.startswith("linux")
     return subprocess.Popen(
         command(), cwd=ROOT, env=child_environment(os.environ if environ is None else environ),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
-        preexec_fn=_posix_limits(memory_bytes, math.ceil(timeout_seconds) + 5) if posix else None,
+        preexec_fn=_linux_limits(memory_bytes, math.ceil(timeout_seconds) + 5) if linux else None,
         start_new_session=posix)
 
 

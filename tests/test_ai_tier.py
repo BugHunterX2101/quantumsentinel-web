@@ -172,7 +172,7 @@ def test_a_job_process_inherits_only_the_allow_list():
     assert b"canary" not in stdout
     assert result["process_role"] == "ai-job"
     assert result["trusted_modules"] == []
-    if os.name == "posix":
+    if sys.platform.startswith("linux"):
         assert result["limits"]["RLIMIT_CORE"] == 0
         assert result["limits"]["RLIMIT_AS"] == 256 << 20
 

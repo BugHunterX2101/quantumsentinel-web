@@ -19,6 +19,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE = ROOT / "docker-compose.production.yml"
 PASSWORDS = ("POSTGRES_PASSWORD", "DB_APP_PASSWORD", "DB_RESEARCH_WORKER_PASSWORD", "DB_EVALUATOR_PASSWORD",
+             "DB_AI_WORKER_PASSWORD",
              "DB_MIGRATOR_PASSWORD", "DB_BACKUP_PASSWORD")
 # Secrets only the API uses (backend/config.py); a research worker or the
 # research evaluator holds none.
@@ -30,6 +31,8 @@ HOLDERS = {
     "DB_APP_PASSWORD": {"quantumsentinel", "provision"},
     "DB_RESEARCH_WORKER_PASSWORD": {"research-worker", "provision"},
     "DB_EVALUATOR_PASSWORD": {"research-evaluator", "provision"},
+    # The AI worker service arrives in R4-2; until then only provisioning uses it.
+    "DB_AI_WORKER_PASSWORD": {"provision"},
     "DB_MIGRATOR_PASSWORD": {"migrate", "provision"},
     "DB_BACKUP_PASSWORD": {"backup", "provision"},
 }

@@ -10,6 +10,10 @@
     python -m backend.manage set-holdout <FAMILY> <YYYY-MM-DD> --by <who> --reason <why>
     python -m backend.manage holdouts
     python -m backend.manage final-evaluate <VALIDATION_JOB_ID> --period <P> --capital <C> --by <who> --reason <why>
+    python -m backend.manage set-flag <FLAG> <on|off> --by <who> --reason <why>
+    python -m backend.manage flags
+    python -m backend.manage ai-selftest --by <who> [--hold <seconds>]
+    python -m backend.manage ai-job <AI_JOB_ID>
 
 Roles are granted only here — out of band, by someone with shell access to
 the deployment — never through the web API, so no self-registered account
@@ -31,8 +35,8 @@ previous check.
 (backend/db_roles.py) and hands the schema to them. Run it as the database
 superuser, with DATABASE_URL naming that superuser. A role that does not
 exist yet takes its password from DB_MIGRATOR_PASSWORD, DB_APP_PASSWORD,
-DB_RESEARCH_WORKER_PASSWORD, DB_EVALUATOR_PASSWORD or DB_BACKUP_PASSWORD (or
-the matching *_FILE setting); given for a role that
+DB_RESEARCH_WORKER_PASSWORD, DB_EVALUATOR_PASSWORD, DB_AI_WORKER_PASSWORD or
+DB_BACKUP_PASSWORD (or the matching *_FILE setting); given for a role that
 exists, the password is changed. It is safe to run again: it repairs any
 drift from the intended privileges. It is safe while the application runs:
 it takes the table locks it needs all at once or not at all, so it cannot
@@ -49,6 +53,16 @@ strategy validation, named by the job that recorded it, with the period and
 capital its evaluation ran with (backend/services/holdout_evaluation.py). The
 research evaluator runs it and spends the attempt as it starts. The command
 prints the job id, and the owner sees only whether the grade passed.
+
+``set-flag`` switches a feature flag of the AI tier (backend/ai/flags.py)
+on or off. A stage of the AI tier runs only while ``research_intelligence``
+and its own flag are both on, and every flag starts off. The change is
+audited and takes effect without a restart: the AI worker checks the flags
+when it claims a job and while one runs. ``flags`` prints them.
+``ai-selftest`` queues a job that reports what an AI job process runs with:
+the names of its environment variables, its process role, and any module of
+the trusted tier it imported (there must be none). ``ai-job`` prints an AI
+job's state and result.
 """
 import argparse
 import sys
@@ -94,6 +108,17 @@ def main(argv: list[str] | None = None) -> int:
                                 help="the initial capital its evaluation ran with")
     final_evaluate.add_argument("--by", required=True, help="who queues it")
     final_evaluate.add_argument("--reason", required=True, help="why")
+    set_flag = commands.add_parser("set-flag", help="switch a feature flag of the AI tier on or off")
+    set_flag.add_argument("flag")
+    set_flag.add_argument("state", choices=("on", "off"))
+    set_flag.add_argument("--by", required=True, help="who sets it")
+    set_flag.add_argument("--reason", required=True, help="why")
+    commands.add_parser("flags", help="print the AI tier's feature flags")
+    ai_selftest = commands.add_parser("ai-selftest", help="queue an AI job that reports what AI jobs run with")
+    ai_selftest.add_argument("--by", required=True, help="who queues it")
+    ai_selftest.add_argument("--hold", type=float, default=0, help="seconds the job keeps running (at most 30)")
+    ai_job = commands.add_parser("ai-job", help="print an AI job's state and result")
+    ai_job.add_argument("job")
     args = parser.parse_args(argv)
 
     if args.command == "generate-server-key":
@@ -121,6 +146,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "final-evaluate":
         init_db()
         return _final_evaluate(SessionLocal, args.validation, args.period, args.capital, args.by, args.reason)
+    if args.command == "set-flag":
+        init_db()
+        return _set_flag(SessionLocal, args.flag, args.state == "on", args.by, args.reason)
+    if args.command == "flags":
+        init_db()
+        return _print_flags(SessionLocal)
+    if args.command == "ai-selftest":
+        init_db()
+        return _ai_selftest(SessionLocal, args.by, args.hold)
+    if args.command == "ai-job":
+        init_db()
+        return _print_ai_job(SessionLocal, args.job)
 
     init_db()
     db = SessionLocal()
@@ -187,6 +224,85 @@ def _final_evaluate(session_factory, validation: str, period: str, capital: floa
     return 0
 
 
+def _ai_connection(db):
+    """The session's psycopg connection, inside its transaction, and the AI schema's name."""
+    from . import db_roles
+
+    conn = db.connection().connection.driver_connection
+    return conn, db_roles.ai_schema_for(conn.execute("SELECT current_schema()").fetchone()[0])
+
+
+_ON_OFF = {True: "on", False: "off"}
+
+
+def _set_flag(session_factory, name: str, on: bool, set_by: str, reason: str) -> int:
+    from .ai import flags
+    from .services import security_service
+
+    with session_factory() as db:
+        conn, schema = _ai_connection(db)
+        try:
+            previous = flags.set_flag(conn, schema, name, on, set_by, reason)
+        except flags.FlagError as exc:
+            print(f"set-flag: {exc}", file=sys.stderr)
+            return 1
+        db.commit()
+        security_service.write_audit_log(db, None, "AI_FLAG_SET", "ai_flag", name,
+                                         {"enabled": on, "previous": previous, "set_by": set_by.strip()[:320],
+                                          "reason": reason.strip()})
+        print(f"{name}: {_ON_OFF[on]} (was {_ON_OFF[previous]})")
+    return 0
+
+
+def _print_flags(session_factory) -> int:
+    from .ai import flags
+
+    with session_factory() as db:
+        conn, schema = _ai_connection(db)
+        rows = flags.listing(conn, schema)
+    for row in rows:
+        effective = "" if row["name"] == flags.MASTER else f" (effective: {_ON_OFF[row['effective']]})"
+        if row["set_at"]:
+            detail = f"  set {row['set_at']:%Y-%m-%d %H:%M} by {row['set_by']}: {row['reason']}"
+        else:
+            detail = "  never set"
+        print(f"{row['name']:24s} {_ON_OFF[row['enabled']]}{effective}{detail}")
+    return 0
+
+
+def _ai_selftest(session_factory, queued_by: str, hold: float) -> int:
+    from .ai import queue
+    from .services import security_service
+
+    with session_factory() as db:
+        conn, schema = _ai_connection(db)
+        try:
+            job_id = queue.enqueue(conn, schema, "ai_selftest", {"hold_seconds": hold}, queued_by)
+        except queue.EnqueueError as exc:
+            print(f"ai-selftest: {exc}", file=sys.stderr)
+            return 1
+        db.commit()
+        security_service.write_audit_log(db, None, "AI_JOB_QUEUED", "ai_job", job_id,
+                                         {"kind": "ai_selftest", "queued_by": queued_by.strip()[:320]})
+        print(f"AI job queued: {job_id}")
+    return 0
+
+
+def _print_ai_job(session_factory, job_id: str) -> int:
+    import json
+
+    from .ai import queue
+
+    with session_factory() as db:
+        conn, schema = _ai_connection(db)
+        job = queue.get(conn, schema, job_id)
+    if job is None:
+        print(f"ai-job: no AI job {job_id}", file=sys.stderr)
+        return 1
+    print(json.dumps(job, default=str, indent=2))
+    return 0
+
+
 def _print_holdouts(session_factory) -> int:
     from .services import dataset_holdouts
 
@@ -237,7 +353,7 @@ def _provision_roles(target_engine=None, roles=None) -> int:
     passwords = {role: _setting(name) for role, name in (
         (roles.migrator, "DB_MIGRATOR_PASSWORD"), (roles.app, "DB_APP_PASSWORD"),
         (roles.research_worker, "DB_RESEARCH_WORKER_PASSWORD"), (roles.evaluator, "DB_EVALUATOR_PASSWORD"),
-        (roles.backup, "DB_BACKUP_PASSWORD"))}
+        (roles.ai_worker, "DB_AI_WORKER_PASSWORD"), (roles.backup, "DB_BACKUP_PASSWORD"))}
     try:
         with target.begin() as connection:
             summary = db_roles.provision(connection.connection.driver_connection, roles,
@@ -249,8 +365,8 @@ def _provision_roles(target_engine=None, roles=None) -> int:
           f"objects given to {roles.owner}: {summary['ownership_moved']}; "
           f"passwords set: {', '.join(role for role, pw in passwords.items() if pw) or 'none'}")
     print(f"connect the application as {roles.app}, a separate research worker as "
-          f"{roles.research_worker}, the research evaluator as {roles.evaluator}, "
-          f"migrations as {roles.migrator}, backups as {roles.backup}")
+          f"{roles.research_worker}, the research evaluator as {roles.evaluator}, the AI worker as "
+          f"{roles.ai_worker}, migrations as {roles.migrator}, backups as {roles.backup}")
     if summary["unlisted"]:
         print("tables missing from db_roles.APP_TABLE_PRIVILEGES, which the application cannot use: "
               + ", ".join(summary["unlisted"]), file=sys.stderr)

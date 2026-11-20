@@ -91,6 +91,9 @@ class TestMigrations:
             for table in reversed(Base.metadata.sorted_tables):
                 conn.execute(text(f'DROP TABLE "{table.name}" CASCADE'))
             conn.execute(text("DROP TABLE alembic_version"))
+            # A first deploy has no AI schema either (migration 0012 makes it).
+            schema = conn.execute(text("SELECT current_schema()")).scalar()
+            conn.execute(text(f'DROP SCHEMA "{schema}_ai" CASCADE'))
         results, errors = [], []
         barrier = threading.Barrier(4)
 

@@ -857,7 +857,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | Variable | Required | Description |
 |---|---|---|
 | `ENVIRONMENT` | No | `development` (default) or `production` |
-| `QS_PROCESS_ROLE` | No | Which process this is: `api` (default), `research-worker`, `research-evaluator` or `research-job`. In production the API requires every secret below; a research worker or the research evaluator only `DATABASE_URL`, the `SERVER_DSA_*` key and the PQC provider; a job process nothing. The role also decides which job kinds a worker claims: the API's embedded worker and `research-worker` claim every kind except the holdout evaluator's, `research-evaluator` claims only those (and reaps or purges no other job), and any other role claims nothing. No worker claims a kind its code does not know; that job stays queued. A worker starts its job processes as `research-job` with only the platform's variables (paths, locale, proxies, CA bundles, thread counts) and `ENVIRONMENT`. The API refuses to run under another role, and a worker refuses `research-job` |
+| `QS_PROCESS_ROLE` | No | Which process this is: `api` (default), `research-worker`, `research-evaluator` or `research-job`. In production the API requires every secret below; a research worker or the research evaluator only `DATABASE_URL`, the `SERVER_DSA_*` key and the PQC provider; a job process nothing. The role also decides which job kinds a worker claims: the API's embedded worker and `research-worker` claim every kind except the holdout evaluator's, `research-evaluator` claims only those (and reaps or purges no other job), and any other role claims nothing. No worker claims a kind its code does not know; that job stays queued. A worker starts its job processes as `research-job` with only the platform's variables (paths, locale, proxies, CA bundles, thread counts) and `ENVIRONMENT`. The API refuses to run under another role, and a worker refuses `research-job`. The AI tier's roles, `ai-worker` and `ai-job`, are not among them: `backend/config.py` refuses to load under them (see [AI tier](#ai-tier)) |
 | `DATABASE_URL` | Prod | PostgreSQL URL (`postgresql+psycopg://user:password@host:5432/db`; `postgresql://` and `postgres://` are accepted). Any other database is refused at startup. Default: the `docker-compose.yml` dev database |
 | `DB_POOL_SIZE` | No | Connections each process keeps open (default 20) |
 | `DB_MAX_OVERFLOW` | No | Extra connections a process may open for bursts; they are closed when returned, so steady load should fit in `DB_POOL_SIZE` (default 0) |
@@ -866,7 +866,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `DB_LOCK_TIMEOUT_MS` | No | Server-side limit on waiting for a lock (default 10000) |
 | `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | No | A session idle inside an open transaction is ended after this long (default 60000) |
 | `DB_MIGRATE_ON_STARTUP` | No | `true` (default): API processes apply pending migrations at startup, serialised by a database lock; `false`: run `python -m backend.manage migrate` as a release step |
-| `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_EVALUATOR_PASSWORD`, `DB_MIGRATOR_PASSWORD`, `DB_BACKUP_PASSWORD` | `provision-roles`; Docker production | Passwords for `qs_app`, `qs_research_worker`, `qs_evaluator`, `qs_migrator` and `qs_backup`, read by `python -m backend.manage provision-roles` (each also as `*_FILE`). Needed to create a role; given for an existing role, its password is changed. `docker-compose.production.yml` also builds each service's `DATABASE_URL` from them, so they must be URL-safe |
+| `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_EVALUATOR_PASSWORD`, `DB_AI_WORKER_PASSWORD`, `DB_MIGRATOR_PASSWORD`, `DB_BACKUP_PASSWORD` | `provision-roles`; Docker production | Passwords for `qs_app`, `qs_research_worker`, `qs_evaluator`, `qs_ai_worker`, `qs_migrator` and `qs_backup`, read by `python -m backend.manage provision-roles` (each also as `*_FILE`). Needed to create a role; given for an existing role, its password is changed. `docker-compose.production.yml` also builds each service's `DATABASE_URL` from them, so they must be URL-safe |
 | `CSRF_SECRET` | Prod | Signs CSRF tokens and keys the experiment-manifest HMACs; every API process must share it. Outside production each process makes up its own |
 | `REFRESH_TOKEN_SECRET` | Prod | Required by the production startup check |
 | `JWT_PRIVATE_KEY` | Prod | RS256 private key (PEM, `\n`-escaped) |
@@ -917,7 +917,7 @@ PostgreSQL 16 or newer is the only supported database; any other `DATABASE_URL` 
 
 ### Database roles
 
-Connected as the superuser that the `postgres` image creates from `POSTGRES_USER`, the application bypasses every grant, row-level security policy and trigger, and any SQL it runs can drop the schema, read server files or run programs on the database host (`COPY ... TO PROGRAM`). [`backend/db_roles.py`](backend/db_roles.py) defines six roles instead:
+Connected as the superuser that the `postgres` image creates from `POSTGRES_USER`, the application bypasses every grant, row-level security policy and trigger, and any SQL it runs can drop the schema, read server files or run programs on the database host (`COPY ... TO PROGRAM`). [`backend/db_roles.py`](backend/db_roles.py) defines seven roles instead:
 
 | Role | Login | Privileges |
 |---|---|---|
@@ -926,13 +926,16 @@ Connected as the superuser that the `postgres` image creates from `POSTGRES_USER
 | `qs_app` | Yes | The API (and the research worker it embeds, outside Docker production): exactly the table privileges in `APP_TABLE_PRIVILEGES` (`SELECT` only on `alembic_version`). No DDL or `TRUNCATE`; it cannot change roles, ownership or triggers |
 | `qs_research_worker` | Yes | A research worker run as its own service: exactly `WORKER_TABLE_PRIVILEGES`. That covers the job queue, research results, the server signing key, backtest history (insert only) and the audit trail (read and append only). It has nothing on users, accounts, orders, positions, API keys, user keys, refresh tokens or webhooks |
 | `qs_evaluator` | Yes | The research evaluator, which grades strategies on their sealed holdout: exactly `EVALUATOR_TABLE_PRIVILEGES`. It reads and updates jobs (to claim and finish its own) but cannot queue or delete one, registers its heartbeat and the server signing key, and reads and appends to the audit trail. It reads what it grades: the verdict and its manifest, the evaluation, the strategy version and the holdout start. It is the only role that writes `holdout_attempts` and `holdout_evaluations`. It reaches no user, account, order or key table, and writes no strategy, dataset, trial or verdict |
+| `qs_ai_worker` | Yes | The AI tier (see [AI tier](#ai-tier)): exactly `AI_WORKER_TABLE_PRIVILEGES` in the AI schema, and no privilege at all on the application schema, not even `USAGE`. It reads the feature flags, claims, finishes and purges AI jobs but cannot queue one, and keeps its own heartbeat. It reaches no job queue, worker registry, audit trail, key, user or trading table of the trusted tier. Its role carries a connection limit of 8 and its statement (30 s), lock (10 s) and idle-in-transaction (60 s) timeouts |
 | `qs_backup` | Yes | `pg_read_all_data`, for `pg_dump` |
+
+The AI tier's tables live in a schema of their own, `ai`, beside `public`, also owned by `qs_owner`. Only `qs_app` and `qs_ai_worker` hold `USAGE` on it; `qs_app` holds `APP_AI_TABLE_PRIVILEGES` there: it sets flags and queues AI jobs, and never claims or finishes one. No login role may run a routine of either schema.
 
 The privilege maps are allow-lists. A table `APP_TABLE_PRIVILEGES` does not name gets no privilege, and the test suite fails until the table is listed; a table `WORKER_TABLE_PRIVILEGES` or `EVALUATOR_TABLE_PRIVILEGES` does not name is out of that role's reach. Tests run every kind of research job through a worker connected as `qs_research_worker`, and a holdout grade through an evaluator connected as `qs_evaluator`, and check that every other table and every privileged statement is refused to each. Grants are reapplied after every migration that changes the schema revision.
 
 To move a deployment over:
 
-1. As the superuser (`DATABASE_URL` naming it), with `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_EVALUATOR_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` set, run `python -m backend.manage provision-roles`. It migrates the schema to the latest revision first, then creates the roles and hands them the schema in one transaction. Only SCRAM verifiers reach the server, so no password appears in its logs. It can run while the application serves requests. Changing a table's owner needs the table's exclusive lock, and taking those one at a time deadlocked with order traffic in a rehearsal (provisioning held `positions` and waited for `users`, while an order held `users` and waited for `positions`). So the command takes every lock it needs in one `LOCK ... NOWAIT`. If any table is in use, it lets go of everything and tries again moments later; queries wait at most a moment. If the tables stay busy for 10 s, it exits 1 without changing anything. It is safe to run again, and a second run takes no table locks.
+1. As the superuser (`DATABASE_URL` naming it), with `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_EVALUATOR_PASSWORD`, `DB_AI_WORKER_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` set, run `python -m backend.manage provision-roles`. It migrates the schema to the latest revision first, then creates the roles and hands them both schemas in one transaction. Only SCRAM verifiers reach the server, so no password appears in its logs. It can run while the application serves requests. Changing a table's owner needs the table's exclusive lock, and taking those one at a time deadlocked with order traffic in a rehearsal (provisioning held `positions` and waited for `users`, while an order held `users` and waited for `positions`). So the command takes every lock it needs in one `LOCK ... NOWAIT`. If any table is in use, it lets go of everything and tries again moments later; queries wait at most a moment. If the tables stay busy for 10 s, it exits 1 without changing anything. It is safe to run again, and a second run takes no table locks.
 2. Point `DATABASE_URL` for the API and workers at `qs_app`. With `DB_MIGRATE_ON_STARTUP=true` they start normally while the schema is current, and refuse to start if a migration is pending.
 3. Run each release's migrations as `qs_migrator`: `DATABASE_URL=<qs_migrator URL> python -m backend.manage migrate`.
 4. Take backups as `qs_backup`: `pg_dump -U qs_backup`. A dump made this way records `qs_owner` as the owner of everything; create the roles before restoring it, or restore with `--no-owner`. A dump holds only dataset metadata, so back up the blobs under `DATASET_ROOT` too, after each dump (see [Backups](#backups)).
@@ -951,7 +954,7 @@ Running `provision-roles` again restores the intended role attributes, membershi
 - Only `postgres` and `provision` receive the superuser's password. Every service that loads `.env.production` blanks every database password variable, so that file cannot leak one into the API or the worker.
 - `postgres`, `redis` and the research evaluator are only on the `data` network, which has no route out. So the database cannot reach the internet, and nginx (only on `edge`) cannot reach the database. The API and the research worker join both networks, because they need the internet for market data.
 
-To move an existing Docker deployment over, add `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_EVALUATOR_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` to `.env.production`, then run, in this order:
+To move an existing Docker deployment over, add `DB_APP_PASSWORD`, `DB_RESEARCH_WORKER_PASSWORD`, `DB_EVALUATOR_PASSWORD`, `DB_AI_WORKER_PASSWORD`, `DB_MIGRATOR_PASSWORD` and `DB_BACKUP_PASSWORD` to `.env.production`, then run, in this order:
 
 ```bash
 docker compose -f docker-compose.production.yml --env-file .env.production --profile provision run --rm provision
@@ -966,6 +969,8 @@ Upgrading also applies migration `0011`, which adds the append-only holdout tabl
 
 The same holds for `qs_evaluator`: a deployment provisioned before it existed adds `DB_EVALUATOR_PASSWORD` to `.env.production` and runs the same two commands, `provision` first. Until then Compose refuses to start, or, with the variable set but before `provision`, the `research-evaluator` service retries its login every 2 s; holdout grades wait in the queue meanwhile, and no other job does. Upgrading also applies migration `0010`, which records each worker's role in `research_workers`, so a job's status counts only the workers that can run it.
 
+Upgrading to migration `0012` (the AI tier) takes the same two commands, `provision` first, after `DB_AI_WORKER_PASSWORD` is added to `.env.production`. `qs_owner` may not create schemas, so `provision` (as the superuser) creates the `ai` schema and `qs_ai_worker`; `migrate` then fills the schema as `qs_owner`. Without the variable Compose refuses to start. Run `up` before `provision` and `migrate` stops with `schema ai does not exist and qs_owner may not create it: run python -m backend.manage provision-roles ...`, so the new API never starts; running `provision` and then `up` restores it.
+
 The CI job `deploy-compose` checks this end to end on every push. It deploys the stack with Docker and writes data as the superuser. It then provisions while the API runs and brings the stack up again. It checks eight things:
 
 - only `qs_app`, `qs_research_worker` and `qs_evaluator` sessions reach the database, and none of the API, the worker, the evaluator and `migrate` holds the superuser password;
@@ -978,6 +983,30 @@ The CI job `deploy-compose` checks this end to end on every push. It deploys the
 - the API, the worker and the evaluator restart as their own roles.
 
 It also deploys a fresh install the same way (`provision`, then `up`), starting the `backup` service before the worker, and checks that the worker can still store a blob.
+
+### AI tier
+
+The AI tier ([`backend/ai`](backend/ai)) is where Research Intelligence work that handles untrusted input will run, such as fetching paper metadata from the internet. This release adds its skeleton: its own database role and schema, feature flags, a job queue, a worker and a self-test job. It holds the trusted tier at arm's length:
+
+- **Its own role and schema.** The AI worker connects as `qs_ai_worker` (`AI_DATABASE_URL`), which has no privilege on the application schema (see [Database roles](#database-roles)). Its tables, `flags`, `jobs` and `workers`, are in the `ai` schema.
+- **No trusted code.** No module of `backend.ai` imports anything else of `backend`; a test follows every import statement to check it, and another loads every module in a fresh interpreter. `backend/config.py`, which loads the API's keys, refuses to load under `QS_PROCESS_ROLE=ai-worker` or `ai-job`, so an accidental import fails at once.
+- **No trusted secret.** In production the worker refuses to start if it is given `DATABASE_URL`, any database password but its own, a signing or encryption key, the CSRF or refresh-token secret, or Redis's URL or password, or the `*_FILE` form of any of them.
+- **Job processes.** The worker runs each job in a fresh interpreter (`python -E -s`) with `QS_PROCESS_ROLE=ai-job`, none of the worker's file descriptors and an allow-listed environment: paths, locale, proxies, CA bundles and `ENVIRONMENT`, and no database URL or password. On Linux it is also limited in memory (`AI_JOB_MEMORY_BYTES`, default 1 GiB), CPU time, open files and core dumps. It runs only the targets listed in [`backend/ai/kinds.py`](backend/ai/kinds.py), and a job that runs past its kind's timeout is killed and fails.
+- **Feature flags, off by default.** A stage runs only while the master flag `research_intelligence` and its own flag are both on; a flag that was never set is off. The flags are checked when a job is queued, inside the worker's claim query and every `AI_WORKER_HEARTBEAT_SECONDS` while a job runs. Switching a stage off stops its running jobs and hands them back to the queue, uncounted, and switching it on lets the next poll claim them; nothing restarts.
+
+Operator commands, each audited (`AI_FLAG_SET`, `AI_JOB_QUEUED`):
+
+```bash
+python -m backend.manage flags                                   # every flag, its state and who set it
+python -m backend.manage set-flag research_intelligence on --by <who> --reason <why>
+python -m backend.manage set-flag selftest on --by <who> --reason <why>
+python -m backend.manage ai-selftest --by <who> [--hold <seconds>]   # prints the job id
+python -m backend.manage ai-job <job id>                         # its state and result
+```
+
+The self-test job reports what an AI job process runs with: the names (never the values) of its environment variables, its process role, any module of the trusted tier it imported (there must be none) and its resource limits. `--hold` keeps it running for up to 30 s, so that switching `selftest` off can be seen to stop it.
+
+Run the worker with `QS_PROCESS_ROLE=ai-worker AI_DATABASE_URL=postgresql://qs_ai_worker:<password>@<host>:5432/<db> python -m backend.ai.worker`. Its other settings: `AI_DB_SCHEMA` (default `ai`), `AI_WORKER_POLL_SECONDS` (2), `AI_WORKER_HEARTBEAT_SECONDS` (5), `AI_JOB_LEASE_SECONDS` (60, more than twice the heartbeat; a job whose worker stops renewing it is reaped after this), `AI_JOB_RESULT_MAX_BYTES` (1 MiB) and `AI_JOB_RETENTION_DAYS` (7). Each may also be given as a file named by `<NAME>_FILE`. The Docker service for the worker, with its outbound proxy, arrives in a later release; `pg_dump` as `qs_backup` already includes the `ai` schema.
 
 ### Backups
 

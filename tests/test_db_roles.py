@@ -119,26 +119,62 @@ def assert_exactly_provisioned(c: Cluster) -> None:
     assert table_privileges(su, c.schema, roles.evaluator) == {
         name: set(db_roles.EVALUATOR_TABLE_PRIVILEGES.get(name, ())) for name in tables}
     assert table_privileges(su, c.schema, roles.backup) == {name: {"SELECT"} for name in tables}
-    for role in (roles.migrator, "public"):
+    for role in (roles.migrator, roles.ai_worker, "public"):
         assert table_privileges(su, c.schema, role) == {name: set() for name in tables}, role
-    schema_privileges = {role: tuple(su.execute(
-        "SELECT has_schema_privilege(%s, %s, 'USAGE'), has_schema_privilege(%s, %s, 'CREATE')",
-        (role, c.schema, role, c.schema)).fetchone()) for role in (*roles.logins, "public")}
-    assert schema_privileges == {roles.migrator: (True, False), roles.app: (True, False),
-                                 roles.research_worker: (True, False), roles.evaluator: (True, False),
-                                 roles.backup: (True, False), "public": (False, False)}
-    assert su.execute(
-        "SELECT count(*) FROM pg_class c WHERE c.relnamespace = %s::regnamespace"
-        " AND c.relowner <> %s::regrole", (c.schema, roles.owner)).fetchone()[0] == 0
-    assert su.execute("SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = %s",
-                      (c.schema,)).fetchone()[0] == roles.owner
+    ai = db_roles.ai_schema_for(c.schema)
+    ai_tables = [name for (name,) in su.execute(_RELATIONS, (ai,))]
+    assert set(ai_tables) == set(db_roles.AI_WORKER_TABLE_PRIVILEGES) == set(db_roles.APP_AI_TABLE_PRIVILEGES)
+    assert table_privileges(su, ai, roles.app) == {
+        name: set(privileges) for name, privileges in db_roles.APP_AI_TABLE_PRIVILEGES.items()}
+    assert table_privileges(su, ai, roles.ai_worker) == {
+        name: set(privileges) for name, privileges in db_roles.AI_WORKER_TABLE_PRIVILEGES.items()}
+    assert table_privileges(su, ai, roles.backup) == {name: {"SELECT"} for name in ai_tables}
+    for role in (roles.migrator, roles.research_worker, roles.evaluator, "public"):
+        assert table_privileges(su, ai, role) == {name: set() for name in ai_tables}, role
+
+    def schema_privileges(schema):
+        return {role: tuple(su.execute(
+            "SELECT has_schema_privilege(%s, %s, 'USAGE'), has_schema_privilege(%s, %s, 'CREATE')",
+            (role, schema, role, schema)).fetchone()) for role in (*roles.logins, "public")}
+
+    # The backup role's USAGE comes from pg_read_all_data.
+    assert schema_privileges(c.schema) == {
+        roles.migrator: (True, False), roles.app: (True, False), roles.research_worker: (True, False),
+        roles.evaluator: (True, False), roles.ai_worker: (False, False), roles.backup: (True, False),
+        "public": (False, False)}
+    assert schema_privileges(ai) == {
+        roles.migrator: (False, False), roles.app: (True, False), roles.research_worker: (False, False),
+        roles.evaluator: (False, False), roles.ai_worker: (True, False), roles.backup: (True, False),
+        "public": (False, False)}
+    for schema in (c.schema, ai):
+        assert su.execute(
+            "SELECT count(*) FROM pg_class c WHERE c.relnamespace = %s::regnamespace"
+            " AND c.relowner <> %s::regrole", (schema, roles.owner)).fetchone()[0] == 0
+        assert su.execute("SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = %s",
+                          (schema,)).fetchone()[0] == roles.owner
+        # No login role and not PUBLIC may run a routine of either schema.
+        assert su.execute(
+            "SELECT count(*) FROM pg_proc p, unnest(%s::text[]) r WHERE p.pronamespace = %s::regnamespace"
+            " AND has_function_privilege(r, p.oid, 'EXECUTE')",
+            ([*(role for role in roles.logins if role != roles.backup), "public"], schema)).fetchone()[0] == 0
+    assert dict(su.execute(
+        "SELECT r.rolname, r.rolconnlimit FROM pg_roles r WHERE r.rolname = ANY(%s)",
+        ([roles.owner, *roles.logins],)).fetchall()) == {
+            role: db_roles.AI_WORKER_CONNECTION_LIMIT if role == roles.ai_worker else -1
+            for role in (roles.owner, *roles.logins)}
+    settings = su.execute(
+        "SELECT s.setrole::regrole::text, s.setdatabase, s.setconfig FROM pg_db_role_setting s"
+        " WHERE s.setrole::regrole::text = ANY(%s)", ([roles.owner, *roles.logins],)).fetchall()
+    assert [(role, database, sorted(config)) for role, database, config in settings] == [
+        (roles.ai_worker, 0, sorted(f"{k}={v}" for k, v in db_roles.AI_WORKER_SETTINGS.items()))]
     attributes = {row[0]: row[1:] for row in su.execute(
         "SELECT rolname, rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls,"
         " rolcanlogin, rolinherit FROM pg_roles WHERE rolname = ANY(%s)",
         ([roles.owner, *roles.logins],))}
     assert attributes == {roles.owner: (False, False, False), roles.migrator: (False, True, False),
                           roles.app: (False, True, True), roles.research_worker: (False, True, True),
-                          roles.evaluator: (False, True, True), roles.backup: (False, True, True)}
+                          roles.evaluator: (False, True, True), roles.ai_worker: (False, True, True),
+                          roles.backup: (False, True, True)}
     names = [roles.owner, *roles.logins]
     memberships = su.execute(
         "SELECT m.member::regrole::text, m.roleid::regrole::text FROM pg_auth_members m"
@@ -425,6 +461,105 @@ def test_the_evaluator_cannot_reach_beyond_its_jobs(provisioned):
                       *(s.format(app=roles.evaluator, owner=roles.owner) for s in REFUSED)):
         with pytest.raises(errors.InsufficientPrivilege):
             evaluator.execute(statement)
+
+
+def test_the_ai_allow_lists_keep_the_ai_worker_to_its_own_jobs():
+    assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["flags"]) == {"SELECT"}
+    assert "INSERT" not in db_roles.AI_WORKER_TABLE_PRIVILEGES["jobs"]
+    assert set(db_roles.APP_AI_TABLE_PRIVILEGES["jobs"]) == {"SELECT", "INSERT"}
+    assert set(db_roles.APP_AI_TABLE_PRIVILEGES["workers"]) == {"SELECT"}
+    for allowed in (db_roles.AI_WORKER_TABLE_PRIVILEGES, db_roles.APP_AI_TABLE_PRIVILEGES):
+        assert all(p and set(p) <= set(db_roles.TABLE_PRIVILEGES) for p in allowed.values())
+
+
+def test_the_ai_worker_reaches_nothing_of_the_trusted_tier(provisioned):
+    """No USAGE on the application schema: not its job queue, worker
+    registry, audit trail, keys or users, not even by qualified name, and
+    none of its routines. In its own schema it can neither queue a job nor
+    set a flag, and its role carries its timeouts."""
+    roles = provisioned.roles
+    ai_worker = provisioned.connect(roles.ai_worker)
+    main_schema = provisioned.schema
+    for table in sorted(db_roles.APP_TABLE_PRIVILEGES):
+        with pytest.raises(errors.InsufficientPrivilege):
+            ai_worker.execute(f'SELECT 1 FROM "{main_schema}"."{table}" LIMIT 1')
+    for statement in (f"INSERT INTO \"{main_schema}\".research_jobs (id) VALUES ('x')",
+                      f'UPDATE "{main_schema}".research_workers SET pid = 0',
+                      f'DELETE FROM "{main_schema}".audit_logs',
+                      f'CREATE TABLE "{main_schema}".made_by_ai (x int)'):
+        with pytest.raises(errors.InsufficientPrivilege):
+            ai_worker.execute(statement)
+    ai = db_roles.ai_schema_for(main_schema)
+    ai_worker.execute(f'SET search_path = "{ai}"')
+    assert ai_worker.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+    for statement in ("INSERT INTO jobs (id, kind) VALUES ('x', 'ai_selftest')",
+                      "INSERT INTO flags (name, enabled, set_by, reason) VALUES ('selftest', true, 'a', 'b')",
+                      "UPDATE flags SET enabled = true", "DELETE FROM flags", "TRUNCATE jobs",
+                      f'CREATE TABLE "{ai}".made_by_ai (x int)'):
+        with pytest.raises(errors.InsufficientPrivilege):
+            ai_worker.execute(statement)
+    settings = dict(ai_worker.execute(
+        "SELECT name, setting || coalesce(unit, '') FROM pg_settings WHERE name = ANY(%s)",
+        (list(db_roles.AI_WORKER_SETTINGS),)).fetchall())
+    assert settings == {"statement_timeout": "30000ms", "lock_timeout": "10000ms",
+                        "idle_in_transaction_session_timeout": "60000ms"}
+
+
+def test_only_the_app_and_the_ai_worker_reach_the_ai_schema(provisioned):
+    roles = provisioned.roles
+    ai = db_roles.ai_schema_for(provisioned.schema)
+    for role in (roles.research_worker, roles.evaluator, roles.migrator):
+        conn = provisioned.connect(role)
+        for table in sorted(db_roles.AI_WORKER_TABLE_PRIVILEGES):
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute(f'SELECT 1 FROM "{ai}"."{table}" LIMIT 1')
+    app = provisioned.connect(roles.app)
+    for statement in (f"UPDATE \"{ai}\".jobs SET status = 'failed'", f'DELETE FROM "{ai}".jobs',
+                      f'DELETE FROM "{ai}".flags', f"INSERT INTO \"{ai}\".workers (id) VALUES ('x')"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            app.execute(statement)
+
+
+def test_the_ai_worker_runs_its_jobs_as_its_own_role(provisioned, capsys):
+    """An operator, as the app role, switches the selftest stage on and
+    queues a selftest job; the AI worker, connected as qs_ai_worker, claims
+    and runs it in a job process of its own, which imports nothing of the
+    trusted tier. The operator's actions are in the audit trail."""
+    from backend.ai import settings as ai_settings
+    from backend.ai.worker import AiWorker
+
+    roles = provisioned.roles
+    app_sessions = sessionmaker(bind=provisioned.engine_as(roles.app))
+    assert manage._ai_selftest(app_sessions, "ops@example.com", 0) == 1
+    assert "off" in capsys.readouterr().err
+    for flag in ("research_intelligence", "selftest"):
+        assert manage._set_flag(app_sessions, flag, True, "ops@example.com", "role test") == 0
+    capsys.readouterr()
+    assert manage._ai_selftest(app_sessions, "ops@example.com", 0) == 0
+    job_id = capsys.readouterr().out.strip().rsplit(": ", 1)[1]
+    ai = db_roles.ai_schema_for(provisioned.schema)
+    settings = ai_settings.load({
+        "QS_PROCESS_ROLE": "ai-worker",
+        "AI_DATABASE_URL": provisioned.url(roles.ai_worker).render_as_string(hide_password=False),
+        "AI_DB_SCHEMA": ai, "AI_WORKER_HEARTBEAT_SECONDS": "0.5"})
+    runner = AiWorker(settings)
+    runner.connect()
+    try:
+        assert runner.conn.execute("SELECT current_user").fetchone() == (roles.ai_worker,)
+        assert runner.schema_ready()
+        assert runner.run_once() == "succeeded"
+        assert runner.run_once() is None
+    finally:
+        runner.close()
+    assert manage._print_ai_job(app_sessions, job_id) == 0
+    job = json.loads(capsys.readouterr().out)
+    assert job["status"] == "succeeded", job
+    assert job["result"]["trusted_modules"] == []
+    assert job["result"]["process_role"] == "ai-job"
+    with app_sessions() as db:
+        actions = db.execute(text("SELECT action FROM audit_logs ORDER BY created_at, id")).scalars().all()
+        assert actions == ["AI_FLAG_SET", "AI_FLAG_SET", "AI_JOB_QUEUED"]
+        assert db.execute(text(f'SELECT count(*) FROM "{ai}".workers')).scalar() == 1
 
 
 def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(provisioned, tmp_path):
@@ -780,7 +915,8 @@ def test_migrations_run_as_the_owner_and_restore_exact_grants(provisioned, monke
     assert_exactly_provisioned(provisioned)
 
 
-@pytest.mark.parametrize("missing, revision", [("research_worker", "0002"), ("evaluator", "0009")])
+@pytest.mark.parametrize("missing, revision", [("research_worker", "0002"), ("evaluator", "0009"),
+                                               ("ai_worker", "0011")])
 def test_a_schema_provisioned_before_a_role_existed_still_migrates(provisioned, missing, revision):
     """A deployment provisioned before qs_research_worker (or qs_evaluator) was
     added has no such role. The next release's migration still reapplies the
@@ -833,7 +969,15 @@ def test_provisioning_again_repairs_drift(provisioned):
             f'GRANT INSERT ON users TO "{roles.backup}"',
             "GRANT SELECT ON users TO PUBLIC",
             f'GRANT CREATE ON SCHEMA "{provisioned.schema}" TO "{roles.app}", PUBLIC',
-            "ALTER TABLE users OWNER TO CURRENT_USER"):
+            "ALTER TABLE users OWNER TO CURRENT_USER",
+            f'ALTER ROLE "{roles.ai_worker}" CONNECTION LIMIT -1',
+            f'ALTER ROLE "{roles.ai_worker}" RESET statement_timeout',
+            f'ALTER ROLE "{roles.app}" SET statement_timeout = 0',
+            f'GRANT USAGE ON SCHEMA "{provisioned.schema}" TO "{roles.ai_worker}"',
+            f'GRANT SELECT ON "{provisioned.schema}".audit_logs TO "{roles.ai_worker}"',
+            f'GRANT INSERT ON "{provisioned.schema}_ai".jobs TO "{roles.ai_worker}"',
+            f'GRANT USAGE ON SCHEMA "{provisioned.schema}_ai" TO "{roles.research_worker}"',
+            f'ALTER TABLE "{provisioned.schema}_ai".jobs OWNER TO CURRENT_USER'):
         su.execute(statement)
     if su.info.server_version >= 160000:
         su.execute(f'GRANT "{roles.owner}" TO "{roles.migrator}" WITH INHERIT TRUE')
@@ -921,7 +1065,7 @@ def test_provisioning_never_keeps_a_queue_waiting_long_enough_to_look_for_deadlo
 def test_provisioning_gives_up_cleanly_while_a_table_stays_busy(cluster):
     reader = _hold(cluster, "SELECT count(*) FROM trades")
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match='"trades"'):
+    with pytest.raises(RuntimeError, match=r'\.trades"'):
         with cluster.engine.begin() as connection:
             db_roles.provision(connection.connection.driver_connection, cluster.roles, cluster.passwords,
                                lock_wait_ms=800)
@@ -980,7 +1124,8 @@ def test_passwords_reach_the_server_only_as_scram_verifiers(cluster):
 def test_the_provision_roles_command(cluster, monkeypatch, capsys):
     settings = {cluster.roles.migrator: "DB_MIGRATOR_PASSWORD", cluster.roles.app: "DB_APP_PASSWORD",
                 cluster.roles.research_worker: "DB_RESEARCH_WORKER_PASSWORD",
-                cluster.roles.evaluator: "DB_EVALUATOR_PASSWORD", cluster.roles.backup: "DB_BACKUP_PASSWORD"}
+                cluster.roles.evaluator: "DB_EVALUATOR_PASSWORD", cluster.roles.ai_worker: "DB_AI_WORKER_PASSWORD",
+                cluster.roles.backup: "DB_BACKUP_PASSWORD"}
     for role, name in settings.items():
         monkeypatch.setenv(name, cluster.passwords[role])
     assert manage._provision_roles(cluster.engine, cluster.roles) == 0

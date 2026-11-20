@@ -25,8 +25,7 @@ from test_ai_tier import Ai, ai  # noqa: F401 - the ai fixture
 from test_arxiv_sync import PROXY_VARIABLES, fixture_page
 
 FIXTURES = Path(__file__).parent / "fixtures" / "metadata"
-# Not a real key: only its shape matters here.
-TEST_KEY = "test-Key_0123456789"
+TEST_KEY = "test-Key_0123456789"  # gitleaks:allow - a fake key; only its shape matters
 PAGE = fixture_page("arxiv_page1.xml")
 PAPERS = {doc.source_id: doc for doc in PAGE.documents}
 WITH_DOI = {doc.source_id for doc in PAGE.documents if doc.doi}

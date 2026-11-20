@@ -24,6 +24,13 @@ ARXIV_OAI_URL = "https://oaipmh.arxiv.org/oai"
 OPENALEX_URL = "https://api.openalex.org"
 CROSSREF_URL = "https://api.crossref.org"
 _API_KEY = re.compile(r"[A-Za-z0-9_-]{8,128}")
+# The research model (backend/ai/models.py, backend/ai/extract.py). The
+# provider is unset by default, so no extraction runs until one is chosen;
+# ``fake`` is refused in production.
+MODEL_PROVIDERS = ("fake",)
+DEFAULT_MODEL = "claude-opus-5-5"
+MAX_DAILY_TOKENS = 10 ** 9
+_MODEL = re.compile(r"[a-z0-9][a-z0-9.:@_-]{0,127}")
 
 # Settings the AI worker must never be given: the trusted tier's database
 # URL, keys and secrets, and every database password but its own. In
@@ -88,6 +95,12 @@ class Settings:
     # OpenAlex's free API key raises its daily allowance; optional. Kept out
     # of repr() so that no log line can carry it.
     openalex_api_key: str | None = field(default=None, repr=False)
+    model_provider: str | None = None
+    model: str = DEFAULT_MODEL
+    # The most input and output tokens all AI workers together may use in a
+    # UTC day (backend/ai/ledger.py); 0, the default, allows no request.
+    daily_input_tokens: int = 0
+    daily_output_tokens: int = 0
 
 
 def load(environ=None) -> Settings:
@@ -124,6 +137,20 @@ def load(environ=None) -> Settings:
     openalex_api_key = setting("AI_OPENALEX_API_KEY", None, environ)
     if openalex_api_key is not None and not _API_KEY.fullmatch(openalex_api_key):
         raise SettingsError("AI_OPENALEX_API_KEY must be 8 to 128 letters, digits, - or _")
+    model_provider = setting("AI_MODEL_PROVIDER", None, environ)
+    if model_provider is not None and model_provider not in MODEL_PROVIDERS:
+        raise SettingsError(f"AI_MODEL_PROVIDER must be one of {', '.join(MODEL_PROVIDERS)}")
+    if model_provider == "fake" and environment == "production":
+        raise SettingsError("AI_MODEL_PROVIDER=fake is for tests and development, never production")
+    model = setting("AI_MODEL", DEFAULT_MODEL, environ)
+    if not _MODEL.fullmatch(model or ""):
+        raise SettingsError("AI_MODEL must be a model id (lower-case letters, digits and . : @ _ -)")
+    daily = {}
+    for name in ("AI_DAILY_INPUT_TOKENS", "AI_DAILY_OUTPUT_TOKENS"):
+        raw = setting(name, "0", environ)
+        if not re.fullmatch(r"[0-9]{1,10}", raw or "") or int(raw) > MAX_DAILY_TOKENS:
+            raise SettingsError(f"{name} must be a whole number from 0 to {MAX_DAILY_TOKENS}")
+        daily[name] = int(raw)
     heartbeat = _number("AI_WORKER_HEARTBEAT_SECONDS", "5", environ, 0.1)
     lease = _number("AI_JOB_LEASE_SECONDS", "60", environ, 1)
     if lease <= 2 * heartbeat:
@@ -142,4 +169,8 @@ def load(environ=None) -> Settings:
         openalex_url=service_urls["AI_OPENALEX_URL"],
         crossref_url=service_urls["AI_CROSSREF_URL"],
         openalex_api_key=openalex_api_key,
+        model_provider=model_provider,
+        model=model,
+        daily_input_tokens=daily["AI_DAILY_INPUT_TOKENS"],
+        daily_output_tokens=daily["AI_DAILY_OUTPUT_TOKENS"],
     )

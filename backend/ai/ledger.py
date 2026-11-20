@@ -17,6 +17,8 @@ reserve-then-settle:
    * ``release``, only when the request provably never went out (the stage
      was switched off, the worker stopped before sending). A request whose
      fate is unknown is never released.
+   * ``abandon``, when the request's fate is unknown (its job process
+     failed or ran out of time): ``orphaned`` at once, counting in full.
    * ``reclaim_orphans``, run by the worker's reaper: a reservation still
      open while its job is no longer running that attempt with that worker
      (the worker died or lost its lease mid-request) becomes ``orphaned``
@@ -145,6 +147,15 @@ def release(conn: Connection, schema: str, reservation_id: str) -> bool:
     longer open. Runs in the caller's transaction."""
     return conn.execute(sql.SQL(
         "UPDATE {} SET status = 'released', closed_at = now() WHERE id = %s AND status = 'reserved'"
+    ).format(_t(schema, "token_reservations")), (reservation_id,)).rowcount == 1
+
+
+def abandon(conn: Connection, schema: str, reservation_id: str) -> bool:
+    """Close the reservation of a request whose fate is unknown (its job
+    process failed or ran out of time): ``orphaned``, so it counts in full.
+    False if it was no longer open. Runs in the caller's transaction."""
+    return conn.execute(sql.SQL(
+        "UPDATE {} SET status = 'orphaned', closed_at = now() WHERE id = %s AND status = 'reserved'"
     ).format(_t(schema, "token_reservations")), (reservation_id,)).rowcount == 1
 
 

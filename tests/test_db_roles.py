@@ -475,6 +475,8 @@ def test_the_ai_allow_lists_keep_the_ai_worker_to_its_own_jobs():
     assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["sources"]) == {"SELECT", "UPDATE"}
     assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["harvests"]) == {"SELECT", "INSERT", "UPDATE"}
     assert set(db_roles.APP_AI_TABLE_PRIVILEGES["sources"]) == set(db_roles.APP_AI_TABLE_PRIVILEGES["harvests"])         == {"SELECT"}
+    assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["document_metadata"]) == {"SELECT", "INSERT", "UPDATE"}
+    assert set(db_roles.APP_AI_TABLE_PRIVILEGES["document_metadata"]) == {"SELECT"}
     for allowed in (db_roles.AI_WORKER_TABLE_PRIVILEGES, db_roles.APP_AI_TABLE_PRIVILEGES):
         assert all(p and set(p) <= set(db_roles.TABLE_PRIVILEGES) for p in allowed.values())
 
@@ -661,6 +663,63 @@ def test_the_ai_worker_harvests_arxiv_as_its_own_role(provisioned, capsys, monke
         for statement in statements:
             with pytest.raises(errors.InsufficientPrivilege):
                 conn.execute(statement)
+
+def test_the_ai_worker_looks_up_metadata_as_its_own_role(provisioned, capsys, monkeypatch):
+    """The app role queues an OpenAlex lookup (manage ai-metadata-sync); the
+    AI worker, as qs_ai_worker, runs it against a fake OpenAlex and records
+    what it says. The app role only reads the records; neither role may
+    delete one."""
+    from backend.ai import documents
+    from backend.ai import settings as ai_settings
+    from backend.ai.worker import AiWorker
+    from test_arxiv_sync import PROXY_VARIABLES
+    from test_metadata_sync import PAGE, TEST_KEY, FakeServices
+
+    for name in PROXY_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    roles = provisioned.roles
+    ai = db_roles.ai_schema_for(provisioned.schema)
+    ai_worker = provisioned.connect(roles.ai_worker)
+    with ai_worker.transaction():
+        documents.upsert_page(ai_worker, ai, PAGE)
+    app_sessions = sessionmaker(bind=provisioned.engine_as(roles.app))
+    for flag in ("research_intelligence", "metadata_sync"):
+        assert manage._set_flag(app_sessions, flag, True, "ops@example.com", "role test") == 0
+    capsys.readouterr()
+    assert manage._ai_metadata_sync(app_sessions, "openalex", 2, "ops@example.com") == 0
+    job_id = capsys.readouterr().out.strip().rsplit(": ", 1)[1]
+    assert manage._ai_metadata_sync(app_sessions, "openalex", None, "ops@example.com") == 1
+    assert "already queued or running" in capsys.readouterr().err
+    fake = FakeServices()
+    settings = ai_settings.load({
+        "QS_PROCESS_ROLE": "ai-worker", "AI_OPENALEX_URL": f"{fake.base}/openalex",
+        "AI_OPENALEX_API_KEY": TEST_KEY,
+        "AI_DATABASE_URL": provisioned.url(roles.ai_worker).render_as_string(hide_password=False),
+        "AI_DB_SCHEMA": ai, "AI_WORKER_HEARTBEAT_SECONDS": "0.5"})
+    runner = AiWorker(settings)
+    runner.connect()
+    try:
+        assert runner.run_once() == "succeeded"
+    finally:
+        runner.close()
+        fake.close()
+    assert len(fake.requests) == 2 and fake.requests[0]["authorization"] == f"Bearer {TEST_KEY}"
+    app = provisioned.connect(roles.app)
+    status, result, payload = app.execute(f'SELECT status, result, payload FROM "{ai}".jobs WHERE id = %s',
+                                          (job_id,)).fetchone()
+    assert status == "succeeded" and result["found"] == 2 and payload == {"source": "openalex", "max_docs": 2}
+    assert app.execute(f'SELECT count(*) FROM "{ai}".document_metadata WHERE status = %s',
+                       ("found",)).fetchone() == (2,)
+    for conn, statements in (
+        (ai_worker, (f'DELETE FROM "{ai}".document_metadata', f'TRUNCATE "{ai}".document_metadata')),
+        (app, (f'DELETE FROM "{ai}".document_metadata', f'UPDATE "{ai}".document_metadata SET checks = 9',
+               f'INSERT INTO "{ai}".document_metadata (document_id, source, status, reason)'
+               f' SELECT id, \'crossref\', \'refused\', \'x\' FROM "{ai}".documents LIMIT 1')),
+    ):
+        for statement in statements:
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute(statement)
+
 
 def test_the_app_and_the_worker_may_register_datasets_but_never_change_them(provisioned, tmp_path):
     from backend.services import dataset_registry

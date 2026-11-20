@@ -2,7 +2,9 @@
 
 A kind's target is ``module:function`` under backend.ai. The function runs
 in a job process (backend/ai/child.py) with no database connection and no
-secret; it takes a payload and returns JSON. The job process refuses any
+secret but the one its payload may carry (the OpenAlex API key, which only
+the metadata_sync driver hands over and no stored payload holds); it takes
+a payload and returns JSON. The job process refuses any
 target not listed here.
 
 A kind without a driver runs its target once, with the job's payload, and
@@ -43,6 +45,12 @@ KINDS: dict[str, AiKind] = {
     "arxiv_sync": AiKind("arxiv_sync", "backend.ai.oai_fetch:fetch_page", "arxiv_sync",
                          timeout_seconds=6 * 3600, max_attempts=3, driver="backend.ai.harvest:run",
                          child_timeout_seconds=180, child_output_max_bytes=32 * 1024 * 1024),
+    # Looks up the registry's documents at OpenAlex or Crossref
+    # (manage ai-metadata-sync). Each job process makes one lookup and
+    # returns a few fields of the work.
+    "metadata_sync": AiKind("metadata_sync", "backend.ai.metadata_fetch:fetch_work", "metadata_sync",
+                            timeout_seconds=6 * 3600, max_attempts=3, driver="backend.ai.enrich:run",
+                            child_timeout_seconds=60, child_output_max_bytes=64 * 1024),
 }
 TARGETS = frozenset(kind.target for kind in KINDS.values())
 

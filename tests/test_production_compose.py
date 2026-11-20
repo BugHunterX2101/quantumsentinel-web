@@ -208,7 +208,10 @@ def test_the_ai_worker_loads_no_env_file_and_holds_no_trusted_secret(services):
     worker = services["ai-worker"]
     assert "env_file" not in worker
     environment = worker["environment"]
-    assert set(environment) == {"ENVIRONMENT", "QS_PROCESS_ROLE", "AI_DATABASE_URL", "HTTP_PROXY", "HTTPS_PROXY"}
+    assert set(environment) == {"ENVIRONMENT", "QS_PROCESS_ROLE", "AI_DATABASE_URL", "HTTP_PROXY", "HTTPS_PROXY",
+                                "AI_OPENALEX_API_KEY"}
+    # The OpenAlex key is the AI tier's own, optional, and never has a default.
+    assert environment["AI_OPENALEX_API_KEY"] == "${AI_OPENALEX_API_KEY:-}"
     assert environment["QS_PROCESS_ROLE"] == "ai-worker"
     assert environment["HTTP_PROXY"] == environment["HTTPS_PROXY"] == "http://smokescreen:4750"
     assert worker["command"] == ["python", "-m", "backend.ai.worker"]

@@ -200,7 +200,8 @@
   `api.openalex.org` and `api.crossref.org` and refuses every other host,
   and any private, loopback or link-local address (cloud metadata
   included), with 407. It logs every decision. The AI worker loads no env
-  file, so it holds no secret but its own database password.
+  file, so it holds no secret but its own database password and, if the
+  operator sets one, OpenAlex's free API key.
 - Paper metadata from the internet is parsed only in an AI job process,
   and only if it is UTF-8 with no DTD, so no XML entity can be declared or
   expanded. The AI worker checks every field of the job's result again
@@ -216,6 +217,18 @@
   rate slot per source, so the tier never sends arXiv more than one
   request every 3 s, and the requests carry a generic User-Agent with no
   operator detail.
+- The metadata lookups likewise send only requests the AI worker builds,
+  to the OpenAlex or Crossref URL its settings name (fixed in production).
+  The DOI in a URL must match Crossref's DOI pattern and is percent-encoded
+  whole, so it cannot add a path segment, a query or a fragment. The job
+  process follows no redirect and refuses a body over 4 MiB, and the
+  worker checks every field it returns before recording it. The OpenAlex
+  API key, when set, reaches only the job process of an OpenAlex lookup,
+  through its standard input, and leaves it only in an `Authorization`
+  header to OpenAlex (over TLS through smokescreen). It must be 8 to 128
+  letters, digits, `-` or `_`, so it cannot inject a header. It is in no
+  URL, job environment, stored payload, result or log line, and no error
+  message repeats it.
 
 ## CI security pipeline
 

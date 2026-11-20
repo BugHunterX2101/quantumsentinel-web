@@ -1,8 +1,8 @@
 """docker-compose.production.yml: which service holds which database credential.
 
 The API connects as qs_app, research workers as qs_research_worker, the
-research evaluator as qs_evaluator, migrations run as qs_migrator, backups as
-qs_backup; only postgres and the one-off provision service see the bootstrap
+research evaluator as qs_evaluator, the AI worker as qs_ai_worker, migrations
+run as qs_migrator, backups as qs_backup; only postgres and the one-off provision service see the bootstrap
 superuser's password. Services that load the production env file blank every
 database password variable, so the file cannot leak one into them.
 """
@@ -31,8 +31,7 @@ HOLDERS = {
     "DB_APP_PASSWORD": {"quantumsentinel", "provision"},
     "DB_RESEARCH_WORKER_PASSWORD": {"research-worker", "provision"},
     "DB_EVALUATOR_PASSWORD": {"research-evaluator", "provision"},
-    # The AI worker service arrives in R4-2; until then only provisioning uses it.
-    "DB_AI_WORKER_PASSWORD": {"provision"},
+    "DB_AI_WORKER_PASSWORD": {"ai-worker", "provision"},
     "DB_MIGRATOR_PASSWORD": {"migrate", "provision"},
     "DB_BACKUP_PASSWORD": {"backup", "provision"},
 }
@@ -56,6 +55,8 @@ def test_each_service_connects_as_its_own_role(services):
     assert url("research-evaluator").startswith("postgresql+psycopg://qs_evaluator:${DB_EVALUATOR_PASSWORD")
     assert url("migrate").startswith("postgresql+psycopg://qs_migrator:${DB_MIGRATOR_PASSWORD")
     assert url("provision").startswith("postgresql+psycopg://quantumsentinel:${POSTGRES_PASSWORD")
+    assert services["ai-worker"]["environment"]["AI_DATABASE_URL"].startswith(
+        "postgresql://qs_ai_worker:${DB_AI_WORKER_PASSWORD")
     backup = services["backup"]["environment"]
     assert (backup["PGHOST"], backup["PGUSER"], backup["PGDATABASE"]) == ("postgres", "qs_backup", "quantumsentinel")
     assert backup["PGPASSWORD"].startswith("${DB_BACKUP_PASSWORD")
@@ -121,8 +122,9 @@ def test_the_database_has_no_route_out_and_no_route_from_nginx():
     assert compose["networks"]["data"] == {"internal": True}
     # The research evaluator grades on the sealed holdout and needs no market
     # data: nothing it runs can send the holdout anywhere.
-    for name in ("postgres", "redis", "migrate", "provision", "backup", "research-evaluator"):
+    for name in ("redis", "migrate", "provision", "backup", "research-evaluator"):
         assert services[name]["networks"] == ["data"], name
+    assert services["postgres"]["networks"] == ["data", "ai_db"]
     assert services["nginx"]["networks"] == ["edge"]
     for name in ("quantumsentinel", "research-worker"):
         assert services[name]["networks"] == ["data", "edge"], name
@@ -183,6 +185,58 @@ def test_nginx_replaces_a_client_supplied_x_forwarded_for(services):
     for block in re.findall(r"location[^{]*\{([^}]*)\}", code):
         assert "proxy_set_header" not in block, block
 
+def test_the_ai_worker_reaches_only_postgres_and_the_egress_proxy():
+    """ai_db and ai_egress have no route out; smokescreen alone joins ai_out.
+    The AI worker shares no network with redis, the API or nginx."""
+    compose = yaml.safe_load(COMPOSE.read_text())
+    services, networks = compose["services"], compose["networks"]
+    assert networks["ai_db"] == {"internal": True}
+    assert networks["ai_egress"] == {"internal": True}
+    assert services["ai-worker"]["networks"] == ["ai_db", "ai_egress"]
+    assert services["smokescreen"]["networks"] == ["ai_egress", "ai_out"]
+
+    def on(network):
+        return {name for name, service in services.items() if network in service.get("networks", [])}
+    assert on("ai_db") == {"postgres", "ai-worker"}
+    assert on("ai_egress") == {"ai-worker", "smokescreen"}
+    assert on("ai_out") == {"smokescreen"}
+
+
+def test_the_ai_worker_loads_no_env_file_and_holds_no_trusted_secret(services):
+    """backend/ai/settings.py refuses to start in production while it holds a
+    secret of the trusted tier; nothing in the compose file gives it one."""
+    worker = services["ai-worker"]
+    assert "env_file" not in worker
+    environment = worker["environment"]
+    assert set(environment) == {"ENVIRONMENT", "QS_PROCESS_ROLE", "AI_DATABASE_URL", "HTTP_PROXY", "HTTPS_PROXY"}
+    assert environment["QS_PROCESS_ROLE"] == "ai-worker"
+    assert environment["HTTP_PROXY"] == environment["HTTPS_PROXY"] == "http://smokescreen:4750"
+    assert worker["command"] == ["python", "-m", "backend.ai.worker"]
+    assert worker["depends_on"]["smokescreen"] == {"condition": "service_healthy"}
+    assert worker["depends_on"]["migrate"] == {"condition": "service_completed_successfully"}
+    assert worker["read_only"] is True
+
+
+def test_smokescreen_is_pinned_and_allows_only_the_research_hosts():
+    smokescreen = ROOT / "deploy" / "smokescreen"
+    dockerfile = (smokescreen / "Dockerfile").read_text()
+    assert "ARG SMOKESCREEN_COMMIT=609eb8931420453daf5893509be0b25b21bd9edb" in dockerfile
+    assert 'test "$(git -C /src rev-parse HEAD)" = "$SMOKESCREEN_COMMIT"' in dockerfile
+    assert "-mod=vendor" in dockerfile
+    assert re.search(r"^USER smokescreen$", dockerfile, re.MULTILINE)
+    config = yaml.safe_load((smokescreen / "config.yaml").read_text())
+    assert config["acl_file"] == "/etc/smokescreen/acl.yaml"
+    assert config["allow_missing_role"] is True
+    # smokescreen refuses private, loopback and link-local addresses unless
+    # one of these opens a range up.
+    assert not {"allow_ranges", "allow_addresses", "unsafe_allow_private_ranges"} & set(config)
+    acl = yaml.safe_load((smokescreen / "acl.yaml").read_text())
+    assert acl["services"] == []
+    assert acl["default"]["action"] == "enforce"
+    assert acl["default"]["allowed_domains"] == ["oaipmh.arxiv.org", "api.openalex.org", "api.crossref.org"]
+    assert "global_allow_list" not in acl
+    assert not {"mitm_domains", "allowed_external_proxies"} & set(acl["default"])
+
 
 def test_external_research_workers_need_a_worker_service(services):
     """With RESEARCH_WORKER_MODE=external the API starts no worker, so research
@@ -222,9 +276,10 @@ def test_resolved_configuration_confines_each_password(tmp_path):
         held = {password for password, mark in marks.items() if mark in text}
         allowed = {password for password, holders in HOLDERS.items() if name in holders}
         assert held <= allowed, (name, held - allowed)
-        if name in ("research-worker", "research-evaluator"):
+        if name in ("research-worker", "research-evaluator", "ai-worker"):
             assert "apimark" not in text and "markredis" not in text
         if name == "quantumsentinel":  # the env file does reach the services that load it
             assert all(api_marks[secret] in text for secret in API_SECRETS if secret != "REDIS_URL")
         seen.add(name)
-    assert {"quantumsentinel", "research-worker", "research-evaluator", "migrate", "provision", "backup"} <= seen
+    assert {"quantumsentinel", "research-worker", "research-evaluator", "ai-worker", "migrate", "provision",
+            "backup"} <= seen

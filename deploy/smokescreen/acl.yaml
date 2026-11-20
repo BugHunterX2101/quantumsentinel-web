@@ -1,0 +1,16 @@
+# The hosts the AI tier may reach, by the name the client asks for (an IP
+# address never matches). Everything else is refused with 407.
+#   oaipmh.arxiv.org   arXiv's OAI-PMH metadata interface (export.arxiv.org/oai2
+#                      redirects here)
+#   api.openalex.org   OpenAlex
+#   api.crossref.org   Crossref
+version: v1
+services: []
+default:
+  name: ai-worker
+  project: ai-tier
+  action: enforce
+  allowed_domains:
+    - oaipmh.arxiv.org
+    - api.openalex.org
+    - api.crossref.org

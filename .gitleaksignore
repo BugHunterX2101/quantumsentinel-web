@@ -1,0 +1,2 @@
+# The fake OpenAlex test key in the R4-4 commit, before it carried a gitleaks:allow marker.
+49fa337538f109bf0df17afa85d8b666621e93bd:tests/test_metadata_sync.py:generic-api-key:29

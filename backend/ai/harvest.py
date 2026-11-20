@@ -40,8 +40,8 @@ import time
 import psycopg
 from psycopg import sql
 
-from . import child, documents, queue
-from .worker import Interrupted
+from . import child, documents, pacing, queue
+from .worker import Interrupted  # noqa: F401  (raised through pacing.own; tests refer to it here)
 
 log = logging.getLogger("backend.ai.harvest")
 
@@ -60,8 +60,8 @@ COUNTS = ("records", "inserted", "updated", "unchanged", "deletions", "deleted",
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
 
-class SyncError(Exception):
-    """The sync cannot go on; the job fails with this reason."""
+# The sync cannot go on; the job fails with this reason.
+SyncError = pacing.SourceError
 
 
 def check_payload(payload, today: dt.date | None = None) -> tuple[str, dt.date | None, int | None]:
@@ -90,17 +90,7 @@ def check_payload(payload, today: dt.date | None = None) -> tuple[str, dt.date |
     return set_spec, start, max_pages
 
 
-def response_status(out) -> tuple[int, int | None]:
-    """The HTTP status and Retry-After a job process reported; raises SyncError."""
-    if not isinstance(out, dict):
-        raise SyncError("the job process returned no result object")
-    status, retry_after = out.get("http_status"), out.get("retry_after")
-    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
-        raise SyncError("the job process returned no valid HTTP status")
-    if retry_after is not None and (isinstance(retry_after, bool) or not isinstance(retry_after, int)
-                                    or retry_after < 0):
-        retry_after = None
-    return status, retry_after
+response_status = pacing.response_status
 
 
 def _t(schema: str, name: str) -> sql.Composable:
@@ -119,11 +109,7 @@ class _Sync:
     def own(self) -> None:
         """Inside a transaction: lock the job row, or raise Interrupted if
         the job is no longer this worker's."""
-        row = self.conn.execute(sql.SQL(
-            "SELECT 1 FROM {} WHERE id = %s AND worker_id = %s AND status = 'running' FOR UPDATE"
-        ).format(_t(self.schema, "jobs")), (self.job["id"], self.worker.id)).fetchone()
-        if row is None:
-            raise Interrupted("lost (lease lapsed)", release=False)
+        pacing.own(self.conn, self.schema, self.job["id"], self.worker.id)
 
     def open_cursor(self, set_spec: str, start: dt.date | None) -> dict:
         with self.conn.transaction():
@@ -144,25 +130,12 @@ class _Sync:
 
     def take_slot(self) -> float:
         """Take the next request slot; returns the seconds until it."""
-        with self.conn.transaction():
-            row = self.conn.execute(sql.SQL(
-                "UPDATE {} SET next_allowed_at = greatest(next_allowed_at, now())"
-                " + make_interval(secs => min_interval_seconds::float8) WHERE name = %s"
-                " RETURNING extract(epoch FROM next_allowed_at"
-                " - make_interval(secs => min_interval_seconds::float8) - now())::float8"
-            ).format(_t(self.schema, "sources")), (SOURCE,)).fetchone()
-        if row is None:
-            raise SyncError(f"source {SOURCE} is missing from the sources table")
-        return max(0.0, row[0])
+        return pacing.take_slot(self.conn, self.schema, SOURCE)
 
     def push_slot(self, seconds: float = 0) -> None:
         """After an answer: no request before min_interval_seconds (or
         ``seconds``, if longer) from now."""
-        with self.conn.transaction():
-            self.conn.execute(sql.SQL(
-                "UPDATE {} SET next_allowed_at = greatest(next_allowed_at,"
-                " now() + make_interval(secs => greatest(min_interval_seconds::float8, %s))) WHERE name = %s"
-            ).format(_t(self.schema, "sources")), (float(seconds), SOURCE))
+        pacing.push_slot(self.conn, self.schema, SOURCE, seconds)
 
     def save(self, cursor: dict, page_counts: dict | None = None, error: str | None = None) -> None:
         """Inside a transaction: write the cursor (and a page's counts)."""

@@ -14,6 +14,7 @@
     python -m backend.manage flags
     python -m backend.manage ai-selftest --by <who> [--hold <seconds>]
     python -m backend.manage ai-arxiv-sync <SET> --by <who> [--from <YYYY-MM-DD>] [--max-pages <N>]
+    python -m backend.manage ai-metadata-sync <openalex|crossref> --by <who> [--max-docs <N>]
     python -m backend.manage ai-job <AI_JOB_ID>
 
 Roles are granted only here — out of band, by someone with shell access to
@@ -66,8 +67,12 @@ the trusted tier it imported (there must be none). ``ai-arxiv-sync`` queues
 a harvest of one arXiv set's metadata into the document registry
 (backend/ai/harvest.py), from where the last sync of that set stopped;
 ``--from`` gives the first day for a set never harvested before. At most one
-sync is queued or running at a time; schedule it daily. ``ai-job`` prints
-an AI job's state and result.
+sync is queued or running at a time; schedule it daily.
+``ai-metadata-sync`` queues lookups of the registry's documents at OpenAlex
+or Crossref (backend/ai/enrich.py): every document never looked up there,
+changed since, or due for a recheck. At most one is queued or running per
+service; schedule it daily, after the arXiv sync. ``ai-job`` prints an AI
+job's state and result.
 """
 import argparse
 import sys
@@ -127,6 +132,11 @@ def main(argv: list[str] | None = None) -> int:
     arxiv_sync.add_argument("--by", required=True, help="who queues it")
     arxiv_sync.add_argument("--from", dest="start", help="first day, for a set never harvested (YYYY-MM-DD)")
     arxiv_sync.add_argument("--max-pages", type=int, help="stop after this many pages")
+    metadata_sync = commands.add_parser("ai-metadata-sync",
+                                        help="queue lookups of the registry's documents at OpenAlex or Crossref")
+    metadata_sync.add_argument("source", help="openalex or crossref")
+    metadata_sync.add_argument("--by", required=True, help="who queues it")
+    metadata_sync.add_argument("--max-docs", type=int, help="stop after this many documents")
     ai_job = commands.add_parser("ai-job", help="print an AI job's state and result")
     ai_job.add_argument("job")
     args = parser.parse_args(argv)
@@ -168,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ai-arxiv-sync":
         init_db()
         return _ai_arxiv_sync(SessionLocal, args.set, args.start, args.max_pages, args.by)
+    if args.command == "ai-metadata-sync":
+        init_db()
+        return _ai_metadata_sync(SessionLocal, args.source, args.max_docs, args.by)
     if args.command == "ai-job":
         init_db()
         return _print_ai_job(SessionLocal, args.job)
@@ -326,6 +339,33 @@ def _ai_arxiv_sync(session_factory, set_spec: str, start: str | None, max_pages:
         db.commit()
         security_service.write_audit_log(db, None, "AI_JOB_QUEUED", "ai_job", job_id,
                                          {"kind": "arxiv_sync", "queued_by": queued_by.strip()[:320],
+                                          **payload})
+        print(f"AI job queued: {job_id}")
+    return 0
+
+
+def _ai_metadata_sync(session_factory, source: str, max_docs: int | None, queued_by: str) -> int:
+    from .ai import enrich, queue
+    from .services import security_service
+
+    payload = {"source": source}
+    if max_docs is not None:
+        payload["max_docs"] = max_docs
+    try:
+        enrich.check_payload(payload)
+    except ValueError as exc:
+        print(f"ai-metadata-sync: {exc}", file=sys.stderr)
+        return 1
+    with session_factory() as db:
+        conn, schema = _ai_connection(db)
+        try:
+            job_id = queue.enqueue(conn, schema, "metadata_sync", payload, queued_by)
+        except queue.EnqueueError as exc:
+            print(f"ai-metadata-sync: {exc}", file=sys.stderr)
+            return 1
+        db.commit()
+        security_service.write_audit_log(db, None, "AI_JOB_QUEUED", "ai_job", job_id,
+                                         {"kind": "metadata_sync", "queued_by": queued_by.strip()[:320],
                                           **payload})
         print(f"AI job queued: {job_id}")
     return 0

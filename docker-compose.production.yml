@@ -251,6 +251,9 @@ services:
       AI_DATABASE_URL: postgresql://qs_ai_worker:${DB_AI_WORKER_PASSWORD:?Set DB_AI_WORKER_PASSWORD}@postgres:5432/quantumsentinel
       HTTP_PROXY: http://smokescreen:4750
       HTTPS_PROXY: http://smokescreen:4750
+      # Optional: OpenAlex's free API key raises its daily allowance tenfold.
+      # The worker hands it only to the job process of an OpenAlex lookup.
+      AI_OPENALEX_API_KEY: ${AI_OPENALEX_API_KEY:-}
     networks: [ai_db, ai_egress]
     depends_on:
       postgres:

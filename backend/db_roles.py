@@ -214,6 +214,8 @@ AI_WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # the per-set cursors, and never deletes either.
     "sources": ("SELECT", "UPDATE"),
     "harvests": ("SELECT", "INSERT", "UPDATE"),
+    # What OpenAlex and Crossref say of each document (migration 0015).
+    "document_metadata": ("SELECT", "INSERT", "UPDATE"),
 }
 # The application's privileges in the AI schema: ``manage set-flag`` sets the
 # flags; the application enqueues AI jobs and reads their outcome, the
@@ -226,6 +228,7 @@ APP_AI_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "documents": ("SELECT",),
     "sources": ("SELECT",),
     "harvests": ("SELECT",),
+    "document_metadata": ("SELECT",),
 }
 # Set on qs_ai_worker itself, so they hold whatever its client sets.
 AI_WORKER_CONNECTION_LIMIT = 8

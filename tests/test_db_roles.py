@@ -468,6 +468,9 @@ def test_the_ai_allow_lists_keep_the_ai_worker_to_its_own_jobs():
     assert "INSERT" not in db_roles.AI_WORKER_TABLE_PRIVILEGES["jobs"]
     assert set(db_roles.APP_AI_TABLE_PRIVILEGES["jobs"]) == {"SELECT", "INSERT"}
     assert set(db_roles.APP_AI_TABLE_PRIVILEGES["workers"]) == {"SELECT"}
+    # No role deletes a document; only the AI worker writes one.
+    assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["documents"]) == {"SELECT", "INSERT", "UPDATE"}
+    assert set(db_roles.APP_AI_TABLE_PRIVILEGES["documents"]) == {"SELECT"}
     for allowed in (db_roles.AI_WORKER_TABLE_PRIVILEGES, db_roles.APP_AI_TABLE_PRIVILEGES):
         assert all(p and set(p) <= set(db_roles.TABLE_PRIVILEGES) for p in allowed.values())
 
@@ -516,6 +519,43 @@ def test_only_the_app_and_the_ai_worker_reach_the_ai_schema(provisioned):
     app = provisioned.connect(roles.app)
     for statement in (f"UPDATE \"{ai}\".jobs SET status = 'failed'", f'DELETE FROM "{ai}".jobs',
                       f'DELETE FROM "{ai}".flags', f"INSERT INTO \"{ai}\".workers (id) VALUES ('x')"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            app.execute(statement)
+
+
+def test_the_ai_worker_records_documents_and_the_app_only_reads_them(provisioned):
+    """As qs_ai_worker the registry takes a harvested page, and the same page
+    again changes nothing; no role may delete a document, and the app role
+    may read the registry but never write it."""
+    from backend.ai import documents
+
+    roles = provisioned.roles
+    ai = db_roles.ai_schema_for(provisioned.schema)
+    result = {"response_date": "2026-11-20T06:47:36Z", "error": None, "resumption_token": None,
+              "token_expires": None, "records": [{
+                  "identifier": "oai:arXiv.org:2611.00001", "datestamp": "2026-11-02", "sets": ["q-fin:q-fin:TR"],
+                  "deleted": False, "id": "2611.00001", "created": "2026-11-01", "title": "A title",
+                  "abstract": "An abstract.", "categories": "q-fin.TR",
+                  "license": "http://creativecommons.org/licenses/by/4.0/",
+                  "authors": [{"keyname": "Doe", "forenames": "Jane"}], "author_count": 1}]}
+    ai_worker = provisioned.connect(roles.ai_worker)
+    for expected in ({"inserted": 1, "updated": 0}, {"inserted": 0, "updated": 0}):
+        with ai_worker.transaction():
+            outcome = documents.upsert_page(ai_worker, ai, documents.clean_page(result))
+        assert {key: outcome[key] for key in expected} == expected
+    with ai_worker.transaction():
+        outcome = documents.upsert_page(ai_worker, ai, documents.clean_page(
+            {**result, "records": [{"identifier": "oai:arXiv.org:2611.00001", "datestamp": "2026-11-03",
+                                    "deleted": True}]}))
+    assert outcome["deleted"] == 1
+    for statement in (f'DELETE FROM "{ai}".documents', f'TRUNCATE "{ai}".documents'):
+        with pytest.raises(errors.InsufficientPrivilege):
+            ai_worker.execute(statement)
+    app = provisioned.connect(roles.app)
+    assert app.execute(f'SELECT source_id, reuse_class, deleted_at IS NOT NULL FROM "{ai}".documents').fetchall() \
+        == [("2611.00001", "open", True)]
+    for statement in (f"UPDATE \"{ai}\".documents SET title = 'x'", f'DELETE FROM "{ai}".documents',
+                      f"INSERT INTO \"{ai}\".documents (source, source_id) VALUES ('arxiv', '2611.00002')"):
         with pytest.raises(errors.InsufficientPrivilege):
             app.execute(statement)
 

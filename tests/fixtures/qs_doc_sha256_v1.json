@@ -1,0 +1,57 @@
+{
+  "scheme": "qs-doc-sha256-v1",
+  "note": "content_hash = scheme + ':' + sha256(canonical); canonical is the RFC 8785 form of the document's content (backend/ai/documents.py Document.content)",
+  "vectors": [
+    {
+      "content": {
+        "source": "arxiv",
+        "source_id": "2602.16401",
+        "title": "Stackelberg Equilibria in Monopoly Insurance Markets with Probability Weighting",
+        "authors": [
+          "Maria Andraos",
+          "Mario Ghossoub",
+          "Bin Li",
+          "Benxuan Shi"
+        ],
+        "author_count": 4,
+        "abstract": "We study Stackelberg Equilibria (Bowley optima) in a monopolistic centralized sequential-move insurance market, with a profit-maximizing insurer who sets premia using a distortion premium principle, and a single policyholder who seeks to minimize a distortion risk measure. We show that equilibria are characterized as follows: In equilibrium, the optimal indemnity function exhibits a layer-type structure, providing full insurance over any loss layer on which the policyholder is more pessimistic than the insurer's pricing functional about tail losses; and no insurance coverage over loss layers on which the policyholder is less pessimistic than the insurer's pricing functional about tail losses. In equilibrium, the optimal pricing distortion function is determined by the policyholder's degree of risk aversion, whereby prices never exceed the policyholder's marginal willingness to insure tail losses. Moreover, we show that both the insurance coverage and the insurer's expected profit increase with the policyholder's degree of risk aversion. Additionally, and echoing recent work in the literature, we show that equilibrium contracts are Pareto efficient, but they do not induce a welfare gain to the policyholder. Conversely, any Pareto-optimal contract that leaves no welfare gain to the policyholder can be obtained as an equilibrium contract. Finally, we consider a few examples of interest that recover some existing results in the literature as special cases of our analysis.",
+        "categories": [
+          "q-fin.RM",
+          "econ.TH",
+          "q-fin.MF"
+        ],
+        "license_url": "http://creativecommons.org/licenses/by-nc-nd/4.0/",
+        "doi": "10.1017/asb.2026.10106",
+        "journal_ref": null,
+        "created": "2026-05-21",
+        "updated": "2026-06-17"
+      },
+      "canonical": "{\"abstract\":\"We study Stackelberg Equilibria (Bowley optima) in a monopolistic centralized sequential-move insurance market, with a profit-maximizing insurer who sets premia using a distortion premium principle, and a single policyholder who seeks to minimize a distortion risk measure. We show that equilibria are characterized as follows: In equilibrium, the optimal indemnity function exhibits a layer-type structure, providing full insurance over any loss layer on which the policyholder is more pessimistic than the insurer's pricing functional about tail losses; and no insurance coverage over loss layers on which the policyholder is less pessimistic than the insurer's pricing functional about tail losses. In equilibrium, the optimal pricing distortion function is determined by the policyholder's degree of risk aversion, whereby prices never exceed the policyholder's marginal willingness to insure tail losses. Moreover, we show that both the insurance coverage and the insurer's expected profit increase with the policyholder's degree of risk aversion. Additionally, and echoing recent work in the literature, we show that equilibrium contracts are Pareto efficient, but they do not induce a welfare gain to the policyholder. Conversely, any Pareto-optimal contract that leaves no welfare gain to the policyholder can be obtained as an equilibrium contract. Finally, we consider a few examples of interest that recover some existing results in the literature as special cases of our analysis.\",\"author_count\":4,\"authors\":[\"Maria Andraos\",\"Mario Ghossoub\",\"Bin Li\",\"Benxuan Shi\"],\"categories\":[\"q-fin.RM\",\"econ.TH\",\"q-fin.MF\"],\"created\":\"2026-05-21\",\"doi\":\"10.1017/asb.2026.10106\",\"journal_ref\":null,\"license_url\":\"http://creativecommons.org/licenses/by-nc-nd/4.0/\",\"source\":\"arxiv\",\"source_id\":\"2602.16401\",\"title\":\"Stackelberg Equilibria in Monopoly Insurance Markets with Probability Weighting\",\"updated\":\"2026-06-17\"}",
+      "content_hash": "qs-doc-sha256-v1:52ec5a81c128c0c2a6e981882ef617c3f592c6976b67932b7f45819dbff51e7b"
+    },
+    {
+      "content": {
+        "source": "arxiv",
+        "source_id": "math.GT/0309136",
+        "title": "Knötchen in São Paulo and Łódź",
+        "authors": [
+          "José Müller Jr",
+          "Collaboration"
+        ],
+        "author_count": 2,
+        "abstract": "Line one. Line two 𝓐.",
+        "categories": [
+          "math.GT",
+          "cond-mat.stat-mech"
+        ],
+        "license_url": null,
+        "doi": null,
+        "journal_ref": null,
+        "created": "2003-09-08",
+        "updated": null
+      },
+      "canonical": "{\"abstract\":\"Line one. Line two 𝓐.\",\"author_count\":2,\"authors\":[\"José Müller Jr\",\"Collaboration\"],\"categories\":[\"math.GT\",\"cond-mat.stat-mech\"],\"created\":\"2003-09-08\",\"doi\":null,\"journal_ref\":null,\"license_url\":null,\"source\":\"arxiv\",\"source_id\":\"math.GT/0309136\",\"title\":\"Knötchen in São Paulo and Łódź\",\"updated\":null}",
+      "content_hash": "qs-doc-sha256-v1:82eb58eb51a84da792c09a9559a7787bb5e6f19c60380819cfa26936bd6951eb"
+    }
+  ]
+}

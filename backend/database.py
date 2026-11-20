@@ -159,6 +159,9 @@ def migrate(target_engine=None, roles=None) -> str:
                         f"database schema is at revision {current}, expected {head}, and {user} "
                         f"cannot migrate it: run `python -m backend.manage migrate` as {roles.migrator}")
                 return current
+            # The owner role may not create schemas; a superuser creates the
+            # AI schema for it (migration 0012 fills it).
+            db_roles.ensure_ai_schema(driver, roles)
             db_roles.become(driver, roles.owner)
         before = current_revision(connection)
         command.upgrade(_alembic_config(connection), "head")

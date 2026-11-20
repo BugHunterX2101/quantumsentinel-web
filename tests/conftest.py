@@ -62,7 +62,8 @@ def new_schema(prefix: str) -> str:
 
 
 def drop_schema(schema: str) -> None:
-    _admin(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    """Drop ``schema`` and the AI tier's schema beside it (migration 0012)."""
+    _admin(f'DROP SCHEMA IF EXISTS "{schema}", "{schema}_ai" CASCADE')
 
 
 _ensure_database()

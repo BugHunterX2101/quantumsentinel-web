@@ -185,6 +185,14 @@
   result and the audit event, which the research worker can read, carry
   pass or fail only. Each strategy version gets one attempt per holdout
   start, spent before any data is read.
+- The AI tier (`backend/ai`), which will handle untrusted input such as
+  paper metadata, runs as `qs_ai_worker`: a role with no privilege on the
+  application schema, not even `USAGE`, whose tables are in a schema of
+  their own. It imports no trusted module (`backend/config.py` refuses to
+  load under its process roles), refuses the trusted tier's secrets in
+  production, and runs each job in a process with an allow-listed
+  environment and no database connection. Every stage is behind feature
+  flags that start off and are checked while a job runs.
 
 ## CI security pipeline
 

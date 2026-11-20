@@ -91,6 +91,7 @@ settings = {
     "ENVIRONMENT": "production",
     "POSTGRES_PASSWORD": token(), "REDIS_PASSWORD": token(),
     "DB_APP_PASSWORD": token(), "DB_RESEARCH_WORKER_PASSWORD": token(), "DB_EVALUATOR_PASSWORD": token(),
+    "DB_AI_WORKER_PASSWORD": token(),
     "DB_MIGRATOR_PASSWORD": token(), "DB_BACKUP_PASSWORD": token(),
     "REDIS_URL": "redis://:REPLACED_BY_COMPOSE@redis:6379/0",
     "REFRESH_TOKEN_SECRET": token(), "CSRF_SECRET": token(),

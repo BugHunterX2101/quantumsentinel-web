@@ -201,6 +201,13 @@
   and any private, loopback or link-local address (cloud metadata
   included), with 407. It logs every decision. The AI worker loads no env
   file, so it holds no secret but its own database password.
+- Paper metadata from the internet is parsed only in an AI job process,
+  and only if it is UTF-8 with no DTD, so no XML entity can be declared or
+  expanded. The AI worker checks every field of the job's result again
+  (formats, lengths, control and bidirectional characters) before it
+  writes the document registry; a malformed record is dropped, not
+  stored. No role may delete a document, and the application only reads
+  them.
 
 ## CI security pipeline
 

@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" 
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.openarchives.org/OAI/2.0/ http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd">
+    <responseDate>2026-11-20T06:47:21Z</responseDate>
+                <request verb='ListRecords' resumptionToken='verb%3DListRecords%26metadataPrefix%3DarXiv%26from%3D2026-06-17%26until%3D2026-10-31%26set%3Dq-fin%26skip%3D14'>http://oaipmh.arxiv.org/oai</request>
+
+
+    <ListRecords>
+                    <record>
+                <header>
+        <identifier>oai:arXiv.org:2403.00471</identifier>
+        <datestamp>2026-06-17</datestamp>
+            <setSpec>econ:econ:GN</setSpec>
+            <setSpec>q-fin:q-fin:EC</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2403.00471</id>
+        <created>2026-06-16</created>
+            <updated>2026-06-17</updated>
+        <authors>
+                <author>
+                    <keyname>Hänsel</keyname>
+                        <forenames>Matthias</forenames>
+                </author>
+        </authors>
+        <title>How much inflation can fiscal policy create? Separating household heterogeneity and liquidity</title>
+            <categories>econ.GN q-fin.EC</categories>
+            <comments>Number of page: 34 (main text, 83 incl. Appendices). Substantial revision of the previous versions: added an analytically tractable model and refocussed the paper on monetary-fiscal interactions more generally. This involved substantial rewriting. The title was also changed to better convey the content of the article</comments>
+            <license>http://creativecommons.org/licenses/by/4.0/</license>
+            <abstract>A key determinant of monetary-fiscal interactions in Heterogeneous Agent New Keynesian (HANK) models is the liquidity value of public debt and its effect on interest rate dynamics. Yet, while household heterogeneity shapes this channel, it doesn&#39;t pin it down. In both analytically tractable and quantitative 2-asset HANK models, asset market assumptions unrelated to standard micro moments give rise to disparate implications of fiscal policy for inflation, as well as model determinacy and fiscal self-financing. To address this issue, I propose a simple model extension and discipline it with macro-level evidence on the relationship between public debt and treasury returns. This moderates the inflationary impact of public debt dynamics but does not render it negligible. After large fiscal shocks, it can still generate persistently elevated ``last mile&#39;&#39; inflation.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:2501.00826</identifier>
+        <datestamp>2026-06-17</datestamp>
+            <setSpec>q-fin:q-fin:TR</setSpec>
+            <setSpec>cs:cs:AI</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2501.00826</id>
+        <created>2026-06-16</created>
+            <updated>2026-06-17</updated>
+        <authors>
+                <author>
+                    <keyname>Luo</keyname>
+                        <forenames>Yichen</forenames>
+                </author>
+                <author>
+                    <keyname>Feng</keyname>
+                        <forenames>Yebo</forenames>
+                </author>
+                <author>
+                    <keyname>Xu</keyname>
+                        <forenames>Jiahua</forenames>
+                </author>
+                <author>
+                    <keyname>Tasca</keyname>
+                        <forenames>Paolo</forenames>
+                </author>
+                <author>
+                    <keyname>Liu</keyname>
+                        <forenames>Yang</forenames>
+                </author>
+        </authors>
+        <title>LLM-Powered Multi-Agent System for Automated Crypto Portfolio Management</title>
+            <categories>q-fin.TR cs.AI</categories>
+            <license>http://arxiv.org/licenses/nonexclusive-distrib/1.0/</license>
+            <abstract>Cryptocurrency portfolio management requires the fusion of heterogeneous multi-modal signals, including structured price and on-chain time series, unstructured news text, and technical indicators, under high-volatility and real-time constraints. While deep learning approaches show predictive capability, their opacity limits practical adoption, and single large language model (LLM) agents struggle to process the breadth of modality-specific inputs needed for robust decision-making. We propose a multi-agent system (MAS) framework in which three modality-specialised agents, a Crypto Agent for market dynamics, a News Agent for weekly news sentiment, and a Trading Agent for signal fusion and portfolio execution, decompose the task across three communication architectures: hierarchical, collaborative, and debate. We evaluate four capability configurations: zero-shot, chain-of-thought (CoT), retrieval-augmented generation (RAG), and skill-augmented. In a 52-week backtest over calendar year 2025 across the top 15 L1 blockchain native cryptocurrencies by market capitalisation as of January 2025, the best configuration, Hierarchical (Skill), achieves a cumulative return of 133.52% and a Sharpe ratio of 1.502, outperforming single-agent variants, passive benchmarks, and deep learning baselines. An ablation study identifies the Crypto Agent as the most critical component, with its removal reducing cumulative return by 42.57 percentage points. A cross-model comparison further shows that MAS outperforms the single-agent baseline under GPT-4o, GPT-5, and Claude Sonnet 4.5, suggesting that the benefit of multi-agent coordination is model-agnostic. Unlike black-box deep learning models, every portfolio decision is traceable to explicit agent reasoning, offering an interpretable and effective approach to multi-modal cryptocurrency portfolio management.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:2602.16401</identifier>
+        <datestamp>2026-06-17</datestamp>
+            <setSpec>q-fin:q-fin:RM</setSpec>
+            <setSpec>econ:econ:TH</setSpec>
+            <setSpec>q-fin:q-fin:MF</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2602.16401</id>
+        <created>2026-05-21</created>
+            <updated>2026-06-17</updated>
+        <authors>
+                <author>
+                    <keyname>Andraos</keyname>
+                        <forenames>Maria</forenames>
+                </author>
+                <author>
+                    <keyname>Ghossoub</keyname>
+                        <forenames>Mario</forenames>
+                </author>
+                <author>
+                    <keyname>Li</keyname>
+                        <forenames>Bin</forenames>
+                </author>
+                <author>
+                    <keyname>Shi</keyname>
+                        <forenames>Benxuan</forenames>
+                </author>
+        </authors>
+        <title>Stackelberg Equilibria in Monopoly Insurance Markets with Probability Weighting</title>
+            <categories>q-fin.RM econ.TH q-fin.MF</categories>
+            <doi>10.1017/asb.2026.10106</doi>
+            <license>http://creativecommons.org/licenses/by-nc-nd/4.0/</license>
+            <abstract>We study Stackelberg Equilibria (Bowley optima) in a monopolistic centralized sequential-move insurance market, with a profit-maximizing insurer who sets premia using a distortion premium principle, and a single policyholder who seeks to minimize a distortion risk measure. We show that equilibria are characterized as follows: In equilibrium, the optimal indemnity function exhibits a layer-type structure, providing full insurance over any loss layer on which the policyholder is more pessimistic than the insurer&#39;s pricing functional about tail losses; and no insurance coverage over loss layers on which the policyholder is less pessimistic than the insurer&#39;s pricing functional about tail losses. In equilibrium, the optimal pricing distortion function is determined by the policyholder&#39;s degree of risk aversion, whereby prices never exceed the policyholder&#39;s marginal willingness to insure tail losses. Moreover, we show that both the insurance coverage and the insurer&#39;s expected profit increase with the policyholder&#39;s degree of risk aversion. Additionally, and echoing recent work in the literature, we show that equilibrium contracts are Pareto efficient, but they do not induce a welfare gain to the policyholder. Conversely, any Pareto-optimal contract that leaves no welfare gain to the policyholder can be obtained as an equilibrium contract. Finally, we consider a few examples of interest that recover some existing results in the literature as special cases of our analysis.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+
+                    <resumptionToken expirationDate='2026-11-21T00:00:00Z'>verb%3DListRecords%26metadataPrefix%3DarXiv%26from%3D2026-09-15%26until%3D2026-10-31%26set%3Dq-fin%26skip%3D32</resumptionToken>
+
+    </ListRecords>
+</OAI-PMH>

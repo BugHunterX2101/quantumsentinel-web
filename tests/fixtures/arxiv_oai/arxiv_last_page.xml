@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" 
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.openarchives.org/OAI/2.0/ http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd">
+    <responseDate>2026-11-20T06:47:36Z</responseDate>
+                <request verb="ListRecords" metadataPrefix="arXiv" from="2026-11-01" set="q-fin:q-fin:TR">http://oaipmh.arxiv.org/oai</request>
+
+
+    <ListRecords>
+                    <record>
+                <header>
+        <identifier>oai:arXiv.org:2610.33400</identifier>
+        <datestamp>2026-11-02</datestamp>
+            <setSpec>q-fin:q-fin:TR</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2610.33400</id>
+        <created>2026-10-30</created>
+            <updated>2026-11-02</updated>
+        <authors>
+                <author>
+                    <keyname>Guo</keyname>
+                        <forenames>Li</forenames>
+                </author>
+                <author>
+                    <keyname>Li</keyname>
+                        <forenames>Frank Weikai</forenames>
+                </author>
+                <author>
+                    <keyname>Qi</keyname>
+                        <forenames>Ding</forenames>
+                </author>
+                <author>
+                    <keyname>Sun</keyname>
+                        <forenames>Lijian</forenames>
+                </author>
+        </authors>
+        <title>Tracking High-Frequency Trading Activity in China and Its Effects on Market Quality</title>
+            <categories>q-fin.TR</categories>
+            <license>http://arxiv.org/licenses/nonexclusive-distrib/1.0/</license>
+            <abstract>We develop a new order-level proxy for high-frequency trading (HFT) activity based on precise order placement and study its effects on market quality. With quotes updating multiple times per second, millisecond-level order-book access makes high-frequency traders more likely to submit active exact-match orders, defined as limit orders priced exactly at the prevailing best opposite-side quote. Using Shenzhen Stock Exchange data, we validate the proxy: active exact-match orders respond faster to quote updates, cancel more rapidly, concentrate when depth imbalance is favorable and spreads are narrow, and predict mid-quote returns from 100 milliseconds through ten minutes. A difference-in-differences design exploiting cross-channel variation in order dissemination latency at the market open shows that lower latency increases active exact-match shares. This variation yields plausibly causal evidence that latency-induced HFT raises short-horizon price variation, wide-spread incidence, and adverse-selection exposure, while realized spreads decline and pricing error falls modestly. Unlike developed markets, China&#39;s T+1 constraint, absence of maker-taker rebates, and limits on rapid quote revision tilt speed advantages toward directional liquidity taking, highlighting how market design shapes the channel through which speed affects market quality.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:2606.04574</identifier>
+        <datestamp>2026-11-03</datestamp>
+            <setSpec>cs:cs:LG</setSpec>
+            <setSpec>cs:cs:NE</setSpec>
+            <setSpec>q-fin:q-fin:ST</setSpec>
+            <setSpec>q-fin:q-fin:TR</setSpec>
+            <setSpec>stat:stat:ML</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2606.04574</id>
+        <created>2026-10-31</created>
+            <updated>2026-11-03</updated>
+        <authors>
+                <author>
+                    <keyname>Lebiedź</keyname>
+                        <forenames>Damian</forenames>
+                </author>
+                <author>
+                    <keyname>Ślepaczuk</keyname>
+                        <forenames>Robert</forenames>
+                </author>
+        </authors>
+        <title>Dynamic Multi-Pair Trading Strategy in Cryptocurrency Markets with Deep Reinforcement Learning</title>
+            <categories>cs.LG cs.NE q-fin.ST q-fin.TR stat.ML</categories>
+            <comments>61 pages, 37 figures, 16 tables</comments>
+            <license>http://creativecommons.org/licenses/by-nc-nd/4.0/</license>
+            <abstract>This study aims to determine whether the application of Deep Reinforcement Learning (DRL) as a specialized execution overlay can enhance pair trading in highly volatile cryptocurrency markets. Although classical implementations of the strategy have proven successful in traditional equities, they frequently exhibit rigidity and suffer from severe divergence risks when applied to high-variance environments. To construct a robust system, we developed a hierarchical &#34;Filter-then-Rank&#34; pair selection methodology and a custom &#34;Fixed Risk, Adaptive Mean&#34; execution model. The system employs a Proximal Policy Optimization (PPO) agent with a Long Short-Term Memory (LSTM) layer to govern execution decisions within strict deterministic risk management boundaries. Evaluated on 1-hour interval data from the Binance USD-M Futures market, the selected RL policy achieved an Out-Of-Sample performance that substantially outperformed the heuristic baseline, although the results varied considerably across five random seeds, with four of the five seeds exceeding the baseline in both CAGR and Sortino Ratio. A stationary circular block bootstrap test of the Agent&#39;s risk-adjusted outperformance yields p-values of approximately 0.06, which fall just short of the conventional 5% significance threshold. Ultimately, this study contributes to the quantitative finance literature by introducing a hybrid architecture that combines statistical arbitrage with DRL execution policies. Furthermore, it applies safe reinforcement learning via deterministic shielding, with results indicating that anchoring a neural policy to statistically robust boundaries mitigates severe divergence risks.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:2606.25986</identifier>
+        <datestamp>2026-11-03</datestamp>
+            <setSpec>cs:cs:LG</setSpec>
+            <setSpec>q-fin:q-fin:ST</setSpec>
+            <setSpec>q-fin:q-fin:TR</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2606.25986</id>
+        <created>2026-11-02</created>
+            <updated>2026-11-03</updated>
+        <authors>
+                <author>
+                    <keyname>Hedges</keyname>
+                        <forenames>C. Evans</forenames>
+                </author>
+        </authors>
+        <title>The Inference-Compute Frontier for Limit Order Book Prediction</title>
+            <categories>cs.LG q-fin.ST q-fin.TR</categories>
+            <license>http://creativecommons.org/publicdomain/zero/1.0/</license>
+            <abstract>We identify an empirical inference-compute frontier for limit order book prediction on FI-2010. A power law fitted to low- and mid-compute models extrapolates to an excluded MLPLOB-style mixer family whose work is $56$--$2{,}515$ times the largest budget in the corresponding fit. Across nine folds and five horizons, pooled $R^2$ is $0.934$ on the realized target frontier, with 59\% lower RMSE than constant endpoint extrapolation, and $0.731$ on all excluded operating points. Measured latency gives a weaker relationship and reorders model families. We therefore design FastBiNLOB to pack computation into dense temporal and feature mixing. H120 exceeds the published state-of-the-art macro-F1 on two of four horizons in every one of five seeds. Under our CPU/MPS protocol, H96 reduces median latency by 23.6\% relative to the W128 MLPLOB reference, and H120 by 60.2\% relative to a TLOB-inspired dual-axis attention reference.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+
+    </ListRecords>
+</OAI-PMH>

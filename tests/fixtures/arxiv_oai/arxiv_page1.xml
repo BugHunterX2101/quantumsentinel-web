@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" 
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://www.openarchives.org/OAI/2.0/ http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd">
+    <responseDate>2026-11-20T06:47:13Z</responseDate>
+                <request verb="ListRecords" metadataPrefix="arXiv" from="2026-06-17" until="2026-10-31" set="q-fin">http://oaipmh.arxiv.org/oai</request>
+
+
+    <ListRecords>
+                    <record>
+                <header>
+        <identifier>oai:arXiv.org:0709.4467</identifier>
+        <datestamp>2026-06-03</datestamp>
+            <setSpec>q-fin:q-fin:PM</setSpec>
+            <setSpec>cs:cs:NA</setSpec>
+            <setSpec>math:math:NA</setSpec>
+            <setSpec>math:math:OC</setSpec>
+            <setSpec>math:math:PR</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>0709.4467</id>
+        <created>2007-09-27</created>
+            <updated>2026-06-03</updated>
+        <authors>
+                <author>
+                    <keyname>Jin</keyname>
+                        <forenames>Hanqing</forenames>
+                </author>
+                <author>
+                    <keyname>Xu</keyname>
+                        <forenames>Zuo Quan</forenames>
+                </author>
+                <author>
+                    <keyname>Zhou</keyname>
+                        <forenames>Xun Yu</forenames>
+                </author>
+        </authors>
+        <title>A Convex Stochastic Optimization Problem Arising from Portfolio Selection</title>
+            <categories>q-fin.PM cs.NA math.NA math.OC math.PR</categories>
+            <comments>15 pages</comments>
+            <msc-class>49K20</msc-class>
+            <journal-ref>Mathematical Finance, Vol. 18, No. 1 (January 2008), 171-183</journal-ref>
+            <doi>10.1111/j.1467-9965.2007.00327.x</doi>
+            <abstract>  A continuous-time financial portfolio selection model with expected utility maximization typically boils down to solving a (static) convex stochastic optimization problem in terms of the terminal wealth, with a budget constraint. In literature the latter is solved by assuming {\it a priori} that the problem is well-posed (i.e., the supremum value is finite) and a Lagrange multiplier exists (and as a consequence the optimal solution is attainable). In this paper it is first shown, via various counter-examples, neither of these two assumptions needs to hold, and an optimal solution does not necessarily exist. These anomalies in turn have important interpretations in and impacts on the portfolio selection modeling and solutions. Relations among the non-existence of the Lagrange multiplier, the ill-posedness of the problem, and the non-attainability of an optimal solution are then investigated. Finally, explicit and easily verifiable conditions are derived which lead to finding the unique optimal solution.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:1602.06855</identifier>
+        <datestamp>2026-06-04</datestamp>
+            <setSpec>econ:econ:GN</setSpec>
+            <setSpec>q-fin:q-fin:EC</setSpec>
+            <setSpec>physics:nlin:AO</setSpec>
+            <setSpec>physics:physics:data-an</setSpec>
+            <setSpec>physics:physics:soc-ph</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>1602.06855</id>
+        <created>2016-03-09</created>
+            <updated>2026-06-04</updated>
+        <authors>
+                <author>
+                    <keyname>Soares</keyname>
+                        <forenames>Abner D.</forenames>
+                </author>
+                <author>
+                    <keyname>Moura</keyname>
+                        <forenames>Newton J.</forenames>
+                        <suffix>Jr.</suffix>
+                </author>
+                <author>
+                    <keyname>Ribeiro</keyname>
+                        <forenames>Marcelo B.</forenames>
+                </author>
+        </authors>
+        <title>Tsallis statistics in the income distribution of Brazil</title>
+            <categories>econ.GN nlin.AO physics.data-an physics.soc-ph q-fin.EC</categories>
+            <comments>10 figures, 39 graphs, 17 pages, LaTeX. Minor changes to match version sent to publisher. To appear in &#34;Chaos, Solitons &amp; Fractals&#34;</comments>
+            <journal-ref>Chaos, Solitons and Fractals 88 (2016) 158-171</journal-ref>
+            <doi>10.1016/j.chaos.2016.02.026</doi>
+            <license>http://arxiv.org/licenses/nonexclusive-distrib/1.0/</license>
+            <abstract>This paper discusses the empirical evidence of Tsallis statistical functions in the personal income distribution of Brazil. Yearly samples from 1978 to 2014 were linearized by the q-logarithm and straight lines were fitted to the entire range of the income data in all samples, producing a two-parameters-only single function representation of the whole distribution in every year. The results showed that the time evolution of the parameters is periodic and plotting one in terms of the other reveals a cycle mostly clockwise. It was also found that the empirical data oscillate periodically around the fitted straight lines with the amplitude growing as the income values increase. Since the entire income data range can be fitted by a single function, this raises questions on previous results claiming that the income distribution is constituted by a well defined two-classes-base income structure, since such a division in two very distinct income classes might not be an intrinsic property of societies, but a consequence of an a priori fitting-choice procedure that may leave aside possibly important income dynamics at the intermediate levels.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:2605.02085</identifier>
+        <datestamp>2026-05-05</datestamp>
+            <setSpec>econ:econ:EM</setSpec>
+            <setSpec>cs:cs:DS</setSpec>
+            <setSpec>math:math:ST</setSpec>
+            <setSpec>stat:stat:TH</setSpec>
+            <setSpec>q-fin:q-fin:PR</setSpec>
+            <setSpec>q-fin:q-fin:RM</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2605.02085</id>
+        <created>2026-05-03</created>
+            <updated>2026-05-05</updated>
+        <authors>
+                <author>
+                    <keyname>Aldridge</keyname>
+                        <forenames>Irene</forenames>
+                </author>
+        </authors>
+        <title>Fast Monte-Carlo</title>
+            <categories>econ.EM cs.DS math.ST q-fin.PR q-fin.RM stat.TH</categories>
+            <comments>12 pages, originally published in the proceedings of the Winter Simulation Conference 2025</comments>
+            <acm-class>I.6</acm-class>
+            <journal-ref>2025 Winter Simulation Conference (WSC), Seattle, WA, USA, 2025, pp. 2051-2062</journal-ref>
+            <doi>10.1109/WSC68292.2025.11339108</doi>
+            <license>http://creativecommons.org/licenses/by/4.0/</license>
+            <abstract>This paper proposes an eigenvalue-based small-sample approximation of the celebrated Markov Chain Monte Carlo that delivers an invariant steady-state distribution that is consistent with traditional Monte Carlo methods. The proposed eigenvalue-based methodology reduces the number of paths required for Monte Carlo from as many as 1,000,000 to as few as 10 (depending on the simulation time horizon $T$), and delivers comparable, distributionally robust results, as measured by the Wasserstein distance. The proposed methodology also produces a significant variance reduction in the steady-state distribution.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:2605.06688</identifier>
+        <datestamp>2026-05-11</datestamp>
+            <setSpec>q-fin:q-fin:CP</setSpec>
+            <setSpec>math:math:PR</setSpec>
+            <setSpec>math:math:ST</setSpec>
+            <setSpec>stat:stat:TH</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2605.06688</id>
+        <created>2026-05-01</created>
+            <updated>2026-05-11</updated>
+        <authors>
+                <author>
+                    <keyname>Rohan</keyname>
+                </author>
+                <author>
+                    <keyname>Shetty</keyname>
+                        <forenames>Siddanth</forenames>
+                </author>
+                <author>
+                    <keyname>Kumar</keyname>
+                        <forenames>Amit N.</forenames>
+                </author>
+        </authors>
+        <title>American Options Pricing under Heston Model via Curriculum Learning in Coupled PINNs</title>
+            <categories>q-fin.CP math.PR math.ST stat.TH</categories>
+            <comments>25 pages, 22 figures</comments>
+            <msc-class>Primary: 91G20, 91G15, Secondary: 62P05, 68T07</msc-class>
+            <license>http://arxiv.org/licenses/nonexclusive-distrib/1.0/</license>
+            <abstract>In American options, the early exercise feature allows the option to be exercised at any time prior to expiration. However, this flexibility introduces a challenge: the pricing model must value the option while simultaneously determining an unknown, time-varying exercise boundary. The Heston model is one of the most popular ways to model real market behavior because it allows volatility to change over time. However, unlike European options, there is no closed-form solution for American options under the Heston model, so we have to use numerical methods. In this paper, we propose a novel approach to solving the stochastic Heston partial differential equation for American options, using coupled physics-informed neural networks (PINNs) to predict both the option price and the free boundary, while employing curriculum learning and adaptive resampling to stabilize model training. Our work builds on recent deep learning methods but introduces a more effective training strategy to address the limitations of these approaches. The numerical results demonstrate the effectiveness of the proposed learning framework, providing a robust and efficient alternative to pricing American options, enabling rapid inference and accurate estimation under stochastic volatility.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:2509.18837</identifier>
+        <datestamp>2026-05-01</datestamp>
+            <setSpec>q-fin:q-fin:MF</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2509.18837</id>
+        <created>2026-04-29</created>
+            <updated>2026-05-01</updated>
+        <authors>
+                <author>
+                    <keyname>Bianchi</keyname>
+                        <forenames>Sergio</forenames>
+                </author>
+                <author>
+                    <keyname>Angelini</keyname>
+                        <forenames>Daniele</forenames>
+                </author>
+        </authors>
+        <title>Fair Volatility: A Framework for Reconceptualizing Financial Risk</title>
+            <categories>q-fin.MF</categories>
+            <comments>16 figures, 27 pages, 5 tables</comments>
+            <license>http://creativecommons.org/licenses/by-nc-nd/4.0/</license>
+            <abstract>Volatility is the canonical measure of financial risk, a role largely inherited from Modern Portfolio Theory. Yet, its universality rests on restrictive efficiency assumptions that render volatility, at best, an incomplete proxy for true risk. This paper identifies three fundamental inconsistencies: (i) volatility is path-independent and blind to temporal dependence and non-stationarity; (ii) its relevance collapses in derivative-intensive strategies, where volatility often represents opportunity rather than risk; and (iii) it lacks an absolute benchmark, providing no guidance on what level of volatility is economically ``fair&#39;&#39; in efficient markets. To address these limitations, we propose a new paradigm that reconceptualizes risk in terms of predictability rather than variability. Building on a general class of stochastic processes, we derive an analytical link between volatility and the Hurst-Holder exponent within the Multifractional Process with Random Exponent (MPRE) framework. This relationship yields a formal definition of ``fair volatility&#39;&#39;, namely the volatility implied under market efficiency, where prices follow semi-martingale dynamics. Extensive empirical analysis on global equity indices supports this framework, showing that deviations from fair volatility provide a tractable measure of market inefficiency, distinguishing between momentum-driven and mean-reverting regimes. Our results advance both the theoretical foundations and empirical assessment of financial risk, offering a definition of volatility that is efficiency-consistent and economically interpretable.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+<record>
+                <header>
+        <identifier>oai:arXiv.org:2503.24324</identifier>
+        <datestamp>2026-05-01</datestamp>
+            <setSpec>stat:stat:AP</setSpec>
+            <setSpec>econ:econ:GN</setSpec>
+            <setSpec>q-fin:q-fin:EC</setSpec>
+            <setSpec>physics:physics:soc-ph</setSpec>
+            <setSpec>q-fin:q-fin:RM</setSpec>
+    </header>
+
+            <metadata>
+                        <arXiv xmlns="http://arxiv.org/OAI/arXiv/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://arxiv.org/OAI/arXiv/ https://oaipmh.arxiv.org/OAI/arXiv.xsd">
+        <id>2503.24324</id>
+        <created>2026-04-30</created>
+            <updated>2026-05-01</updated>
+        <authors>
+                <author>
+                    <keyname>Das</keyname>
+                        <forenames>Sourish</forenames>
+                </author>
+                <author>
+                    <keyname>Shukla</keyname>
+                        <forenames>Sudeep</forenames>
+                </author>
+                <author>
+                    <keyname>Kailasam</keyname>
+                        <forenames>Abbinav Sankar</forenames>
+                </author>
+                <author>
+                    <keyname>Rai</keyname>
+                        <forenames>Anish</forenames>
+                </author>
+                <author>
+                    <keyname>Garg</keyname>
+                        <forenames>Sejal</forenames>
+                </author>
+                <author>
+                    <keyname>Chakraborti</keyname>
+                        <forenames>Anirban</forenames>
+                </author>
+        </authors>
+        <title>Mitigating Financial Risk from Climate-Induced Agricultural Price Volatility</title>
+            <categories>stat.AP econ.GN physics.soc-ph q-fin.EC q-fin.RM</categories>
+            <comments>15 pages, 11 figures</comments>
+            <license>http://arxiv.org/licenses/nonexclusive-distrib/1.0/</license>
+            <abstract>Agricultural price volatility, driven by market dynamics and meteorological factors such as temperature and precipitation, poses challenges for sustainable finance, planning, and policy. This study analyzes the impact of climate on crop price volatility for soybean in Madhya Pradesh (India) and Illinois (US), rice in Assam (India), wheat in North Dakota (US), cotton in Gujarat (India), and corn in Iowa (US). Using CMIP6 climate projections from the Copernicus Climate Change Service, we examine historical climate patterns and evaluate two future scenarios: SSP2-4.5 (moderate) and SSP5-8.5 (severe). We estimate conditional price volatility using the Exponential Generalized Autoregressive Conditional Heteroskedasticity (EGARCH) model, and forecast this volatility with a Seasonal Autoregressive Integrated Moving Average with Exogenous Regressors (SARIMAX) model that incorporates meteorological variables. Finally, we apply the Black-Scholes framework to evaluate the cost of put-option-based insurance, which provides protection to farmers against adverse price drops linked to climate change. Our results highlight the role of meteorological data in improving agricultural risk modelling, enabling better design of insurance mechanisms, price stabilization tools, and sustainable policy interventions under climate uncertainty.</abstract>
+    </arXiv>
+
+            </metadata>
+        </record>
+
+                    <resumptionToken expirationDate='2026-11-21T00:00:00Z'>verb%3DListRecords%26metadataPrefix%3DarXiv%26from%3D2026-06-17%26until%3D2026-10-31%26set%3Dq-fin%26skip%3D14</resumptionToken>
+
+    </ListRecords>
+</OAI-PMH>

@@ -1,6 +1,7 @@
 # Database credentials (backend/db_roles.py). The API connects as qs_app,
 # research jobs run in the `research-worker` service as qs_research_worker,
 # holdout grading runs in the `research-evaluator` service as qs_evaluator,
+# AI jobs run in the `ai-worker` service as qs_ai_worker,
 # migrations run as qs_migrator in the one-off `migrate` service, backups run
 # as qs_backup, and only `postgres` and `provision` see the bootstrap
 # superuser's password. Every service that loads PRODUCTION_ENV_FILE blanks
@@ -12,6 +13,9 @@
 # the database cannot reach the internet and nginx cannot reach the database.
 # The API and the research worker also join `edge` for market data; the
 # research evaluator stays on `data` alone, with no route to the internet.
+# The AI worker is on neither: it reaches postgres on `ai_db` and the
+# smokescreen egress proxy on `ai_egress`, both with no route out, and only
+# smokescreen joins `ai_out`, the AI tier's way to the internet.
 x-app: &app
   # QS_CODE_COMMIT: the commit being deployed (`export QS_CODE_COMMIT=$(git
   # rev-parse HEAD)` before building), baked into the image for manifests.
@@ -73,7 +77,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    networks: [data]
+    networks: [data, ai_db]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U quantumsentinel -d quantumsentinel"]
       interval: 10s
@@ -230,6 +234,60 @@ services:
     mem_limit: 1g
     cpus: "1.0"
 
+  # The AI tier's worker (backend/ai). It runs AI jobs as qs_ai_worker, which
+  # holds no privilege on the application schema, and loads no env file: in
+  # production it refuses to start while it holds any secret of the trusted
+  # tier (backend/ai/settings.py). It reaches postgres and smokescreen and
+  # nothing else of this stack, not redis, the API or nginx. HTTP(S)_PROXY
+  # send its jobs' requests through smokescreen, the only way out.
+  ai-worker:
+    build: *build
+    image: quantumsentinel-web:production
+    restart: unless-stopped
+    command: ["python", "-m", "backend.ai.worker"]
+    environment:
+      ENVIRONMENT: production
+      QS_PROCESS_ROLE: ai-worker
+      AI_DATABASE_URL: postgresql://qs_ai_worker:${DB_AI_WORKER_PASSWORD:?Set DB_AI_WORKER_PASSWORD}@postgres:5432/quantumsentinel
+      HTTP_PROXY: http://smokescreen:4750
+      HTTPS_PROXY: http://smokescreen:4750
+    networks: [ai_db, ai_egress]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      smokescreen:
+        condition: service_healthy
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    # A job process may use up to AI_JOB_MEMORY_BYTES (1 GiB) of address space.
+    mem_limit: 1536m
+    cpus: "1.0"
+
+  # Stripe's smokescreen, built from a pinned release (deploy/smokescreen). It
+  # forwards the AI worker's requests to the hosts in deploy/smokescreen/acl.yaml
+  # and refuses every other host, and any private, loopback or link-local
+  # address, with 407.
+  smokescreen:
+    build: ./deploy/smokescreen
+    image: quantumsentinel-smokescreen:v0.1.0
+    restart: unless-stopped
+    networks: [ai_egress, ai_out]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4750"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    mem_limit: 256m
+    cpus: "0.5"
+
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
@@ -297,6 +355,11 @@ networks:
   data:
     internal: true
   edge: {}
+  ai_db:
+    internal: true
+  ai_egress:
+    internal: true
+  ai_out: {}
 
 volumes:
   postgres_data:

@@ -193,6 +193,14 @@
   production, and runs each job in a process with an allow-listed
   environment and no database connection. Every stage is behind feature
   flags that start off and are checked while a job runs.
+- In Docker the AI worker shares no network with the API, redis, nginx or
+  the research services, and has no route to the internet of its own. Its
+  only way out is the smokescreen egress proxy, built from a pinned
+  release. Smokescreen forwards only to `oaipmh.arxiv.org`,
+  `api.openalex.org` and `api.crossref.org` and refuses every other host,
+  and any private, loopback or link-local address (cloud metadata
+  included), with 407. It logs every decision. The AI worker loads no env
+  file, so it holds no secret but its own database password.
 
 ## CI security pipeline
 

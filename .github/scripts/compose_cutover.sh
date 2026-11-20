@@ -5,7 +5,8 @@
 #   B. `up` with the current file before provisioning: migrate cannot log in
 #   C. provision (while the API runs), then `up`: migrate as qs_migrator, API as qs_app
 #   D. who is connected, what the API's environment holds, data from era A, research jobs,
-#      the research evaluator's network, dataset access and heartbeat role
+#      the research evaluator's network, dataset access and heartbeat role; the AI worker's
+#      role, environment and networks, the smokescreen egress proxy, and an AI self-test job
 #   E. the backup service dumps as qs_backup and copies the dataset blobs;
 #      the blobs are restored onto an empty datasets volume
 #   F. the API restarts as qs_app
@@ -58,6 +59,24 @@ assert DatasetStore(DATASET_ROOT).get(stored.dataset_id, stored.sha256).dataset_
 print(stored.dataset_id, stored.sha256)
 EOF
 }
+# The AI worker connects as qs_ai_worker, under its own application_name.
+ai_sessions() {
+  "${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -Atc \
+    "SELECT string_agg(DISTINCT usename, ',' ORDER BY usename) FROM pg_stat_activity
+     WHERE application_name = 'quantumsentinel-ai-worker'"
+}
+ai_role() {
+  for _ in $(seq 1 60); do
+    [ "$(ai_sessions)" = "qs_ai_worker" ] && { echo "ai-worker sessions: qs_ai_worker"; return 0; }
+    sleep 2
+  done
+  echo "ai-worker sessions: $(ai_sessions)"
+  "${NEW[@]}" logs --no-log-prefix ai-worker 2>&1 | tail -20
+  return 1
+}
+# manage.py in the API container (as qs_app), and SQL as the bootstrap superuser.
+manage() { "${NEW[@]}" exec -T quantumsentinel python -m backend.manage "$@" 2>&1 | tr -d '\r'; return "${PIPESTATUS[0]}"; }
+psql_su() { "${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -v ON_ERROR_STOP=1 -Atc "$1" 2>&1 | tr -d '\r'; return "${PIPESTATUS[0]}"; }
 # Waits for the backup service's first pass and prints its summary line.
 backup_pass() {
   for _ in $(seq 1 60); do
@@ -111,6 +130,9 @@ print("\n".join(f"{name}={value}" for name, value in settings.items()))
 EOF
 docker run --rm quantumsentinel-web:production python -m backend.manage generate-server-key \
   | grep -E '^(SERVER_DSA_|TRUSTED_SERVER_DSA_)' >> .env.production
+# The egress proxy, built from the pinned smokescreen release; a build failure
+# shows here rather than inside phase B's expected failure.
+"${NEW[@]}" build -q smokescreen
 # The superuser-era deployment: the API wired as in 205de7b, and postgres,
 # redis and nginx as they are now. 205de7b's own versions of those three
 # cannot start: with every capability dropped, postgres and redis fail to
@@ -307,6 +329,151 @@ for directory in (DATASET_ROOT, shard):
         raise SystemExit(f"research-evaluator wrote to {directory}")
 EOF
 echo "research-evaluator reads $dataset_id and cannot write the datasets volume"
+# The AI tier. The AI worker connects as qs_ai_worker and loads no env file:
+# it holds no value of .env.production but its own database password.
+ai_role
+"${NEW[@]}" exec -T ai-worker env | tr -d '\r' > "$RUNNER_TEMP/ai_worker.env"
+checked=0
+while IFS='=' read -r name value; do
+  case "$name" in ENVIRONMENT|DB_AI_WORKER_PASSWORD) continue ;; esac
+  [ "${#value}" -ge 16 ] || continue
+  if grep -qF -- "$value" "$RUNNER_TEMP/ai_worker.env"; then
+    echo "ai-worker holds $name"; exit 1
+  fi
+  checked=$((checked + 1))
+done < .env.production
+test "$checked" -ge 15
+echo "ai-worker holds none of the $checked other values of .env.production"
+# It resolves postgres and smokescreen and nothing else of the stack; it has
+# no route out of its own; through smokescreen it reaches the hosts in
+# deploy/smokescreen/acl.yaml, and smokescreen refuses every other host, the
+# cloud metadata address and the stack's own services with 407.
+"${NEW[@]}" exec -T ai-worker python - <<'EOF'
+import os
+import socket
+import time
+import urllib.error
+import urllib.request
+
+
+def resolves(host):
+    try:
+        socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    return True
+
+
+assert resolves("postgres") and resolves("smokescreen")
+for host in ("redis", "quantumsentinel", "nginx", "research-worker"):
+    assert not resolves(host), f"the AI worker resolves {host}"
+print("ai-worker resolves postgres and smokescreen, not redis, the API, nginx or the research worker")
+
+assert os.environ["HTTP_PROXY"] == os.environ["HTTPS_PROXY"] == "http://smokescreen:4750"
+direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    direct.open("https://api.crossref.org/works?rows=0", timeout=15)
+except OSError as error:
+    print(f"ai-worker -> api.crossref.org without the proxy: {error}")
+else:
+    raise SystemExit("the AI worker reached api.crossref.org without the proxy")
+for address in ("1.1.1.1", "8.8.8.8"):
+    try:
+        socket.create_connection((address, 443), timeout=5).close()
+    except OSError as error:
+        print(f"ai-worker -> {address}:443 without the proxy: {error}")
+    else:
+        raise SystemExit(f"the AI worker connected to {address}:443 without the proxy")
+
+
+def through_proxy(url):
+    """The status a request through HTTP(S)_PROXY ends with: the upstream's, or smokescreen's 407."""
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+        except urllib.error.URLError as error:
+            if "407" in str(error.reason):  # a refused CONNECT: "Tunnel connection failed: 407 ..."
+                return 407
+            if attempt == 2:
+                raise
+            print(f"{url}: {error.reason}; retrying")
+            time.sleep(5)
+
+
+for url in ("https://oaipmh.arxiv.org/oai?verb=Identify", "https://api.openalex.org/works?per-page=1",
+            "https://api.crossref.org/works?rows=0"):
+    status = through_proxy(url)
+    print(f"ai-worker -> {url} through smokescreen: {status}")
+    assert status != 407, url
+for url in ("https://example.com/", "http://example.com/", "http://169.254.169.254/latest/meta-data/",
+            "https://export.arxiv.org/oai2", "https://oaipmh.arxiv.org.evil.example/",
+            "http://postgres:5432/", "http://quantumsentinel:8000/health/ready"):
+    status = through_proxy(url)
+    print(f"ai-worker -> {url} through smokescreen: {status}")
+    assert status == 407, url
+EOF
+# smokescreen logged a decision for each of those requests.
+"${NEW[@]}" logs --no-log-prefix smokescreen 2>&1 | tr -d '\r' > "$RUNNER_TEMP/smokescreen.log"
+python3 - "$RUNNER_TEMP/smokescreen.log" <<'EOF'
+import json
+import sys
+
+decisions = {}
+for line in open(sys.argv[1]):
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        continue
+    if isinstance(entry, dict) and entry.get("msg") == "CANONICAL-PROXY-DECISION":
+        decisions.setdefault(entry["requested_host"].rsplit(":", 1)[0], set()).add(entry["allow"])
+for host, allowed in sorted(decisions.items()):
+    print(f"smokescreen decision: {host} allow={sorted(allowed)}")
+for host in ("oaipmh.arxiv.org", "api.openalex.org", "api.crossref.org"):
+    assert decisions.get(host) == {True}, host
+for host in ("example.com", "169.254.169.254", "export.arxiv.org", "postgres", "quantumsentinel"):
+    assert decisions.get(host) == {False}, host
+EOF
+echo "smokescreen forwarded the three research hosts and refused the rest"
+# Its heartbeat comes from the ai-worker container.
+ai_host=$("${NEW[@]}" exec -T ai-worker python -c "import socket; print(socket.gethostname())" | tr -d '\r')
+ai_hosts=$(psql_su "SELECT string_agg(DISTINCT hostname, ',') FROM ai.workers")
+echo "ai.workers heartbeats from: $ai_hosts (ai-worker container: $ai_host)"
+test "$ai_hosts" = "$ai_host"
+# An AI job, end to end: an operator switches the AI tier and its self-test
+# stage on, queues the self-test, and the AI worker runs it in a job process
+# that has no database URL, no trusted module, the egress proxy and the limits.
+manage set-flag research_intelligence on --by ci --reason "AI tier e2e"
+manage set-flag selftest on --by ci --reason "AI tier e2e"
+out=$(manage ai-selftest --by ci)
+echo "$out"
+ai_job=${out##*: }
+for _ in $(seq 1 60); do
+  "${NEW[@]}" exec -T quantumsentinel python -m backend.manage ai-job "$ai_job" 2> /dev/null | tr -d '\r' \
+    > "$RUNNER_TEMP/ai_job.json"
+  grep -qE '"status": "(succeeded|failed)"' "$RUNNER_TEMP/ai_job.json" && break
+  sleep 2
+done
+python3 - "$RUNNER_TEMP/ai_job.json" <<'EOF'
+import json
+import sys
+
+job = json.load(open(sys.argv[1]))
+assert job["status"] == "succeeded", (job["status"], job["error"])
+result = job["result"]
+environment = set(result["environment"])
+print(f"AI job {job['id']} ran as {result['process_role']} with: {' '.join(sorted(environment))}")
+print(f"its limits: {result['limits']}; trusted modules: {result['trusted_modules']}")
+assert result["process_role"] == "ai-job"
+assert result["trusted_modules"] == []
+assert {"HTTP_PROXY", "HTTPS_PROXY", "ENVIRONMENT"} <= environment
+assert not environment & {"AI_DATABASE_URL", "DATABASE_URL", "DB_AI_WORKER_PASSWORD", "QS_CODE_COMMIT"}
+assert not [name for name in environment if any(word in name for word in ("PASSWORD", "SECRET", "KEY", "TOKEN"))]
+assert result["limits"]["RLIMIT_AS"] == 1 << 30, result["limits"]
+EOF
+echo "the AI worker ran the self-test job in a confined job process"
 # The API keys the /api/auth/* rate limit, login lockout and audit records on
 # the client's address, which it takes from X-Forwarded-For. Through nginx a
 # client must not be able to choose it: 11 requests to one /api/auth/ path,
@@ -375,10 +542,11 @@ echo "restored $dataset_id onto an empty datasets volume; the worker owns every 
 "${NEW[@]}" --profile backup up -d backup
 echo "::endgroup::"
 
-echo "::group::F. the API, the research worker and the research evaluator restart as their own roles"
-"${NEW[@]}" restart quantumsentinel research-worker research-evaluator
+echo "::group::F. the API, the research and AI workers and the research evaluator restart as their own roles"
+"${NEW[@]}" restart quantumsentinel research-worker research-evaluator ai-worker
 ready
 all_roles
+ai_role
 # The research evaluator started, shut down on the restart's SIGTERM and
 # started again, all as qs_evaluator, with no statement refused to it.
 "${NEW[@]}" logs --no-log-prefix research-evaluator 2>&1 | tr -d '\r' > "$RUNNER_TEMP/evaluator.log"
@@ -443,8 +611,6 @@ echo "::group::G. a sealed dataset holdout"
 # then see that family's data only from before the start, also when rerun on
 # datasets taken before it was set. The start can only move later, and a
 # recorded start cannot be changed, not even by the superuser.
-manage() { "${NEW[@]}" exec -T quantumsentinel python -m backend.manage "$@" 2>&1 | tr -d '\r'; return "${PIPESTATUS[0]}"; }
-psql_su() { "${NEW[@]}" exec -T postgres psql -U quantumsentinel -d quantumsentinel -v ON_ERROR_STOP=1 -Atc "$1" 2>&1 | tr -d '\r'; return "${PIPESTATUS[0]}"; }
 out=$(manage holdouts)
 echo "holdouts: $out"
 test "$out" = "no dataset family has a holdout"
@@ -485,6 +651,7 @@ backup_pass
 "${NEW[@]}" up -d
 ready
 all_roles
+ai_role
 read -r fresh_id fresh_sha < <(store_blob)
 test -n "$fresh_sha"
 echo "research-worker stored $fresh_id in a datasets volume the backup service mounted first"

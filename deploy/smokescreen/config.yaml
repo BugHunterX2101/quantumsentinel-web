@@ -1,0 +1,18 @@
+# smokescreen's settings; the keys are those of pkg/smokescreen/config_loader.go
+# at v0.1.0, which refuses any other.
+ip: 0.0.0.0
+port: 4750
+acl_file: /etc/smokescreen/acl.yaml
+# Clients present no TLS certificate, so no request names a role, and every
+# request is decided by acl.yaml's default rule.
+allow_missing_role: true
+# smokescreen also refuses, whatever acl.yaml allows, any address that is
+# loopback, private (RFC 1918, so every Docker network), link-local (cloud
+# metadata), CGNAT or otherwise not global unicast. Nothing here relaxes that.
+connect_timeout: 10s
+dns_timeout: 5s
+idle_timeout: 120s
+exit_timeout: 30s
+read_header_timeout: 10s
+max_concurrent_requests: 32
+max_concurrent_connect_tunnels: 32

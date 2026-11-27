@@ -25,6 +25,12 @@ configuration that was tried (``n_rejected``, which the sweep row keeps
 forever). Admission also counts each earlier sweep's valid candidates that
 have no trial yet, so two sweeps created back to back cannot both pass on
 the same count: a candidate that never runs keeps holding its place.
+A candidate that fails the risk gate still records its trial (the backtest
+reports the gate, it does not refuse the run), and a spec that parses
+always compiles and runs: a window longer than the data runs flat. So a
+backtest that fails leaves no trial only for a cause every candidate on the
+same panel shares (too few sessions, a crash, a cancellation); it showed no
+result to select on, and admission keeps counting it all the same.
 
 Paying and queueing. Creating a sweep charges its pipeline for every valid
 candidate at once (research_pipelines.charge), all or nothing. The

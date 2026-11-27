@@ -55,6 +55,11 @@ def test_the_cap_is_the_largest_n_whose_minimum_backtest_length_fits(years):
     assert research_sweeps.minbtl_cap(years, 2.0) >= cap >= research_sweeps.minbtl_cap(years, 0.5)
 
 
+@pytest.mark.parametrize("n", [2, 7, 45])
+def test_a_span_exactly_as_long_as_the_minimum_backtest_length_allows_that_many_trials(n):
+    assert research_sweeps.minbtl_cap(validation_stats.expected_max(n) ** 2, 1.0) == n
+
+
 def test_the_cap_stops_at_its_ceiling_and_refuses_what_is_not_a_span():
     assert research_sweeps.minbtl_cap(99.0) == research_sweeps.MINBTL_CEILING
     for bad in (-1.0, float("nan"), float("inf"), True, "2"):
@@ -489,6 +494,7 @@ def test_a_sweep_takes_only_the_callers_own_strategy_pipeline_datasets_and_sweep
     assert written(db)[:2] == before[:2]
     # Alice's refused point and unrun candidate are hers: Bob's family starts empty.
     assert research_sweeps.family_trials(db, bob.id, FAMILY)["trials"] == 0
+    run_all(db)  # Alice's candidate runs first, so the worker reaches Bob's snapshot; her trial stays hers.
     bobs = body(sweep(db, bob, bob_pid, {"fast": [2]}, snapshot(db, bob), period="2y"))
     assert bobs["minbtl"]["trials_after"] == 1
     assert research_sweeps.family_trials(db, alice.id, FAMILY)["sweep_rejections"] == 1
@@ -535,11 +541,13 @@ def test_a_sweep_of_another_familys_datasets_is_refused(db, monkeypatch, tmp_pat
 # The schema (migration 0019)
 # --------------------------------------------------------------------------
 
-def _refused(db, statement, **params):
-    with pytest.raises(DBAPIError):
+def _refused(db, statement, sqlstate=None, **params):
+    with pytest.raises(DBAPIError) as caught:
         db.execute(text(statement), params)
         db.flush()
     db.rollback()
+    if sqlstate is not None:  # who refused: a CHECK constraint must not stand in for a trigger
+        assert caught.value.orig.sqlstate == sqlstate, caught.value.orig
 
 
 @pytest.fixture
@@ -560,12 +568,15 @@ def swept(db, market):
     "UPDATE research_sweep_candidates SET job_id = 'other', queued_at = now() WHERE job_id IS NOT NULL",
     "UPDATE research_sweep_candidates SET params = '{}' WHERE job_id IS NULL",
     "UPDATE research_sweep_candidates SET rejection = NULL, strategy_version_id = NULL WHERE rejection IS NOT NULL",
-    "UPDATE research_sweep_candidates SET job_id = 'j', queued_at = now(), params = '{}' WHERE job_id IS NULL",
+    "UPDATE research_sweep_candidates SET job_id = 'j', queued_at = now(), params = '{}'"
+    " WHERE job_id IS NULL AND rejection IS NULL",
+    "UPDATE research_sweep_candidates SET job_id = 'j', queued_at = now(), rejection = 'x'"
+    " WHERE job_id IS NULL AND rejection IS NULL",
     "DELETE FROM research_sweep_candidates",
     "TRUNCATE research_sweep_candidates",
 ])
 def test_sweeps_and_their_candidates_never_change_but_to_be_queued_once(db, swept, statement):
-    _refused(db, statement)
+    _refused(db, statement, sqlstate="23001")  # restrict_violation, raised by the triggers
     assert count(db, models.ResearchSweep) == 1 and count(db, models.ResearchSweepCandidate) == 6
     assert db.execute(select(models.ResearchSweep.n_rejected)).scalar_one() == 1
 
@@ -577,7 +588,7 @@ def test_an_unqueued_candidate_may_be_queued_once(db, swept):
                     " WHERE sweep_id = :sid AND ordinal = 3"), {"job": job, "sid": created["sweep_id"]})
     db.commit()
     _refused(db, "UPDATE research_sweep_candidates SET job_id = :job, queued_at = now()"
-                 " WHERE sweep_id = :sid AND ordinal = 3", job=job, sid=created["sweep_id"])
+                 " WHERE sweep_id = :sid AND ordinal = 3", sqlstate="23001", job=job, sid=created["sweep_id"])
 
 
 _INSERT_SWEEP = ("INSERT INTO research_sweeps (id, user_id, pipeline_id, base_version_id, family_hash, grid,"

@@ -619,6 +619,59 @@ class ResearchPipelineRequest(BaseModel):
     max_jobs: int
 
 
+SWEEP_MAX_KEYS = 4
+SWEEP_MAX_VALUES = 50
+# Grid points per sweep. The MinBTL cap and the pipeline's budget usually
+# bound a sweep well below this; it bounds the work done before they apply.
+SWEEP_MAX_CANDIDATES = 500
+
+
+class ResearchSweepRequest(MarketDataRequest):
+    """Expand one of the caller's strategy versions (by id or tag) over a grid
+    of its signal parameters, and backtest every candidate on these frozen
+    datasets over the trailing ``period`` (research_sweeps.create)."""
+    model_config = {"extra": "forbid"}
+    strategy: str = Field(min_length=1, max_length=96)
+    grid: dict[str, list[int]]
+    period: str = "2y"
+    initial_capital: float = Field(default=100_000.0, ge=1000.0, le=100_000_000.0)
+    # A sweep's candidates all read the same frozen data.
+    dataset_ids: list[str] = Field(min_length=1, max_length=DATASET_MAX_INPUTS)
+
+    @field_validator("period")
+    @classmethod
+    def valid_period(cls, value: str) -> str:
+        return _trailing_period(value)
+
+    @field_validator("grid", mode="before")
+    @classmethod
+    def strict_grid(cls, value: Any) -> Any:
+        # Integers only: 2.0, "2" and True are refused, as in a spec.
+        if isinstance(value, dict):
+            for values in value.values():
+                if isinstance(values, list) and any(isinstance(v, bool) or not isinstance(v, int) for v in values):
+                    raise ValueError("grid values are whole numbers")
+        return value
+
+    @field_validator("grid")
+    @classmethod
+    def valid_grid(cls, value: dict[str, list[int]]) -> dict[str, list[int]]:
+        if not 1 <= len(value) <= SWEEP_MAX_KEYS:
+            raise ValueError(f"a grid varies 1 to {SWEEP_MAX_KEYS} parameters")
+        points = 1
+        for key, values in value.items():
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", key):
+                raise ValueError(f"not a parameter name: {key[:40]!r}")
+            if not 1 <= len(values) <= SWEEP_MAX_VALUES:
+                raise ValueError(f"{key} takes 1 to {SWEEP_MAX_VALUES} values")
+            if len(set(values)) != len(values):
+                raise ValueError(f"{key}'s values must be distinct")
+            points *= len(values)
+        if points > SWEEP_MAX_CANDIDATES:
+            raise ValueError(f"the grid has {points} points; a sweep has at most {SWEEP_MAX_CANDIDATES}")
+        return value
+
+
 def _trailing_period(value: str) -> str:
     from .services.market_data import PERIOD
 

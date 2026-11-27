@@ -178,25 +178,25 @@ def family_state(db: Session, user_id: str, family: str) -> dict:
 
     ``trials``, the count every statistic deflates by, is the ledger's
     research trials plus the holdout attempts spent in the family
-    (holdout_evaluation): a strategy picked after a holdout grade was picked
-    from one more look at the data. The holdout runs have no column in a
-    trial matrix, so completeness (``every_trial_evaluated``) is judged on
-    the research trials alone."""
-    from .holdout_evaluation import holdout_queries
+    (holdout_evaluation) plus the candidates research sweeps refused as
+    specs (research_sweeps.family_trials): a strategy picked after a holdout
+    grade was picked from one more look at the data, and a refused candidate
+    was still a configuration tried. Neither has a column in a trial matrix,
+    so completeness (``every_trial_evaluated``) is judged on the research
+    trials alone."""
+    from .research_sweeps import family_trials
     evaluated_configs = select(models.ResearchTrialEvaluation.config_hash).where(
         models.ResearchTrialEvaluation.user_id == user_id,
         models.ResearchTrialEvaluation.family_hash == family)
     evaluated = int(db.execute(select(func.count()).select_from(models.ResearchTrial).where(
         models.ResearchTrial.user_id == user_id, models.ResearchTrial.family_hash == family,
         models.ResearchTrial.config_hash.in_(evaluated_configs))).scalar() or 0)
-    research = research_trials.count(db, user_id, family)
-    holdout = holdout_queries(db, user_id, family)
+    counted = family_trials(db, user_id, family)
     versions = sorted(db.execute(select(models.ResearchTrialEvaluation.strategy_version_id).distinct().where(
         models.ResearchTrialEvaluation.user_id == user_id,
         models.ResearchTrialEvaluation.family_hash == family)).scalars())
-    return {"trials": research + holdout, "research_trials": research, "holdout_queries": holdout,
-            "evaluated_trials": evaluated, "every_trial_evaluated": evaluated == research,
-            "strategy_version_ids": versions}
+    return {**counted, "evaluated_trials": evaluated,
+            "every_trial_evaluated": evaluated == counted["research_trials"], "strategy_version_ids": versions}
 
 
 # --------------------------------------------------------------------------

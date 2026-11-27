@@ -69,6 +69,8 @@ class TestMigrations:
             conn.execute(text("DROP TABLE validation_manifests"))
             conn.execute(text("DROP TABLE strategy_validations, trial_matrices"))
             conn.execute(text("DROP TABLE research_trial_evaluations"))
+            # Revision 0019's sweeps reference strategy_versions, so they go first.
+            conn.execute(text("DROP TABLE research_sweep_candidates, research_sweeps"))
             conn.execute(text("DROP TABLE user_strategy_tags, user_strategy_versions, strategy_versions"))
             # And revision 0018 these.
             conn.execute(text("DROP TABLE research_pipeline_days, research_pipelines"))

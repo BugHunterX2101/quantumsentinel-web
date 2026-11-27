@@ -27,6 +27,7 @@ import importlib
 import json
 import math
 import re
+import contextlib
 import threading
 from dataclasses import dataclass
 
@@ -325,10 +326,72 @@ def _same_request(job: models.ResearchJob, kind: str, request_hash: str, pipelin
             and job.stage == stage)
 
 
+def _lock_user(db: Session, user_id: str) -> None:
+    db.execute(text("SELECT id FROM users WHERE id = :uid FOR UPDATE"), {"uid": user_id})
+
+
+@contextlib.contextmanager
+def queue_transaction(db: Session, user_id: str):
+    """One transaction that holds this process's enqueue lock and the user's
+    row lock, as ``enqueue`` does: committed when the block ends, rolled back
+    if it raises. For code that queues on a user's behalf outside
+    ``enqueue`` (research_sweeps), so it is serialised with every enqueue of
+    that user."""
+    with _enqueue_lock:
+        try:
+            _lock_user(db, user_id)
+            yield
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+
+def active_jobs(db: Session, user_id: str) -> int:
+    """The user's queued and running jobs, which RESEARCH_MAX_ACTIVE_JOBS_PER_USER caps."""
+    return int(db.execute(
+        select(func.count()).select_from(models.ResearchJob).where(
+            models.ResearchJob.user_id == user_id,
+            models.ResearchJob.status.in_(ACTIVE))
+    ).scalar() or 0)
+
+
+def insert_prepaid(db: Session, user_id: str, kind: str, params: dict, pipeline_id: str,
+                   stage: str) -> models.ResearchJob:
+    """Queue a pipeline job its pipeline has already paid for, inside a
+    ``queue_transaction`` of the user: research_sweeps charges a sweep's
+    pipeline for every candidate when the sweep is created and queues them
+    here as slots free. Nothing is charged; the pipeline must still be open
+    (PipelineClosed) and the active-job limit still applies (QueueFull).
+    Only that service calls this: no request header or parameter reaches
+    it."""
+    if kind not in KINDS:
+        raise ValueError(f"unknown research job kind {kind!r}")
+    if not pipeline_id or not STAGE.fullmatch(stage or ""):
+        raise ValueError(f"a prepaid job needs a pipeline and a stage, not {pipeline_id!r}, {stage!r}")
+    if research_pipelines.lock_open(db, pipeline_id) is None:
+        raise research_pipelines.PipelineClosed()
+    active = active_jobs(db, user_id)
+    if active >= RESEARCH_MAX_ACTIVE_JOBS_PER_USER:
+        raise QueueFull(active, RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
+    return _insert_job(db, user_id, kind, json_safe(params), pipeline_id, stage, None, None)
+
+
+def _insert_job(db: Session, user_id: str, kind: str, params: dict, pipeline_id: str | None,
+                stage: str | None, idempotency_key: str | None, request_hash: str | None) -> models.ResearchJob:
+    job = models.ResearchJob(user_id=user_id, kind=kind, params_json=params, status=QUEUED,
+                             max_attempts=KINDS[kind].max_attempts or RESEARCH_JOB_MAX_ATTEMPTS,
+                             pipeline_id=pipeline_id, stage=stage, idempotency_key=idempotency_key,
+                             request_hash=request_hash)
+    db.add(job)
+    db.flush()
+    return job
+
+
 def _enqueue_locked(db: Session, user_id: str, kind: str, params: dict, same_as: tuple[str, ...],
                     pipeline_id: str | None, stage: str | None,
                     idempotency_key: str | None, request_hash: str | None) -> models.ResearchJob:
-    db.execute(text("SELECT id FROM users WHERE id = :uid FOR UPDATE"), {"uid": user_id})
+    _lock_user(db, user_id)
     if idempotency_key is not None:
         earlier = db.execute(select(models.ResearchJob).where(
             models.ResearchJob.user_id == user_id,
@@ -348,22 +411,12 @@ def _enqueue_locked(db: Session, user_id: str, kind: str, params: dict, same_as:
             if all((existing.params_json or {}).get(f) == params.get(f) for f in same_as)), None)
         if duplicate is not None:
             return duplicate
-    active = int(db.execute(
-        select(func.count()).select_from(models.ResearchJob).where(
-            models.ResearchJob.user_id == user_id,
-            models.ResearchJob.status.in_(ACTIVE))
-    ).scalar() or 0)
+    active = active_jobs(db, user_id)
     if active >= RESEARCH_MAX_ACTIVE_JOBS_PER_USER:
         raise QueueFull(active, RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
     if pipeline_id is not None:
         research_pipelines.charge(db, user_id, pipeline_id, RESEARCH_PIPELINE_DAILY_JOBS, utcnow().date())
-    job = models.ResearchJob(user_id=user_id, kind=kind, params_json=params, status=QUEUED,
-                             max_attempts=KINDS[kind].max_attempts or RESEARCH_JOB_MAX_ATTEMPTS,
-                             pipeline_id=pipeline_id, stage=stage, idempotency_key=idempotency_key,
-                             request_hash=request_hash)
-    db.add(job)
-    db.flush()
-    return job
+    return _insert_job(db, user_id, kind, params, pipeline_id, stage, idempotency_key, request_hash)
 
 
 def get_for_user(db: Session, user_id: str, job_id: str) -> models.ResearchJob | None:

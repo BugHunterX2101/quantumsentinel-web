@@ -508,6 +508,59 @@ class ResearchPipelineDay(Base):
     jobs_queued = Column(Integer, nullable=False, default=0)
 
 
+class ResearchSweep(Base):
+    """One strategy version expanded over a parameter grid in a pipeline
+    (services/research_sweeps.py): the grid points it generated, how many of
+    them were refused as specs, and the MinBTL cap the family was held to.
+
+    Append-only (migration 0019's triggers): a refused candidate counts
+    toward its family's trials, so ``n_rejected`` is never lowered. The
+    CHECKs on the counts live in the migration.
+    """
+    __tablename__ = "research_sweeps"
+    __table_args__ = (Index("ix_research_sweeps_user_family", "user_id", "family_hash"),
+                      Index("ix_research_sweeps_pipeline", "pipeline_id"),
+                      # A retried request gets the sweep the first one created.
+                      Index("uq_research_sweeps_idempotency", "user_id", "idempotency_key", unique=True,
+                            postgresql_where=text("idempotency_key IS NOT NULL")))
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    pipeline_id = Column(String, ForeignKey("research_pipelines.id"), nullable=False)
+    base_version_id = Column(String(80), ForeignKey("strategy_versions.version_id"), nullable=False)
+    family_hash = Column(String(64), nullable=False)
+    grid = Column(JSON, nullable=False)
+    period = Column(String(8), nullable=False)
+    initial_capital = Column(Float, nullable=False)
+    dataset_ids = Column(JSON, nullable=False)
+    n_candidates = Column(Integer, nullable=False)
+    n_rejected = Column(Integer, nullable=False)
+    # The family's trials once every candidate has run, and the most the
+    # MinBTL bound allowed for the sweep's period.
+    trials_after = Column(Integer, nullable=False)
+    minbtl_cap = Column(Integer, nullable=False)
+    idempotency_key = Column(String(128), nullable=True)
+    request_hash = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class ResearchSweepCandidate(Base):
+    """One grid point of a sweep: the strategy version it registered and the
+    trial config its backtest runs as, or why its spec was refused. Its
+    backtest job is named once, when it is queued (migration 0019's trigger
+    refuses any other change); the job is purged later, the name stays."""
+    __tablename__ = "research_sweep_candidates"
+
+    sweep_id = Column(String, ForeignKey("research_sweeps.id"), primary_key=True)
+    ordinal = Column(Integer, primary_key=True)
+    params = Column(JSON, nullable=False)
+    strategy_version_id = Column(String(80), ForeignKey("strategy_versions.version_id"), nullable=True)
+    config_hash = Column(String(64), nullable=True)
+    rejection = Column(String(500), nullable=True)
+    job_id = Column(String, nullable=True)
+    queued_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class DatasetVersion(Base):
     """A frozen, content-addressed dataset (services/dataset_registry.py).
 

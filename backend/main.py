@@ -61,8 +61,8 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
                      RESEARCH_WORKER_MODE, PROCESS_ROLE)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, integration_service, order_security
-from .services import (dataset_registry, paper_broker, research_jobs, research_pipelines, research_trials,
-                       strategy_registry, strategy_validation, trial_matrix, validation_manifest)
+from .services import (dataset_registry, paper_broker, research_jobs, research_pipelines, research_sweeps,
+                       research_trials, strategy_registry, strategy_validation, trial_matrix, validation_manifest)
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -1939,11 +1939,10 @@ def statistical_tests(req: schemas.StatTestRequest,
         raise HTTPException(422, "Every return observation must be a finite number")
 
     # The Deflated Sharpe discount uses at least every configuration the
-    # server evaluated for this research family, and every holdout attempt
-    # spent in it (counted now, when the test is queued), whatever is
-    # declared.
-    from .services.holdout_evaluation import holdout_queries
-    server_counted = (research_trials.count(db, user.id, trial_family) + holdout_queries(db, user.id, trial_family)
+    # server evaluated for this research family, every holdout attempt spent
+    # in it and every candidate a sweep refused in it (counted now, when the
+    # test is queued), whatever is declared.
+    server_counted = (research_sweeps.family_trials(db, user.id, trial_family)["trials"]
                       if trial_family else 0)
     n_trials = max(req.n_strategies_tested, server_counted)
     return _queue_job(db, user, "stat_test", {
@@ -2348,6 +2347,69 @@ def close_research_pipeline(pipeline_id: str, user: models.User = Depends(get_cu
         security_service.write_audit_log(db, user.id, "PIPELINE_CLOSED", "research_pipeline", pipeline.id,
                                          {"jobs_queued": pipeline.jobs_queued})
     return research_pipelines.view(db, pipeline)
+
+
+@app.post("/api/research/pipelines/{pipeline}/sweeps", status_code=201)
+def create_research_sweep(pipeline: str, req: schemas.ResearchSweepRequest,
+                          user: models.User = Depends(get_current_user),
+                          db: Session = Depends(get_db),
+                          routing: JobRouting = Depends(job_routing)):
+    """Sweep one of the caller's strategy versions over a grid of its signal
+    parameters in the pipeline: every grid point becomes a candidate, each
+    valid one a strategy version backtested on the given frozen datasets
+    (stage ``sweep``). The pipeline pays for every valid candidate now; the
+    family's trials, with these, must stay within the minimum backtest
+    length bound for the data (409 otherwise), and candidates refused as
+    specs count among them. As many candidates are queued as the active-job
+    limit allows; POST .../advance queues the rest. With an Idempotency-Key,
+    a retry gets the sweep the first request created."""
+    if not isinstance(routing, JobRouting):
+        routing = JobRouting()
+    # The path names the pipeline; job_routing reads X-Research-Pipeline
+    # (whose parameter takes the name pipeline_id), which must agree if sent.
+    pipeline_id = pipeline
+    if routing.pipeline_id is not None and routing.pipeline_id != pipeline_id:
+        raise HTTPException(422, "X-Research-Pipeline names another pipeline than the path")
+    if research_pipelines.get_for_user(db, user.id, pipeline_id) is None:
+        raise HTTPException(404, "Research pipeline not found")
+    try:
+        sweep, created = research_sweeps.create(db, user.id, pipeline_id, req,
+                                                idempotency_key=routing.idempotency_key,
+                                                request_hash=routing.request_hash)
+    except research_pipelines.JobRefused as exc:
+        raise HTTPException(exc.status_code, exc.detail) from None
+    if created:
+        security_service.write_audit_log(db, user.id, "SWEEP_CREATED", "research_sweep", sweep.id, {
+            "pipeline_id": pipeline_id, "base_version_id": sweep.base_version_id,
+            "n_candidates": sweep.n_candidates, "n_rejected": sweep.n_rejected,
+            "trials_after": sweep.trials_after, "minbtl_cap": sweep.minbtl_cap})
+    return JSONResponse(research_sweeps.view(db, sweep), status_code=201,
+                        headers={"Location": f"/api/research/sweeps/{sweep.id}"})
+
+
+@app.get("/api/research/sweeps/{sweep_id}")
+def get_research_sweep(sweep_id: str, user: models.User = Depends(get_current_user),
+                       db: Session = Depends(get_db)):
+    """One of the caller's sweeps: its bound, and each candidate with its job
+    (while kept) and what its run measured."""
+    sweep = research_sweeps.get_for_user(db, user.id, sweep_id)
+    if sweep is None:
+        raise HTTPException(404, "Research sweep not found")
+    return research_sweeps.view(db, sweep)
+
+
+@app.post("/api/research/sweeps/{sweep_id}/advance")
+def advance_research_sweep(sweep_id: str, user: models.User = Depends(get_current_user),
+                           db: Session = Depends(get_db)):
+    """Queue the sweep's next candidates, as many as the active-job limit
+    allows (none once its pipeline is closed). Nothing queues them in the
+    background: a client advances the sweep until none is left."""
+    try:
+        queued = research_sweeps.advance(db, user.id, sweep_id)
+    except research_pipelines.JobRefused as exc:
+        raise HTTPException(exc.status_code, exc.detail) from None
+    sweep = research_sweeps.get_for_user(db, user.id, sweep_id)
+    return {"queued": queued, **research_sweeps.view(db, sweep)}
 
 
 @app.get("/api/research/queue")

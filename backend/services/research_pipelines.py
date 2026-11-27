@@ -54,15 +54,23 @@ class PipelineClosed(JobRefused):
 
 
 class PipelineBudgetSpent(JobRefused):
-    def __init__(self, max_jobs: int):
-        super().__init__(409, f"The research pipeline has queued all {max_jobs} jobs its budget allows")
+    def __init__(self, max_jobs: int, remaining: int = 0, needed: int = 1):
+        super().__init__(409, f"The research pipeline has queued all {max_jobs} jobs its budget allows"
+                         if remaining <= 0 else
+                         f"The research pipeline has {remaining} of its {max_jobs} jobs left; {needed} are needed")
 
 
 class DailyBudgetSpent(JobRefused):
-    def __init__(self, limit: int):
-        super().__init__(429, f"You have queued {limit} pipeline jobs today, the daily limit "
-                              f"(RESEARCH_PIPELINE_DAILY_JOBS); try again after 00:00 UTC"
-                         if limit > 0 else "Pipeline jobs are disabled (RESEARCH_PIPELINE_DAILY_JOBS is 0)")
+    def __init__(self, limit: int, spent: int | None = None, needed: int = 1):
+        if limit <= 0:
+            detail = "Pipeline jobs are disabled (RESEARCH_PIPELINE_DAILY_JOBS is 0)"
+        elif spent is None or spent >= limit:
+            detail = (f"You have queued {limit} pipeline jobs today, the daily limit "
+                      f"(RESEARCH_PIPELINE_DAILY_JOBS); try again after 00:00 UTC")
+        else:
+            detail = (f"You can queue {limit - spent} more pipeline jobs today (RESEARCH_PIPELINE_DAILY_JOBS "
+                      f"is {limit}); {needed} are needed")
+        super().__init__(429, detail)
 
 
 def utcnow() -> dt.datetime:
@@ -115,10 +123,24 @@ def close(db: Session, user_id: str, pipeline_id: str) -> models.ResearchPipelin
     return pipeline
 
 
-def charge(db: Session, user_id: str, pipeline_id: str, daily_limit: int, today: dt.date) -> None:
-    """Spend one job of the pipeline's budget and of the user's daily budget,
-    or raise JobRefused. Runs in the caller's transaction, which must hold
-    the user's row lock; nothing is committed here."""
+def lock_open(db: Session, pipeline_id: str) -> models.ResearchPipeline | None:
+    """Lock the pipeline's row and return it if it is open, else None. A
+    prepaid job (research_sweeps) is queued only in an open pipeline: closing
+    one stops it queueing, whatever it has paid for."""
+    pipeline = db.execute(select(models.ResearchPipeline).where(models.ResearchPipeline.id == pipeline_id)
+                          .with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
+    return pipeline if pipeline is not None and pipeline.status == OPEN else None
+
+
+def charge(db: Session, user_id: str, pipeline_id: str, daily_limit: int, today: dt.date,
+           jobs: int = 1) -> models.ResearchPipeline:
+    """Spend ``jobs`` jobs of the pipeline's budget and of the user's daily
+    budget, all or none, or raise JobRefused; return the locked pipeline.
+    Runs in the caller's transaction, which must hold the user's row lock;
+    nothing is committed here. A sweep pays here for every candidate it will
+    queue (research_sweeps.create)."""
+    if isinstance(jobs, bool) or not isinstance(jobs, int) or jobs < 1:
+        raise ValueError(f"a charge is for at least one job, not {jobs!r}")
     # populate_existing: the locked row's counters, not ones this session
     # may have loaded before it waited for the lock.
     pipeline = db.execute(select(models.ResearchPipeline).where(models.ResearchPipeline.id == pipeline_id)
@@ -127,8 +149,8 @@ def charge(db: Session, user_id: str, pipeline_id: str, daily_limit: int, today:
         raise PipelineNotFound()
     if pipeline.status != OPEN:
         raise PipelineClosed()
-    if pipeline.jobs_queued >= pipeline.max_jobs:
-        raise PipelineBudgetSpent(pipeline.max_jobs)
+    if pipeline.jobs_queued + jobs > pipeline.max_jobs:
+        raise PipelineBudgetSpent(pipeline.max_jobs, pipeline.max_jobs - pipeline.jobs_queued, jobs)
     # A daily limit of 0 (or less) refuses below too: nothing spent yet is
     # still not under it.
     db.execute(pg_insert(models.ResearchPipelineDay)
@@ -138,14 +160,15 @@ def charge(db: Session, user_id: str, pipeline_id: str, daily_limit: int, today:
         select(models.ResearchPipelineDay.jobs_queued)
         .where(models.ResearchPipelineDay.user_id == user_id, models.ResearchPipelineDay.day == today)
         .with_for_update()).scalar_one()
-    if spent_today >= daily_limit:
-        raise DailyBudgetSpent(daily_limit)
+    if spent_today + jobs > daily_limit:
+        raise DailyBudgetSpent(daily_limit, spent_today, jobs)
     db.execute(update(models.ResearchPipeline).execution_options(**_UNSYNCED)
                .where(models.ResearchPipeline.id == pipeline_id)
-               .values(jobs_queued=models.ResearchPipeline.jobs_queued + 1))
+               .values(jobs_queued=models.ResearchPipeline.jobs_queued + jobs))
     db.execute(update(models.ResearchPipelineDay).execution_options(**_UNSYNCED)
                .where(models.ResearchPipelineDay.user_id == user_id, models.ResearchPipelineDay.day == today)
-               .values(jobs_queued=models.ResearchPipelineDay.jobs_queued + 1))
+               .values(jobs_queued=models.ResearchPipelineDay.jobs_queued + jobs))
+    return pipeline
 
 
 def view(db: Session, pipeline: models.ResearchPipeline, include_jobs: bool = False) -> dict:

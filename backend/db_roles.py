@@ -92,6 +92,11 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # removed, so a spent budget cannot be handed back: no DELETE.
     "research_pipeline_days": ("SELECT", "INSERT", "UPDATE"),
     "research_pipelines": ("SELECT", "INSERT", "UPDATE"),
+    # Research sweeps (services/research_sweeps.py): a sweep is append-only
+    # (migration 0019's triggers), and a candidate only ever gains its job
+    # once, so neither is deleted: a refused candidate stays counted.
+    "research_sweeps": ("SELECT", "INSERT"),
+    "research_sweep_candidates": ("SELECT", "INSERT", "UPDATE"),
     # The trial ledger the Deflated Sharpe discount counts. Only
     # research_trials.record writes it, from the worker, and the API runs an
     # embedded worker under this role, so it needs INSERT. Nothing updates or
@@ -150,6 +155,10 @@ WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "research_experiments": ("SELECT", "UPDATE"),
     # Claim, lease, finish, reap and purge jobs; only the API enqueues them.
     "research_jobs": ("SELECT", "UPDATE", "DELETE"),
+    # A family's trials include the candidates its sweeps refused
+    # (research_sweeps.family_trials, read by trial matrix jobs); only the
+    # API creates a sweep.
+    "research_sweeps": ("SELECT",),
     "research_trials": ("SELECT", "INSERT"),
     # A strategy backtest records what its accepted result measured.
     "research_trial_evaluations": ("SELECT", "INSERT"),

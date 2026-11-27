@@ -1098,6 +1098,76 @@ def test_the_research_worker_runs_a_dataset_snapshot_as_its_own_role(provisioned
     api.close()
 
 
+def test_a_sweep_is_created_and_advanced_as_qs_app_and_run_as_the_research_worker(provisioned, monkeypatch, tmp_path):
+    """qs_app records the sweep, registers its candidates and queues them;
+    qs_research_worker runs them and, building a trial matrix, reads the
+    sweep's refused points as trials of the family, but writes no sweep."""
+    import numpy as np
+    import pandas as pd
+
+    from market_helpers import fake_market
+    from test_research_sweeps import FAMILY, SYMBOLS
+    from test_trial_evaluations import strategy
+
+    days = pd.bdate_range("2021-01-04", "2024-03-29")
+    rng = np.random.default_rng(9)
+    fake_market(monkeypatch, tmp_path, pd.DataFrame(
+        {("Close", t): 100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(days)))) for t in SYMBOLS}, index=days))
+    monkeypatch.setattr(security_service.server_identity, "_registered", False)
+    roles = provisioned.roles
+    api = sessionmaker(bind=provisioned.engine_as(roles.app))()
+    worker_sessions = sessionmaker(bind=provisioned.engine_as(roles.research_worker))
+    with worker_sessions() as db:
+        security_service.server_identity.ensure_registered(db)
+    runner = worker.Worker(job_process=InlineJobProcess(), session_factory=worker_sessions,
+                           lease_seconds=60, timeout_seconds=300, poll_seconds=0.1)
+
+    def view_of(response):
+        assert runner.run_once() is True
+        api.expire_all()
+        return research_jobs.view(api, api.get(models.ResearchJob, json.loads(response.body)["job_id"]))
+
+    user = models.User(email="sweep-role@example.com", password_hash="x", role="user")
+    api.add(user)
+    api.commit()
+    snap = view_of(main.snapshot_dataset(schemas.DatasetSnapshotRequest(
+        symbols=SYMBOLS, start="2021-01-04", end="2024-03-30"), user=user, db=api))
+    datasets = [d["dataset_id"] for d in snap["result"]["datasets"]]
+    main.register_strategy(schemas.StrategyRegisterRequest(spec=strategy(), tag="base"), user=user, db=api)
+    pid = main.create_research_pipeline(schemas.ResearchPipelineRequest(name="sweep", max_jobs=10),
+                                        user=user, db=api)["pipeline_id"]
+    created = json.loads(main.create_research_sweep(pid, schemas.ResearchSweepRequest(
+        strategy="base", grid={"fast": [5, 10, 30, 40]}, period="2y", dataset_ids=datasets),
+        user=user, db=api, routing=main.JobRouting()).body)
+    assert (created["n_candidates"], created["n_rejected"], created["n_queued"]) == (4, 2, 2)
+    while True:
+        while runner.run_once():
+            pass
+        if main.advance_research_sweep(created["sweep_id"], user=user, db=api)["queued"] == 0:
+            break
+    done = main.get_research_sweep(created["sweep_id"], user=user, db=api)
+    ran = [c for c in done["candidates"] if c["job_id"]]
+    assert [c["job_status"] for c in ran] == ["succeeded", "succeeded"], ran
+    matrix = view_of(main.validation_matrix(schemas.ValidationMatrixRequest(
+        evaluation=ran[0]["job_id"], period="2y", initial_capital=100_000.0), user=user, db=api))
+    assert matrix["status"] == "succeeded", matrix
+    assert matrix["result"]["ledger"]["trials"] == 4 and matrix["result"]["ledger"]["sweep_rejections"] == 2
+    assert matrix["result"]["family"] == FAMILY
+    assert security_service.audit_chain_status(api, full=True)["valid"]
+    api.close()
+    research_worker = provisioned.connect(roles.research_worker)
+    assert research_worker.execute("SELECT sum(n_rejected) FROM research_sweeps").fetchone() == (2,)
+    for statement in ("INSERT INTO research_sweeps (id) VALUES ('x')", "UPDATE research_sweeps SET n_rejected = 0",
+                      "SELECT 1 FROM research_sweep_candidates", "DELETE FROM research_sweeps"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            research_worker.execute(statement)
+    app = provisioned.connect(roles.app)
+    for statement in ("DELETE FROM research_sweeps", "DELETE FROM research_sweep_candidates",
+                      "TRUNCATE research_sweeps", "TRUNCATE research_sweep_candidates"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            app.execute(statement)
+
+
 def test_a_research_job_registers_and_reuses_its_market_data_as_the_least_privileged_roles(
         provisioned, monkeypatch, tmp_path):
     """The worker registers a task's snapshot as qs_research_worker; the API

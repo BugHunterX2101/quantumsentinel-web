@@ -441,7 +441,13 @@ class ResearchJob(Base):
     """
     __tablename__ = "research_jobs"
     __table_args__ = (Index("ix_research_jobs_status_created", "status", "created_at"),
-                      Index("ix_research_jobs_user_status", "user_id", "status"))
+                      Index("ix_research_jobs_user_status", "user_id", "status"),
+                      Index("ix_research_jobs_pipeline", "pipeline_id"),
+                      # A retry that names the same key gets the job the first
+                      # request queued (research_jobs.enqueue), while the job
+                      # is kept (RESEARCH_JOB_RETENTION_DAYS).
+                      Index("uq_research_jobs_idempotency", "user_id", "idempotency_key", unique=True,
+                            postgresql_where=text("idempotency_key IS NOT NULL")))
 
     id = Column(String, primary_key=True, default=gen_uuid)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
@@ -459,6 +465,47 @@ class ResearchJob(Base):
     result_json = Column(JSON, nullable=True)
     error_status = Column(Integer, nullable=True)   # HTTP-style status of a failure
     error_detail = Column(Text, nullable=True)      # user-safe message, never a traceback
+    # The pipeline the job was queued in (its budget paid for it), the step
+    # of that pipeline it runs, the caller's idempotency key, and the sha256
+    # of the request queued under it (research_jobs.request_fingerprint),
+    # which a retry under the key must match.
+    pipeline_id = Column(String, ForeignKey("research_pipelines.id"), nullable=True)
+    stage = Column(String(64), nullable=True)
+    idempotency_key = Column(String(128), nullable=True)
+    request_hash = Column(String(64), nullable=True)
+
+
+class ResearchPipeline(Base):
+    """A bounded run of research jobs: it may queue at most ``max_jobs``.
+
+    ``jobs_queued`` counts every job ever queued in the pipeline, whatever
+    became of it, and is never lowered: a finished job is purged after
+    RESEARCH_JOB_RETENTION_DAYS, but the budget it spent stays spent.
+    Migration 0018 adds CHECKs holding the counter within the budget and
+    ``closed_at`` to the status.
+    """
+    __tablename__ = "research_pipelines"
+    __table_args__ = (Index("ix_research_pipelines_user_created", "user_id", "created_at"),)
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    name = Column(String(120), nullable=False)
+    max_jobs = Column(Integer, nullable=False)
+    jobs_queued = Column(Integer, nullable=False, default=0)
+    status = Column(String(16), nullable=False, default="open")   # open | closed
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ResearchPipelineDay(Base):
+    """How many pipeline jobs a user queued on one UTC day, for the daily
+    budget (RESEARCH_PIPELINE_DAILY_JOBS). Like a pipeline's counter, it
+    counts every job queued and is never lowered."""
+    __tablename__ = "research_pipeline_days"
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    day = Column(Date, primary_key=True)
+    jobs_queued = Column(Integer, nullable=False, default=0)
 
 
 class DatasetVersion(Base):

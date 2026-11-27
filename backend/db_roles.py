@@ -87,6 +87,11 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "refresh_tokens": DML,
     "research_experiments": DML,
     "research_jobs": DML,
+    # Research pipelines and the daily pipeline counter (research_jobs.
+    # enqueue). Their counters only rise and a pipeline is closed, never
+    # removed, so a spent budget cannot be handed back: no DELETE.
+    "research_pipeline_days": ("SELECT", "INSERT", "UPDATE"),
+    "research_pipelines": ("SELECT", "INSERT", "UPDATE"),
     # The trial ledger the Deflated Sharpe discount counts. Only
     # research_trials.record writes it, from the worker, and the API runs an
     # embedded worker under this role, so it needs INSERT. Nothing updates or

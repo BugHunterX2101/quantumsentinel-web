@@ -697,6 +697,11 @@ Check extension status at runtime: `GET /api/research/cpp-status`
 
 Research runs as background jobs, never inside the request. The dashboard backtest (`POST /api/backtests`), every `POST` below and the experiment `run`, `replay` and `validate` endpoints validate their input, queue a job and return **`202 Accepted`** at once with the job and a `Location: /api/research/jobs/{job_id}` header. Poll that URL until `status` is `succeeded` (the job then carries `result`), `failed` (`error` holds `status_code` and `detail`) or `cancelled`. Invalid input is still rejected immediately (`400`/`422`) and nothing is queued. A user may have at most `RESEARCH_MAX_ACTIVE_JOBS_PER_USER` jobs queued or running (default 3); one more is refused with `429`. Jobs and their results are visible only to the user who queued them.
 
+Any request that queues a job may carry two optional headers:
+
+- **`Idempotency-Key`** (8 to 128 characters of `A-Z a-z 0-9 _ -`): the job is queued once. The same request again (same endpoint and the same JSON body) under the same key returns that job, whatever its status, and spends nothing. A different request under a used key is refused with `409`, and an invalid key with `400`. A key is freed when its job is deleted after `RESEARCH_JOB_RETENTION_DAYS`. One exception: when the answer is a job an identical request had already queued (a dataset snapshot, or an experiment's run or validation, still queued or running), that job keeps its own key, if any. Once it finishes, a retry under the new key queues a new job.
+- **`X-Research-Pipeline`** (a pipeline id): the job is queued in that **research pipeline** and spends one job of its budget. A pipeline is a budget fixed in advance (`max_jobs`, 1 to 10,000). A job spends its place whatever becomes of it: a failed, cancelled or deleted job still counts. A closed or spent pipeline refuses more jobs with `409`. On top of each pipeline's budget, one user may queue at most `RESEARCH_PIPELINE_DAILY_JOBS` pipeline jobs per UTC day, and one more is refused with `429`. Someone else's pipeline answers `404`. Bounding a search before it runs keeps the number of trials, and so the Deflated Sharpe discount, honest.
+
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/research/backtest` | Event-driven backtest with commission · spread · slippage · execution delay |
@@ -719,6 +724,10 @@ Research runs as background jobs, never inside the request. The dashboard backte
 | `GET`  | `/api/research/jobs` | The caller's recent research jobs, newest first, without results (`?limit=`, up to 100) |
 | `GET`  | `/api/research/jobs/{job_id}` | One job's status and queue position; its result or error once finished |
 | `POST` | `/api/research/jobs/{job_id}/cancel` | Cancel a queued job, or stop a running one (its process is killed) |
+| `POST` | `/api/research/pipelines` | Open a research pipeline: `name`, `max_jobs` (`201`) |
+| `GET`  | `/api/research/pipelines` | The caller's pipelines, newest first, with jobs queued and remaining |
+| `GET`  | `/api/research/pipelines/{pipeline_id}` | One pipeline and the jobs it queued that are still kept |
+| `POST` | `/api/research/pipelines/{pipeline_id}/close` | Close a pipeline: it queues no more jobs (jobs already queued still run) |
 | `GET`  | `/api/research/queue` | Operator only: queued and running counts, oldest queued job's age, live research workers (`workers_online`) and live research evaluators (`evaluators_online`) |
 
 ### Market Microstructure & Paper Exchange Endpoints
@@ -889,6 +898,7 @@ Configuration defaults and production checks live in [`backend/config.py`](backe
 | `RESEARCH_JOB_LEASE_SECONDS` | No | A running job goes back to the queue when its worker stops renewing it for this long (default 60) |
 | `RESEARCH_JOB_MAX_ATTEMPTS` | No | Runs a job gets when its workers are lost mid-run, before it is marked failed (default 2) |
 | `RESEARCH_MAX_ACTIVE_JOBS_PER_USER` | No | Queued plus running research jobs one user may have (default 3) |
+| `RESEARCH_PIPELINE_DAILY_JOBS` | No | Pipeline jobs one user may queue per UTC day, across all their research pipelines (default 100; `0` refuses every pipeline job) |
 | `RESEARCH_JOB_RETENTION_DAYS` | No | Finished jobs and their results are deleted after this many days (default 7) |
 | `RESEARCH_WORKER_POLL_SECONDS` | No | How often an idle worker checks the queue (default 1) |
 | `DATASET_ROOT` | No | Where dataset blobs are stored. The Docker image sets `/data/datasets`; production compose mounts the `datasets` volume there on the research worker (read-only on the research evaluator and the `backup` service). Default outside Docker: `data/datasets` in the repository |

@@ -31,6 +31,7 @@ from contextlib import asynccontextmanager
 import hashlib
 import math
 from collections import OrderedDict, defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, WebSocket, WebSocketDisconnect, Query, Cookie
@@ -60,8 +61,8 @@ from .config import (CORS_ORIGINS, ALLOWED_HOSTS, ENVIRONMENT, REDIS_URL, JWT_EX
                      RESEARCH_WORKER_MODE, PROCESS_ROLE)
 from .crypto import pqc
 from .services import auth_service, signal_engine, trading_service, portfolio_service, security_service, integration_service, order_security
-from .services import (dataset_registry, paper_broker, research_jobs, research_trials, strategy_registry,
-                       strategy_validation, trial_matrix, validation_manifest)
+from .services import (dataset_registry, paper_broker, research_jobs, research_pipelines, research_trials,
+                       strategy_registry, strategy_validation, trial_matrix, validation_manifest)
 from .services import walk_forward as walk_forward_service
 from .services import stat_tests as stat_tests_service
 from .services import redis_store
@@ -332,7 +333,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-CSRF-Token", "Idempotency-Key",
+    allow_headers=["Content-Type", "Authorization", "X-CSRF-Token", "Idempotency-Key", "X-Research-Pipeline",
                    "If-None-Match", "X-QS-API-KEY", "X-QS-Key-ID", "X-QS-Timestamp",
                    "X-QS-Nonce", "X-QS-Signature"],
 )
@@ -1770,14 +1771,41 @@ def create_strategy(req: schemas.StrategyRequest, user: models.User = Depends(ge
     return {"id": strategy.id, "name": strategy.name, "assets": strategy.assets, "config": strategy.config}
 
 
+@dataclass(frozen=True)
+class JobRouting:
+    """Where a queued research job goes, from the request's headers: the
+    caller's research pipeline (``X-Research-Pipeline``), whose budget the job
+    spends, and the caller's ``Idempotency-Key``, under which a retried
+    request gets the job the first one queued (research_jobs.enqueue). A
+    retry is the same request when what the client sent is the same
+    (``request_hash``), whatever server state the endpoint read since."""
+    pipeline_id: str | None = None
+    idempotency_key: str | None = None
+    request_hash: str | None = None
+
+
+async def job_routing(request: Request,
+                      idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+                      pipeline_id: Optional[str] = Header(default=None, alias="X-Research-Pipeline")) -> JobRouting:
+    idempotency_key = idempotency_key or None
+    request_hash = None
+    if idempotency_key is not None:
+        # FastAPI has already read the body to validate it: this is a cached copy.
+        request_hash = research_jobs.request_fingerprint(request.method, request.url.path, request.url.query,
+                                                         await request.body())
+    return JobRouting(pipeline_id=pipeline_id or None, idempotency_key=idempotency_key,
+                      request_hash=request_hash)
+
+
 @app.post("/api/backtests", status_code=202)
 def run_backtest(req: schemas.BacktestRequest, user: models.User = Depends(get_current_user),
-                 db: Session = Depends(get_db)):
+                 db: Session = Depends(get_db),
+                 routing: JobRouting = Depends(job_routing)):
     """Queue the dashboard moving-average backtest; the finished job's result
     carries the stored backtest ``id``."""
     if req.slow_window <= req.fast_window:
         raise HTTPException(400, "slow_window must be larger than fast_window")
-    return _queue_research(db, user, "ma_backtest", req)
+    return _queue_research(db, user, "ma_backtest", req, routing)
 
 
 @app.get("/api/backtests")
@@ -1820,17 +1848,25 @@ def export_portfolio(user: models.User = Depends(get_current_user), db: Session 
 # --------------------------------------------------------------------------
 
 def _queue_job(db: Session, user: models.User, kind: str, params: dict,
-               same_as: tuple[str, ...] = ()) -> JSONResponse:
+               same_as: tuple[str, ...] = (), routing: JobRouting = JobRouting()) -> JSONResponse:
     """Queue a research job and answer 202 with the job to poll.
 
     Research runs in a worker process (backend/worker.py), never in the API
     process: a heavy computation here would hold a request thread and a
     database connection for its whole duration and stall trading requests.
     """
+    if not isinstance(routing, JobRouting):
+        # An endpoint called as a plain function (not through FastAPI) hands
+        # over its unresolved Depends(job_routing) default: no headers.
+        routing = JobRouting()
     try:
-        job = research_jobs.enqueue(db, user.id, kind, params, same_as=same_as)
+        job = research_jobs.enqueue(db, user.id, kind, params, same_as=same_as,
+                                    pipeline_id=routing.pipeline_id, idempotency_key=routing.idempotency_key,
+                                    request_hash=routing.request_hash)
     except research_jobs.QueueFull as exc:
         raise HTTPException(429, str(exc)) from exc
+    except research_jobs.JobRefused as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
     return JSONResponse(research_jobs.view(db, job), status_code=202,
                         headers={"Location": f"/api/research/jobs/{job.id}"})
 
@@ -1842,33 +1878,37 @@ def _require_held_datasets(db: Session, user: models.User, req) -> None:
             raise HTTPException(404, f"Dataset not found: {dataset_id}")
 
 
-def _queue_research(db: Session, user: models.User, kind: str, req) -> JSONResponse:
+def _queue_research(db: Session, user: models.User, kind: str, req,
+                    routing: JobRouting = JobRouting()) -> JSONResponse:
     _require_held_datasets(db, user, req)
-    return _queue_job(db, user, kind, req.model_dump())
+    return _queue_job(db, user, kind, req.model_dump(), routing=routing)
 
 
 @app.post("/api/research/backtest", status_code=202)
 def advanced_backtest(req: schemas.AdvancedBacktestRequest,
                       user: models.User = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      routing: JobRouting = Depends(job_routing)):
     """Queue an advanced backtest (realistic execution costs, multiple
     strategies, comprehensive risk metrics)."""
-    return _queue_research(db, user, "advanced_backtest", req)
+    return _queue_research(db, user, "advanced_backtest", req, routing)
 
 
 @app.post("/api/research/walk-forward", status_code=202)
 def walk_forward_validation(req: schemas.WalkForwardRequest,
                             user: models.User = Depends(get_current_user),
-                            db: Session = Depends(get_db)):
+                            db: Session = Depends(get_db),
+                            routing: JobRouting = Depends(job_routing)):
     """Queue walk-forward validation (rolling/expanding windows,
     out-of-sample aggregation)."""
-    return _queue_research(db, user, "walk_forward", req)
+    return _queue_research(db, user, "walk_forward", req, routing)
 
 
 @app.post("/api/research/stat-test", status_code=202)
 def statistical_tests(req: schemas.StatTestRequest,
                       user: models.User = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      routing: JobRouting = Depends(job_routing)):
     """Queue statistical tests on strategy returns: t-test, bootstrap,
     permutation, Deflated Sharpe Ratio, and multiple-testing corrections."""
     returns = None
@@ -1911,7 +1951,7 @@ def statistical_tests(req: schemas.StatTestRequest,
         "declared": req.n_strategies_tested, "server_counted": server_counted,
         "trial_family": trial_family, "n_bootstrap": req.n_bootstrap,
         "n_permutations": req.n_permutations,
-    })
+    }, routing=routing)
 
 
 # --------------------------------------------------------------------------
@@ -1921,100 +1961,111 @@ def statistical_tests(req: schemas.StatTestRequest,
 @app.post("/api/research/alpha", status_code=202)
 def alpha_research_endpoint(req: schemas.AlphaResearchRequest,
                              user: models.User = Depends(get_current_user),
-                             db: Session = Depends(get_db)):
+                             db: Session = Depends(get_db),
+                             routing: JobRouting = Depends(job_routing)):
     """Queue alpha research: IC, Rank IC, IC decay, hit rate, quintile
     analysis, factor turnover."""
-    return _queue_research(db, user, "alpha", req)
+    return _queue_research(db, user, "alpha", req, routing)
 
 
 @app.post("/api/research/factor-model", status_code=202)
 def factor_model_endpoint(req: schemas.FactorModelRequest,
                            user: models.User = Depends(get_current_user),
-                           db: Session = Depends(get_db)):
+                           db: Session = Depends(get_db),
+                           routing: JobRouting = Depends(job_routing)):
     """Queue a Fama-MacBeth factor model with Newey-West inference."""
-    return _queue_research(db, user, "factor_model", req)
+    return _queue_research(db, user, "factor_model", req, routing)
 
 
 @app.post("/api/research/correlation", status_code=202)
 def correlation_endpoint(req: schemas.CorrelationRequest,
                           user: models.User = Depends(get_current_user),
-                          db: Session = Depends(get_db)):
+                          db: Session = Depends(get_db),
+                          routing: JobRouting = Depends(job_routing)):
     """Queue multi-method correlation analysis (Pearson, Spearman, EWMA,
     Ledoit-Wolf, OAS, PCA)."""
-    return _queue_research(db, user, "correlation", req)
+    return _queue_research(db, user, "correlation", req, routing)
 
 
 @app.post("/api/research/optimize", status_code=202)
 def portfolio_optimize_endpoint(req: schemas.PortfolioOptRequest,
                                   user: models.User = Depends(get_current_user),
-                                  db: Session = Depends(get_db)):
+                                  db: Session = Depends(get_db),
+                                  routing: JobRouting = Depends(job_routing)):
     """Queue multi-method portfolio optimisation with efficient frontier."""
-    return _queue_research(db, user, "optimize", req)
+    return _queue_research(db, user, "optimize", req, routing)
 
 
 @app.post("/api/research/event-backtest", status_code=202)
 def event_backtest_endpoint(req: schemas.EventBacktestRequest,
                              user: models.User = Depends(get_current_user),
-                             db: Session = Depends(get_db)):
+                             db: Session = Depends(get_db),
+                             routing: JobRouting = Depends(job_routing)):
     """Queue an event-driven backtest (1-bar execution delay, commissions,
     spread, slippage, borrow costs)."""
-    return _queue_research(db, user, "event_backtest", req)
+    return _queue_research(db, user, "event_backtest", req, routing)
 
 
 @app.post("/api/research/regime", status_code=202)
 def regime_detection_endpoint(req: schemas.RegimeDetectionRequest,
                                user: models.User = Depends(get_current_user),
-                               db: Session = Depends(get_db)):
+                               db: Session = Depends(get_db),
+                               routing: JobRouting = Depends(job_routing)):
     """Queue market-regime detection (Gaussian HMM, volatility percentile,
     SMA trend)."""
-    return _queue_research(db, user, "regime", req)
+    return _queue_research(db, user, "regime", req, routing)
 
 
 @app.post("/api/research/neutral-strategy", status_code=202)
 def neutral_strategy_endpoint(req: schemas.NeutralStrategyRequest,
                                user: models.User = Depends(get_current_user),
-                               db: Session = Depends(get_db)):
+                               db: Session = Depends(get_db),
+                               routing: JobRouting = Depends(job_routing)):
     """Queue a dollar-neutral cross-sectional long/short strategy."""
-    return _queue_research(db, user, "neutral_strategy", req)
+    return _queue_research(db, user, "neutral_strategy", req, routing)
 
 
 @app.post("/api/research/pairs-trading", status_code=202)
 def pairs_trading_endpoint(req: schemas.PairsTradingRequest,
                             user: models.User = Depends(get_current_user),
-                            db: Session = Depends(get_db)):
+                            db: Session = Depends(get_db),
+                            routing: JobRouting = Depends(job_routing)):
     """Queue pairs trading (Engle-Granger cointegration, Kalman hedge
     ratio, Z-score signals)."""
     if req.asset_y == req.asset_x:
         raise HTTPException(422, "asset_y and asset_x must be different")
-    return _queue_research(db, user, "pairs_trading", req)
+    return _queue_research(db, user, "pairs_trading", req, routing)
 
 
 @app.post("/api/research/latency-benchmark", status_code=202)
 def latency_benchmark_endpoint(req: schemas.LatencyBenchmarkRequest,
                                 user: models.User = Depends(get_current_user),
-                                db: Session = Depends(get_db)):
+                                db: Session = Depends(get_db),
+                                routing: JobRouting = Depends(job_routing)):
     """Queue an end-to-end research pipeline latency benchmark."""
-    return _queue_research(db, user, "latency_benchmark", req)
+    return _queue_research(db, user, "latency_benchmark", req, routing)
 
 
 @app.post("/api/research/report", status_code=202)
 def research_report_endpoint(req: schemas.ReportRequest,
                               user: models.User = Depends(get_current_user),
-                              db: Session = Depends(get_db)):
+                              db: Session = Depends(get_db),
+                              routing: JobRouting = Depends(job_routing)):
     """Queue the full 7-section quant research report."""
-    return _queue_research(db, user, "report", req)
+    return _queue_research(db, user, "report", req, routing)
 
 
 @app.post("/api/research/datasets", status_code=202)
 def snapshot_dataset(req: schemas.DatasetSnapshotRequest,
                      user: models.User = Depends(get_current_user),
-                     db: Session = Depends(get_db)):
+                     db: Session = Depends(get_db),
+                     routing: JobRouting = Depends(job_routing)):
     """Queue a snapshot: fetch daily bars for the symbols and freeze them as
     content-addressed datasets (one per family). The job's result lists the
     dataset ids; an identical request already queued or running is
     returned instead of fetching twice."""
     return _queue_job(db, user, "dataset_snapshot", req.model_dump(mode="json"),
-                      same_as=("symbols", "start", "end"))
+                      same_as=("symbols", "start", "end"), routing=routing)
 
 
 @app.get("/api/research/datasets")
@@ -2104,7 +2155,8 @@ def tag_strategy(version_id: str, req: schemas.StrategyTagRequest,
 @app.post("/api/research/strategy-backtest", status_code=202)
 def strategy_backtest(req: schemas.StrategyBacktestRequest,
                       user: models.User = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      routing: JobRouting = Depends(job_routing)):
     """Queue a backtest of one of the caller's strategy versions, named by its
     id or one of their tags: the event engine runs its spec on its universe's
     prices over the trailing period. A tag is resolved now, so the job runs
@@ -2119,13 +2171,14 @@ def strategy_backtest(req: schemas.StrategyBacktestRequest,
     _require_held_datasets(db, user, req)
     job = schemas.StrategyBacktestJob(strategy_version_id=version.version_id, period=req.period,
                                       initial_capital=req.initial_capital, dataset_ids=req.dataset_ids)
-    return _queue_job(db, user, "strategy_backtest", job.model_dump())
+    return _queue_job(db, user, "strategy_backtest", job.model_dump(), routing=routing)
 
 
 @app.post("/api/research/validation-matrix", status_code=202)
 def validation_matrix(req: schemas.ValidationMatrixRequest,
                       user: models.User = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      routing: JobRouting = Depends(job_routing)):
     """Queue the trial matrix of one of the caller's strategy evaluations,
     named by the job that recorded it: every strategy version evaluated in
     its family re-runs on the datasets it read, over the period and with the
@@ -2142,13 +2195,14 @@ def validation_matrix(req: schemas.ValidationMatrixRequest,
                                       initial_capital=req.initial_capital,
                                       dataset_ids=sorted(evaluation.dataset_ids))
     _require_held_datasets(db, user, job)
-    return _queue_job(db, user, "validation_matrix", job.model_dump())
+    return _queue_job(db, user, "validation_matrix", job.model_dump(), routing=routing)
 
 
 @app.post("/api/research/strategy-validation", status_code=202)
 def validate_strategy(req: schemas.StrategyValidationRequest,
                       user: models.User = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      routing: JobRouting = Depends(job_routing)):
     """Queue the validation of one of the caller's strategy evaluations,
     named as for its trial matrix: the job builds the matrix (as
     /api/research/validation-matrix does), and the worker judges the
@@ -2164,7 +2218,7 @@ def validate_strategy(req: schemas.StrategyValidationRequest,
                                         initial_capital=req.initial_capital,
                                         dataset_ids=sorted(evaluation.dataset_ids))
     _require_held_datasets(db, user, job)
-    return _queue_job(db, user, "strategy_validation", job.model_dump())
+    return _queue_job(db, user, "strategy_validation", job.model_dump(), routing=routing)
 
 
 @app.get("/api/research/strategy-validations")
@@ -2245,6 +2299,55 @@ def cancel_research_job(job_id: str, user: models.User = Depends(get_current_use
     if job is None:
         raise HTTPException(404, "Research job not found")
     return research_jobs.view(db, job, include_result=False)
+
+
+@app.post("/api/research/pipelines", status_code=201)
+def create_research_pipeline(req: schemas.ResearchPipelineRequest,
+                             user: models.User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    """Open a research pipeline: a budget of ``max_jobs`` jobs. Queue a job in
+    it by sending its id in the X-Research-Pipeline header; each one spends
+    one job of the budget, and of the daily RESEARCH_PIPELINE_DAILY_JOBS."""
+    try:
+        pipeline = research_pipelines.create(db, user.id, req.name, req.max_jobs)
+    except research_pipelines.JobRefused as exc:
+        raise HTTPException(exc.status_code, exc.detail) from None
+    security_service.write_audit_log(db, user.id, "PIPELINE_CREATED", "research_pipeline", pipeline.id,
+                                     {"max_jobs": pipeline.max_jobs})
+    return research_pipelines.view(db, pipeline)
+
+
+@app.get("/api/research/pipelines")
+def list_research_pipelines(user: models.User = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    """The caller's research pipelines, newest first."""
+    return {"pipelines": [research_pipelines.view(db, p)
+                          for p in research_pipelines.list_for_user(db, user.id)]}
+
+
+@app.get("/api/research/pipelines/{pipeline_id}")
+def get_research_pipeline(pipeline_id: str, user: models.User = Depends(get_current_user),
+                          db: Session = Depends(get_db)):
+    """One of the caller's pipelines, with the jobs it queued that are still kept."""
+    pipeline = research_pipelines.get_for_user(db, user.id, pipeline_id)
+    if pipeline is None:
+        raise HTTPException(404, "Research pipeline not found")
+    return research_pipelines.view(db, pipeline, include_jobs=True)
+
+
+@app.post("/api/research/pipelines/{pipeline_id}/close")
+def close_research_pipeline(pipeline_id: str, user: models.User = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    """Close the pipeline: it queues nothing more. Jobs already queued still run."""
+    before = research_pipelines.get_for_user(db, user.id, pipeline_id)
+    was_open = before is not None and before.status == research_pipelines.OPEN
+    pipeline = research_pipelines.close(db, user.id, pipeline_id)
+    if pipeline is None:
+        raise HTTPException(404, "Research pipeline not found")
+    if was_open and pipeline.status == research_pipelines.CLOSED:
+        security_service.write_audit_log(db, user.id, "PIPELINE_CLOSED", "research_pipeline", pipeline.id,
+                                         {"jobs_queued": pipeline.jobs_queued})
+    return research_pipelines.view(db, pipeline)
 
 
 @app.get("/api/research/queue")
@@ -2531,7 +2634,8 @@ def experiment_get(experiment_id: str, user: models.User = Depends(get_current_u
 
 @app.post("/api/experiments/{experiment_id}/run", status_code=202)
 def experiment_run(experiment_id: str, user: models.User = Depends(get_current_user),
-                   db: Session = Depends(get_db)):
+                   db: Session = Depends(get_db),
+                   routing: JobRouting = Depends(job_routing)):
     """Queue execution of a platform strategy on the experiment's stored
     inputs; the job then records the result and signs the manifest (once).
     Submitting again while the run is queued or running returns its job."""
@@ -2542,7 +2646,7 @@ def experiment_run(experiment_id: str, user: models.User = Depends(get_current_u
         raise HTTPException(422, str(exc)) from exc
     if params is None:
         raise HTTPException(404, f"Experiment {experiment_id} not found")
-    return _queue_job(db, user, "experiment_run", params, same_as=("experiment_id",))
+    return _queue_job(db, user, "experiment_run", params, same_as=("experiment_id",), routing=routing)
 
 
 @app.get("/api/experiments/{experiment_id}/manifest", status_code=200)
@@ -2558,7 +2662,8 @@ def experiment_manifest(experiment_id: str, user: models.User = Depends(get_curr
 
 @app.post("/api/experiments/{experiment_id}/replay", status_code=202)
 def experiment_replay(experiment_id: str, request_body: dict, user: models.User = Depends(get_current_user),
-                      db: Session = Depends(get_db)):
+                      db: Session = Depends(get_db),
+                      routing: JobRouting = Depends(job_routing)):
     """Queue deterministic verification of an experiment.
 
     Always verifies inputs: the (optionally supplied) dataset, parameters and
@@ -2570,12 +2675,13 @@ def experiment_replay(experiment_id: str, request_body: dict, user: models.User 
     params = PersistentExperimentRegistry(db, user.id).replay_job_params(experiment_id, request_body)
     if params is None:
         raise HTTPException(404, f"Experiment {experiment_id} not found")
-    return _queue_job(db, user, "experiment_replay", params)
+    return _queue_job(db, user, "experiment_replay", params, routing=routing)
 
 
 @app.post("/api/experiments/{experiment_id}/validate", status_code=202)
 def experiment_validate(experiment_id: str, user: models.User = Depends(get_current_user),
-                        db: Session = Depends(get_db)):
+                        db: Session = Depends(get_db),
+                        routing: JobRouting = Depends(job_routing)):
     """Queue the integrity and deployment gates (re-executing the strategy);
     the experiment becomes VALIDATED only if every gate passes. Submitting
     again while validation is queued or running returns its job."""
@@ -2586,7 +2692,7 @@ def experiment_validate(experiment_id: str, user: models.User = Depends(get_curr
         raise HTTPException(409, str(exc)) from exc
     if params is None:
         raise HTTPException(404, f"Experiment {experiment_id} not found")
-    return _queue_job(db, user, "experiment_validate", params, same_as=("experiment_id",))
+    return _queue_job(db, user, "experiment_validate", params, same_as=("experiment_id",), routing=routing)
 
 
 @app.post("/api/experiments/{experiment_id}/approve", status_code=200)

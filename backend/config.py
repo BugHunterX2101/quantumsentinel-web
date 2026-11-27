@@ -107,6 +107,10 @@ RESEARCH_JOB_LEASE_SECONDS = float(os.getenv("RESEARCH_JOB_LEASE_SECONDS", "60")
 RESEARCH_JOB_MAX_ATTEMPTS = int(os.getenv("RESEARCH_JOB_MAX_ATTEMPTS", "2"))
 # Queued plus running jobs one user may have at a time.
 RESEARCH_MAX_ACTIVE_JOBS_PER_USER = int(os.getenv("RESEARCH_MAX_ACTIVE_JOBS_PER_USER", "3"))
+# Jobs one user may queue in research pipelines per UTC day, across all their
+# pipelines (each pipeline also has its own budget). 0 refuses every pipeline
+# job.
+RESEARCH_PIPELINE_DAILY_JOBS = int(os.getenv("RESEARCH_PIPELINE_DAILY_JOBS", "100"))
 # Finished jobs (and their results) are deleted after this many days.
 RESEARCH_JOB_RETENTION_DAYS = float(os.getenv("RESEARCH_JOB_RETENTION_DAYS", "7"))
 RESEARCH_WORKER_POLL_SECONDS = float(os.getenv("RESEARCH_WORKER_POLL_SECONDS", "1"))

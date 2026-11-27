@@ -611,6 +611,14 @@ class StrategyTagRequest(BaseModel):
     label: str
 
 
+class ResearchPipelineRequest(BaseModel):
+    """A research pipeline to open: its name and the number of jobs it may
+    ever queue (research_pipelines.create checks both)."""
+    model_config = {"extra": "forbid"}
+    name: str
+    max_jobs: int
+
+
 def _trailing_period(value: str) -> str:
     from .services.market_data import PERIOD
 

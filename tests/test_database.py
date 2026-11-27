@@ -70,6 +70,8 @@ class TestMigrations:
             conn.execute(text("DROP TABLE strategy_validations, trial_matrices"))
             conn.execute(text("DROP TABLE research_trial_evaluations"))
             conn.execute(text("DROP TABLE user_strategy_tags, user_strategy_versions, strategy_versions"))
+            # And revision 0018 these.
+            conn.execute(text("DROP TABLE research_pipeline_days, research_pipelines"))
             conn.execute(text("INSERT INTO users (id, email, password_hash) VALUES ('u1', 'old@example.com', 'h')"))
             conn.execute(text("INSERT INTO trades (id, user_id, asset, side, quantity, status) "
                               "VALUES ('t1', 'u1', 'AAPL', 'buy', 2.5, 'FILLED')"))

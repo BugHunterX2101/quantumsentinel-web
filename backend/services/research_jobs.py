@@ -22,20 +22,25 @@ that was presumed dead and replaced can never overwrite the newer attempt.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import importlib
+import json
 import math
+import re
 import threading
 from dataclasses import dataclass
 
 import numpy as np
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..config import (RESEARCH_JOB_MAX_ATTEMPTS, RESEARCH_JOB_RETENTION_DAYS,
-                      RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
-from . import dataset_registry, research_trials, security_service
+                      RESEARCH_MAX_ACTIVE_JOBS_PER_USER, RESEARCH_PIPELINE_DAILY_JOBS)
+from . import dataset_registry, research_pipelines, research_trials, security_service
+from .research_pipelines import JobRefused
 from .research_tasks import TaskError
 
 QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED = "queued", "running", "succeeded", "failed", "cancelled"
@@ -227,44 +232,137 @@ def _finite(value):
 _enqueue_lock = threading.Lock()
 
 
+IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9_-]{8,128}")   # the order desk's policy
+STAGE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+class IdempotencyConflict(JobRefused):
+    def __init__(self):
+        super().__init__(409, "Idempotency-Key was already used for a different research job")
+
+
+def request_fingerprint(method: str, path: str, query: str, body: bytes) -> str:
+    """What a client sent, as a sha256: the method, path, query and body (a
+    JSON body canonically, so key order and spacing do not matter). An
+    idempotent retry is matched on this, not on the job's params: an
+    endpoint fills params from server state at request time (stat-test's
+    trial count, a tag's strategy version), which may have moved by the
+    retry."""
+    try:
+        content = json.dumps(json.loads(body), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (UnicodeDecodeError, ValueError):
+        content = body.hex()
+    canonical = json.dumps([method.upper(), path, query, content], separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _params_fingerprint(kind: str, params: dict) -> str:
+    """The fingerprint of a job queued outside an HTTP request: its kind and
+    params."""
+    return hashlib.sha256(json.dumps([kind, params], sort_keys=True, separators=(",", ":"))
+                          .encode("utf-8")).hexdigest()
+
+
 def enqueue(db: Session, user_id: str, kind: str, params: dict,
-            same_as: tuple[str, ...] = ()) -> models.ResearchJob:
+            same_as: tuple[str, ...] = (), *, pipeline_id: str | None = None,
+            stage: str | None = None, idempotency_key: str | None = None,
+            request_hash: str | None = None) -> models.ResearchJob:
     """Queue a job, or raise QueueFull when the user is at their active limit.
 
     With ``same_as`` (names of params fields), a queued or running job of
-    this kind whose params match on all of them is returned instead of
-    queueing a duplicate.
+    this kind in the same pipeline (or outside any, like this one) whose
+    params match on all of them is returned instead of queueing a duplicate.
+
+    With ``pipeline_id``, the job spends one job of that pipeline's budget
+    and of the user's daily pipeline budget (research_pipelines.charge), or
+    is refused with JobRefused; ``stage`` names the step of the pipeline it
+    runs.
+
+    With ``idempotency_key``, a job this user queued under the same key is
+    returned instead (whatever its status, while it is kept), spending
+    nothing, if it is the same request: same kind, pipeline, stage and
+    ``request_hash`` (request_fingerprint of what the client sent; for a
+    job queued outside a request, the hash of its kind and params). A
+    different request under a used key is refused (IdempotencyConflict). A job ``same_as`` returns keeps its own key (if
+    any): the new key is not recorded on it.
     """
     if kind not in KINDS:
         raise ValueError(f"unknown research job kind {kind!r}")
+    if idempotency_key is not None and not IDEMPOTENCY_KEY.fullmatch(idempotency_key):
+        raise JobRefused(400, "invalid Idempotency-Key")
+    if stage is not None and (pipeline_id is None or not STAGE.fullmatch(stage)):
+        raise ValueError(f"invalid pipeline stage {stage!r}")
     params = json_safe(params)
-    with _enqueue_lock:
-        try:
-            db.execute(text("SELECT id FROM users WHERE id = :uid FOR UPDATE"), {"uid": user_id})
-            job = None
-            if same_as:
-                job = next((existing for existing in db.execute(
-                    select(models.ResearchJob).where(
-                        models.ResearchJob.user_id == user_id, models.ResearchJob.kind == kind,
-                        models.ResearchJob.status.in_(ACTIVE))
-                    .order_by(models.ResearchJob.created_at)).scalars()
-                    if all((existing.params_json or {}).get(f) == params.get(f) for f in same_as)), None)
-            if job is None:
-                active = int(db.execute(
-                    select(func.count()).select_from(models.ResearchJob).where(
-                        models.ResearchJob.user_id == user_id,
-                        models.ResearchJob.status.in_(ACTIVE))
-                ).scalar() or 0)
-                if active >= RESEARCH_MAX_ACTIVE_JOBS_PER_USER:
-                    raise QueueFull(active, RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
-                job = models.ResearchJob(user_id=user_id, kind=kind, params_json=params, status=QUEUED,
-                                         max_attempts=KINDS[kind].max_attempts or RESEARCH_JOB_MAX_ATTEMPTS)
-                db.add(job)
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-    db.refresh(job)
+    if idempotency_key is None:
+        request_hash = None
+    elif request_hash is None:
+        request_hash = _params_fingerprint(kind, params)
+    # The user's row lock serialises one user's enqueues, so the key lookup
+    # below sees any job an earlier request queued under it. The unique index
+    # is a backstop: if another path ever inserted first, the retry finds it.
+    for attempt in (1, 2):
+        with _enqueue_lock:
+            try:
+                job = _enqueue_locked(db, user_id, kind, params, same_as, pipeline_id, stage, idempotency_key,
+                                      request_hash)
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                if idempotency_key is None or attempt == 2:
+                    raise
+                continue
+            except Exception:
+                db.rollback()
+                raise
+        db.refresh(job)
+        return job
+    raise AssertionError("unreachable")
+
+
+def _same_request(job: models.ResearchJob, kind: str, request_hash: str, pipeline_id: str | None,
+                  stage: str | None) -> bool:
+    return (job.kind == kind and job.request_hash == request_hash and job.pipeline_id == pipeline_id
+            and job.stage == stage)
+
+
+def _enqueue_locked(db: Session, user_id: str, kind: str, params: dict, same_as: tuple[str, ...],
+                    pipeline_id: str | None, stage: str | None,
+                    idempotency_key: str | None, request_hash: str | None) -> models.ResearchJob:
+    db.execute(text("SELECT id FROM users WHERE id = :uid FOR UPDATE"), {"uid": user_id})
+    if idempotency_key is not None:
+        earlier = db.execute(select(models.ResearchJob).where(
+            models.ResearchJob.user_id == user_id,
+            models.ResearchJob.idempotency_key == idempotency_key)).scalar_one_or_none()
+        if earlier is not None:
+            if not _same_request(earlier, kind, request_hash, pipeline_id, stage):
+                raise IdempotencyConflict()
+            return earlier
+    if same_as:
+        duplicate = next((existing for existing in db.execute(
+            select(models.ResearchJob).where(
+                models.ResearchJob.user_id == user_id, models.ResearchJob.kind == kind,
+                models.ResearchJob.status.in_(ACTIVE),
+                models.ResearchJob.pipeline_id.is_(None) if pipeline_id is None
+                else models.ResearchJob.pipeline_id == pipeline_id)
+            .order_by(models.ResearchJob.created_at)).scalars()
+            if all((existing.params_json or {}).get(f) == params.get(f) for f in same_as)), None)
+        if duplicate is not None:
+            return duplicate
+    active = int(db.execute(
+        select(func.count()).select_from(models.ResearchJob).where(
+            models.ResearchJob.user_id == user_id,
+            models.ResearchJob.status.in_(ACTIVE))
+    ).scalar() or 0)
+    if active >= RESEARCH_MAX_ACTIVE_JOBS_PER_USER:
+        raise QueueFull(active, RESEARCH_MAX_ACTIVE_JOBS_PER_USER)
+    if pipeline_id is not None:
+        research_pipelines.charge(db, user_id, pipeline_id, RESEARCH_PIPELINE_DAILY_JOBS, utcnow().date())
+    job = models.ResearchJob(user_id=user_id, kind=kind, params_json=params, status=QUEUED,
+                             max_attempts=KINDS[kind].max_attempts or RESEARCH_JOB_MAX_ATTEMPTS,
+                             pipeline_id=pipeline_id, stage=stage, idempotency_key=idempotency_key,
+                             request_hash=request_hash)
+    db.add(job)
+    db.flush()
     return job
 
 
@@ -332,6 +430,8 @@ def view(db: Session, job: models.ResearchJob, include_result: bool = True) -> d
         "finished_at": _iso(job.finished_at),
         "poll_url": f"/api/research/jobs/{job.id}",
     }
+    if job.pipeline_id is not None:
+        out["pipeline_id"], out["stage"] = job.pipeline_id, job.stage
     if job.status in ACTIVE:
         # Only the workers that may claim it: no evaluator runs an ordinary
         # job, and nothing runs a kind this build does not know.

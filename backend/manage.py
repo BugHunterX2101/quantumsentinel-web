@@ -16,6 +16,7 @@
     python -m backend.manage ai-arxiv-sync <SET> --by <who> [--from <YYYY-MM-DD>] [--max-pages <N>]
     python -m backend.manage ai-metadata-sync <openalex|crossref> --by <who> [--max-docs <N>]
     python -m backend.manage ai-extract --by <who> [--max-docs <N>]
+    python -m backend.manage ai-propose --by <who> [--max-hypotheses <N>]
     python -m backend.manage ai-job <AI_JOB_ID>
 
 Roles are granted only here — out of band, by someone with shell access to
@@ -77,7 +78,11 @@ hypothesis extraction (backend/ai/extract.py): the AI worker asks its model
 (AI_MODEL_PROVIDER, AI_MODEL) about every document not yet extracted with
 the current prompt and model, within the daily token budget
 (AI_DAILY_INPUT_TOKENS, AI_DAILY_OUTPUT_TOKENS). At most one is queued or
-running. ``ai-job`` prints an AI job's state and result.
+running. ``ai-propose`` queues strategy-signal proposals
+(backend/ai/propose.py) for every extracted hypothesis without one for the
+current prompt and model; a person accepts a proposal, or not, in the
+trusted tier. At most one is queued or running. ``ai-job`` prints an AI
+job's state and result.
 """
 import argparse
 import sys
@@ -145,6 +150,9 @@ def main(argv: list[str] | None = None) -> int:
     ai_extract = commands.add_parser("ai-extract", help="queue a hypothesis extraction from the registry's papers")
     ai_extract.add_argument("--by", required=True, help="who queues it")
     ai_extract.add_argument("--max-docs", type=int, help="stop after this many documents")
+    ai_propose = commands.add_parser("ai-propose", help="queue strategy-signal proposals for extracted hypotheses")
+    ai_propose.add_argument("--by", required=True, help="who queues it")
+    ai_propose.add_argument("--max-hypotheses", type=int, help="stop after this many hypotheses")
     ai_job = commands.add_parser("ai-job", help="print an AI job's state and result")
     ai_job.add_argument("job")
     args = parser.parse_args(argv)
@@ -192,6 +200,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ai-extract":
         init_db()
         return _ai_extract(SessionLocal, args.max_docs, args.by)
+    if args.command == "ai-propose":
+        init_db()
+        return _ai_propose(SessionLocal, args.max_hypotheses, args.by)
     if args.command == "ai-job":
         init_db()
         return _print_ai_job(SessionLocal, args.job)
@@ -402,6 +413,30 @@ def _ai_extract(session_factory, max_docs: int | None, queued_by: str) -> int:
         db.commit()
         security_service.write_audit_log(db, None, "AI_JOB_QUEUED", "ai_job", job_id,
                                          {"kind": "extract", "queued_by": queued_by.strip()[:320], **payload})
+        print(f"AI job queued: {job_id}")
+    return 0
+
+
+def _ai_propose(session_factory, max_hypotheses: int | None, queued_by: str) -> int:
+    from .ai import propose, queue
+    from .services import security_service
+
+    payload = {} if max_hypotheses is None else {"max_hypotheses": max_hypotheses}
+    try:
+        propose.check_payload(payload)
+    except ValueError as exc:
+        print(f"ai-propose: {exc}", file=sys.stderr)
+        return 1
+    with session_factory() as db:
+        conn, schema = _ai_connection(db)
+        try:
+            job_id = queue.enqueue(conn, schema, "propose", payload, queued_by)
+        except queue.EnqueueError as exc:
+            print(f"ai-propose: {exc}", file=sys.stderr)
+            return 1
+        db.commit()
+        security_service.write_audit_log(db, None, "AI_JOB_QUEUED", "ai_job", job_id,
+                                         {"kind": "propose", "queued_by": queued_by.strip()[:320], **payload})
         print(f"AI job queued: {job_id}")
     return 0
 

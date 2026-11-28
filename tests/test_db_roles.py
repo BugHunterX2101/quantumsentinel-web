@@ -477,12 +477,12 @@ def test_the_ai_allow_lists_keep_the_ai_worker_to_its_own_jobs():
     assert set(db_roles.APP_AI_TABLE_PRIVILEGES["sources"]) == set(db_roles.APP_AI_TABLE_PRIVILEGES["harvests"])         == {"SELECT"}
     assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["document_metadata"]) == {"SELECT", "INSERT", "UPDATE"}
     assert set(db_roles.APP_AI_TABLE_PRIVILEGES["document_metadata"]) == {"SELECT"}
-    # Extractions are append-only; a token reservation is closed by UPDATE,
-    # never deleted. The app only reads them.
-    for table in ("extractions", "hypotheses"):
+    # Extractions and proposals are append-only; a token reservation is
+    # closed by UPDATE, never deleted. The app only reads them.
+    for table in ("extractions", "hypotheses", "proposals"):
         assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES[table]) == {"SELECT", "INSERT"}
     assert set(db_roles.AI_WORKER_TABLE_PRIVILEGES["token_reservations"]) == {"SELECT", "INSERT", "UPDATE"}
-    for table in ("extractions", "hypotheses", "token_reservations"):
+    for table in ("extractions", "hypotheses", "proposals", "token_reservations"):
         assert set(db_roles.APP_AI_TABLE_PRIVILEGES[table]) == {"SELECT"}
     for allowed in (db_roles.AI_WORKER_TABLE_PRIVILEGES, db_roles.APP_AI_TABLE_PRIVILEGES):
         assert all(p and set(p) <= set(db_roles.TABLE_PRIVILEGES) for p in allowed.values())
@@ -840,6 +840,65 @@ def test_the_ai_worker_extracts_hypotheses_as_its_own_role(provisioned, capsys):
                f' signal_family, direction, horizon, reported_metric, reported_value, model_confidence, rationale)'
                f" SELECT id, 2, 's', repeat('q', 20), 'fx', 'other', 'long', 'daily', 'none', '', 'low', ''"
                f' FROM "{ai}".extractions LIMIT 1')),
+    ):
+        for statement in statements:
+            with pytest.raises(errors.InsufficientPrivilege):
+                conn.execute(statement)
+
+
+def test_the_ai_worker_proposes_strategy_signals_as_its_own_role(provisioned, capsys):
+    """The app role queues an extraction and then a proposal job (manage
+    ai-propose); the AI worker, as qs_ai_worker, runs both, and the proposal
+    is recorded. The app role only reads proposals; neither role may change
+    or delete one, and the app may not write one."""
+    from backend.ai import documents
+    from backend.ai import settings as ai_settings
+    from backend.ai.documents import clean_page
+    from backend.ai.worker import AiWorker
+    from test_arxiv_registry import page, raw
+    from test_extract import BUDGET
+
+    roles = provisioned.roles
+    ai = db_roles.ai_schema_for(provisioned.schema)
+    ai_worker = provisioned.connect(roles.ai_worker)
+    sentence = "A 50-day moving average crossover earns a Sharpe ratio of 0.85 on commodity futures."
+    with ai_worker.transaction():
+        documents.upsert_page(ai_worker, ai, clean_page(page(
+            raw(id="2611.00001", abstract=sentence, datestamp="2026-10-01"))))
+    app_sessions = sessionmaker(bind=provisioned.engine_as(roles.app))
+    for flag in ("research_intelligence", "extract", "propose"):
+        assert manage._set_flag(app_sessions, flag, True, "ops@example.com", "role test") == 0
+    settings = ai_settings.load({
+        "QS_PROCESS_ROLE": "ai-worker", "AI_MODEL_PROVIDER": "fake", **BUDGET,
+        "AI_DATABASE_URL": provisioned.url(roles.ai_worker).render_as_string(hide_password=False),
+        "AI_DB_SCHEMA": ai, "AI_WORKER_HEARTBEAT_SECONDS": "0.5"})
+    capsys.readouterr()
+    assert manage._ai_extract(app_sessions, None, "ops@example.com") == 0
+    assert manage._ai_propose(app_sessions, 0, "ops@example.com") == 1
+    assert "max_hypotheses must be" in capsys.readouterr().err
+    assert manage._ai_propose(app_sessions, 5, "ops@example.com") == 0
+    job_id = capsys.readouterr().out.strip().rsplit(": ", 1)[1]
+    runner = AiWorker(settings)
+    runner.connect()
+    try:
+        assert runner.run_once() == "succeeded"
+        assert runner.run_once() == "succeeded"
+    finally:
+        runner.close()
+    app = provisioned.connect(roles.app)
+    status, result, payload = app.execute(f'SELECT status, result, payload FROM "{ai}".jobs WHERE id = %s',
+                                          (job_id,)).fetchone()
+    assert status == "succeeded" and payload == {"max_hypotheses": 5}
+    assert (result["hypotheses"], result["proposed"], result["caught_up"]) == (1, 1, True)
+    assert app.execute(f'SELECT status, template FROM "{ai}".proposals').fetchall() == [
+        ("proposed", "ma_crossover")]
+    assert app.execute(f'SELECT status, count(*) FROM "{ai}".token_reservations GROUP BY status').fetchall() == [
+        ("settled", 2)]
+    for conn, statements in (
+        (ai_worker, (f'DELETE FROM "{ai}".proposals', f'TRUNCATE "{ai}".proposals',
+                     f'UPDATE "{ai}".proposals SET status = \'invalid\'')),
+        (app, (f'DELETE FROM "{ai}".proposals', f'UPDATE "{ai}".proposals SET status = \'invalid\'',
+               f'INSERT INTO "{ai}".proposals SELECT * FROM "{ai}".proposals LIMIT 1')),
     ):
         for statement in statements:
             with pytest.raises(errors.InsufficientPrivilege):

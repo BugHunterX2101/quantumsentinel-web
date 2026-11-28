@@ -142,16 +142,166 @@ def _t(schema: str, name: str) -> sql.Composable:
     return sql.Identifier(schema, name)
 
 
-class _Extract:
+class Asker:
+    """What a driver that asks the model one question at a time shares
+    (here and backend/ai/propose.py): the job's ownership, its end, the
+    request path with its ledger actions and retries, and the guard around
+    the driver's loop. A subclass names its task (WHAT, PROMPT_VERSION,
+    COUNTS, which include input_tokens and output_tokens) and gives
+    ``check_payload`` and ``loop``."""
+    WHAT: str
+    PROMPT_VERSION: str
+    COUNTS: tuple[str, ...]
+
     def __init__(self, worker, job: dict, spec):
         self.worker, self.job, self.spec = worker, job, spec
         self.conn, self.schema, self.settings = worker.conn, worker.schema, worker.settings
-        self.totals = dict.fromkeys(COUNTS, 0)
+        self.totals = dict.fromkeys(self.COUNTS, 0)
         self.retries = self.retries_in_a_row = 0
-        self.unsendable: list[str] = []
+
+    @staticmethod
+    def check_payload(payload) -> int | None:
+        raise NotImplementedError
+
+    def loop(self, limit: int | None, deadline: float) -> str:
+        """Ask until done; returns how the job ended (complete or fail)."""
+        raise NotImplementedError
 
     def own(self) -> None:
         pacing.own(self.conn, self.schema, self.job["id"], self.worker.id)
+
+    def limits(self) -> ledger.Limits:
+        return ledger.Limits(self.settings.daily_input_tokens, self.settings.daily_output_tokens)
+
+    def result(self, caught_up: bool, budget_exhausted: bool = False, rate_limited: bool = False) -> dict:
+        return {"provider": self.settings.model_provider, "model": self.settings.model,
+                "prompt_version": self.PROMPT_VERSION, "caught_up": caught_up,
+                "budget_exhausted": budget_exhausted, "rate_limited": rate_limited, "retries": self.retries,
+                **self.totals}
+
+    def fail(self, reason: str) -> str:
+        reason = documents.clean_text(reason, 1000) or "failed"
+        with self.conn.transaction():
+            self.own()
+            queue.fail(self.conn, self.schema, self.job["id"], self.worker.id,
+                       f"The {self.WHAT} failed: {reason}")
+        log.warning("%s %s failed: %s", self.WHAT, self.job["id"], reason)
+        return "failed"
+
+    def complete(self, caught_up: bool, budget_exhausted: bool = False, rate_limited: bool = False) -> str:
+        with self.conn.transaction():
+            done = queue.complete(self.conn, self.schema, self.job["id"], self.worker.id,
+                                  self.result(caught_up, budget_exhausted, rate_limited))
+        return "succeeded" if done else "lost (lease lapsed)"
+
+    def run(self) -> str:
+        try:
+            limit = self.check_payload(self.job["payload"])
+        except ValueError as exc:
+            return self.fail(str(exc))
+        if self.settings.model_provider is None:
+            return self.fail("no model provider is configured (AI_MODEL_PROVIDER)")
+        deadline = time.monotonic() + self.spec.timeout_seconds
+        try:
+            return self.loop(limit, deadline)
+        except ledger.BudgetExhausted as exc:
+            log.info("%s %s: %s", self.WHAT, self.job["id"], exc)
+            return self.complete(caught_up=False, budget_exhausted=True)
+        except _RateLimited:
+            log.info("%s %s: the model provider's allowance is spent", self.WHAT, self.job["id"])
+            return self.complete(caught_up=False, rate_limited=True)
+        except pacing.SourceError as exc:
+            return self.fail(str(exc))
+        except psycopg.DatabaseError as exc:
+            if isinstance(exc, psycopg.OperationalError):
+                raise
+            return self.fail(f"the database refused a write: {type(exc).__name__}")
+
+    def request(self, subject: str, user_message: str, input_tokens: int, max_output_tokens: int,
+                task: str | None = None) -> tuple[str, Reply] | None:
+        """Reserve tokens, make one request in a job process and read its
+        reply. Returns the reservation and a reply with HTTP 200, which the
+        caller settles and records in one transaction that makes sure the job
+        is still its own; None after a failed request that will be retried.
+        Raises SourceError when it will not be (naming ``subject``),
+        BudgetExhausted or _RateLimited."""
+        with self.conn.transaction():
+            self.own()
+            reservation = ledger.reserve(
+                self.conn, self.schema, job_id=self.job["id"], attempt=self.job["attempts"],
+                worker_id=self.worker.id, model=self.settings.model, input_tokens=input_tokens,
+                max_output_tokens=max_output_tokens, limits=self.limits())
+        payload = {"provider": self.settings.model_provider, "model": self.settings.model,
+                   "user_message": user_message, "timeout_seconds": REQUEST_TIMEOUT_SECONDS}
+        if task is not None:
+            payload["task"] = task
+        try:
+            out = self.worker.run_child(self.job, self.spec.target, payload, self.spec.child_timeout_seconds,
+                                        self.spec.child_output_max_bytes)
+        except child.JobFailed as exc:
+            self.abandon(reservation)
+            self.retry(subject, f"the request failed: {exc}", None)
+            return None
+        except Interrupted as stop:
+            if stop.release:  # the job is still this worker's until execute hands it back
+                with self.conn.transaction():
+                    ledger.abandon(self.conn, self.schema, reservation)
+            raise
+        try:
+            reply = read_reply(out)
+        except ReplyError as exc:
+            self.abandon(reservation)
+            raise pacing.SourceError(f"the reply about {subject} did not pass the checks: {exc}") from None
+        if reply.http_status != 200:
+            with self.conn.transaction():
+                self.own()
+                ledger.settle(self.conn, self.schema, reservation, ledger.Usage())
+            if reply.http_status in RETRY_STATUSES:
+                if reply.http_status == 429 and reply.retry_after is not None \
+                        and reply.retry_after > MAX_RETRY_AFTER_SECONDS:
+                    raise _RateLimited()
+                self.retry(subject, f"the model provider answered HTTP {reply.http_status}", reply.retry_after)
+                return None
+            raise pacing.SourceError(f"the model provider answered HTTP {reply.http_status}")
+        return reservation, reply
+
+    def settle(self, reservation: str, reply: Reply) -> None:
+        """Settle an answered reservation, in the caller's owned transaction."""
+        if not ledger.settle(self.conn, self.schema, reservation, reply.usage):
+            log.warning("%s %s: reservation %s was closed before its answer came; it counts in full",
+                        self.WHAT, self.job["id"], reservation)
+
+    def answered(self, reply: Reply) -> None:
+        """Count an answered request."""
+        self.retries_in_a_row = 0
+        self.totals["input_tokens"] += reply.usage.input_total
+        self.totals["output_tokens"] += reply.usage.output_tokens
+
+    def abandon(self, reservation: str) -> None:
+        with self.conn.transaction():
+            self.own()
+            ledger.abandon(self.conn, self.schema, reservation)
+
+    def retry(self, subject: str, reason: str, retry_after: int | None) -> None:
+        self.retries += 1
+        self.retries_in_a_row += 1
+        if self.retries_in_a_row > MAX_RETRIES:
+            raise pacing.SourceError(f"{reason} ({MAX_RETRIES} retries in a row, at {subject})")
+        delay = RETRY_SECONDS if retry_after is None else min(max(retry_after, 1), MAX_RETRY_AFTER_SECONDS)
+        log.info("%s %s: %s; retrying in %d s", self.WHAT, self.job["id"], reason, delay)
+        self.worker.sleep(self.job, delay)
+
+
+class _Extract(Asker):
+    WHAT = "hypothesis extraction"
+    PROMPT_VERSION = hypotheses.PROMPT_VERSION
+    COUNTS = COUNTS
+
+    def __init__(self, worker, job: dict, spec):
+        super().__init__(worker, job, spec)
+        self.unsendable: list[str] = []
+
+    check_payload = staticmethod(check_payload)
 
     def due(self) -> list[tuple[str, str, str, str]]:
         """The next batch of documents to ask about: (id, content_hash, title, abstract)."""
@@ -167,125 +317,45 @@ class _Extract:
                 {"skip": self.unsendable, "version": hypotheses.PROMPT_VERSION, "model": self.settings.model,
                  "batch": BATCH}).fetchall()
 
-    def limits(self) -> ledger.Limits:
-        return ledger.Limits(self.settings.daily_input_tokens, self.settings.daily_output_tokens)
-
-    def result(self, caught_up: bool, budget_exhausted: bool = False, rate_limited: bool = False) -> dict:
-        return {"provider": self.settings.model_provider, "model": self.settings.model,
-                "prompt_version": hypotheses.PROMPT_VERSION, "caught_up": caught_up,
-                "budget_exhausted": budget_exhausted, "rate_limited": rate_limited, "retries": self.retries,
-                **self.totals}
-
-    def fail(self, reason: str) -> str:
-        reason = documents.clean_text(reason, 1000) or "failed"
-        with self.conn.transaction():
-            self.own()
-            queue.fail(self.conn, self.schema, self.job["id"], self.worker.id,
-                       f"The hypothesis extraction failed: {reason}")
-        log.warning("extraction %s failed: %s", self.job["id"], reason)
-        return "failed"
-
-    def complete(self, caught_up: bool, budget_exhausted: bool = False, rate_limited: bool = False) -> str:
-        with self.conn.transaction():
-            done = queue.complete(self.conn, self.schema, self.job["id"], self.worker.id,
-                                  self.result(caught_up, budget_exhausted, rate_limited))
-        return "succeeded" if done else "lost (lease lapsed)"
-
-    def run(self) -> str:
-        try:
-            max_docs = check_payload(self.job["payload"])
-        except ValueError as exc:
-            return self.fail(str(exc))
-        if self.settings.model_provider is None:
-            return self.fail("no model provider is configured (AI_MODEL_PROVIDER)")
-        deadline = time.monotonic() + self.spec.timeout_seconds
-        try:
-            while True:
-                batch = self.due()
-                if not batch:
-                    return self.complete(caught_up=True)
-                for document_id, content_hash, title, abstract in batch:
-                    if max_docs is not None and self.totals["documents"] >= max_docs:
+    def loop(self, max_docs: int | None, deadline: float) -> str:
+        while True:
+            batch = self.due()
+            if not batch:
+                return self.complete(caught_up=True)
+            for document_id, content_hash, title, abstract in batch:
+                if max_docs is not None and self.totals["documents"] >= max_docs:
+                    return self.complete(caught_up=False)
+                try:
+                    prompt = hypotheses.prompt_for(title, abstract)
+                except ValueError:
+                    self.unsendable.append(document_id)
+                    self.totals["unsendable"] += 1
+                    continue
+                while True:
+                    if time.monotonic() >= deadline:
                         return self.complete(caught_up=False)
-                    try:
-                        prompt = hypotheses.prompt_for(title, abstract)
-                    except ValueError:
-                        self.unsendable.append(document_id)
-                        self.totals["unsendable"] += 1
-                        continue
-                    while True:
-                        if time.monotonic() >= deadline:
-                            return self.complete(caught_up=False)
-                        if self.ask(document_id, content_hash, prompt):
-                            break
-        except ledger.BudgetExhausted as exc:
-            log.info("extraction %s: %s", self.job["id"], exc)
-            return self.complete(caught_up=False, budget_exhausted=True)
-        except _RateLimited:
-            log.info("extraction %s: the model provider's allowance is spent", self.job["id"])
-            return self.complete(caught_up=False, rate_limited=True)
-        except pacing.SourceError as exc:
-            return self.fail(str(exc))
-        except psycopg.DatabaseError as exc:
-            if isinstance(exc, psycopg.OperationalError):
-                raise
-            return self.fail(f"the database refused a write: {type(exc).__name__}")
+                    if self.ask(document_id, content_hash, prompt):
+                        break
 
     def ask(self, document_id: str, content_hash: str, prompt: hypotheses.Prompt) -> bool:
         """One request, its ledger action and its record; False after a
         failed request that will be retried. Raises SourceError when it will
         not be, BudgetExhausted or _RateLimited."""
-        with self.conn.transaction():
-            self.own()
-            reservation = ledger.reserve(
-                self.conn, self.schema, job_id=self.job["id"], attempt=self.job["attempts"],
-                worker_id=self.worker.id, model=self.settings.model, input_tokens=input_token_bound(prompt),
-                max_output_tokens=hypotheses.MAX_OUTPUT_TOKENS, limits=self.limits())
-        payload = {"provider": self.settings.model_provider, "model": self.settings.model,
-                   "user_message": prompt.user_message, "timeout_seconds": REQUEST_TIMEOUT_SECONDS}
-        try:
-            out = self.worker.run_child(self.job, self.spec.target, payload, self.spec.child_timeout_seconds,
-                                        self.spec.child_output_max_bytes)
-        except child.JobFailed as exc:
-            self.abandon(reservation)
-            self.retry(document_id, f"the request failed: {exc}", None)
+        asked = self.request(f"document {document_id}", prompt.user_message, input_token_bound(prompt),
+                             hypotheses.MAX_OUTPUT_TOKENS)
+        if asked is None:
             return False
-        except Interrupted as stop:
-            if stop.release:  # the job is still this worker's until execute hands it back
-                with self.conn.transaction():
-                    ledger.abandon(self.conn, self.schema, reservation)
-            raise
-        try:
-            reply = read_reply(out)
-        except ReplyError as exc:
-            self.abandon(reservation)
-            raise pacing.SourceError(f"the reply about document {document_id} did not pass the checks: {exc}") \
-                from None
-        if reply.http_status != 200:
-            with self.conn.transaction():
-                self.own()
-                ledger.settle(self.conn, self.schema, reservation, ledger.Usage())
-            if reply.http_status in RETRY_STATUSES:
-                if reply.http_status == 429 and reply.retry_after is not None \
-                        and reply.retry_after > MAX_RETRY_AFTER_SECONDS:
-                    raise _RateLimited()
-                self.retry(document_id, f"the model provider answered HTTP {reply.http_status}", reply.retry_after)
-                return False
-            raise pacing.SourceError(f"the model provider answered HTTP {reply.http_status}")
+        reservation, reply = asked
         checked = hypotheses.check_output(reply.stop_reason, reply.text, prompt)
         with self.conn.transaction():
             self.own()
-            if not ledger.settle(self.conn, self.schema, reservation, reply.usage):
-                log.warning("extraction %s: reservation %s was closed before its answer came; it counts in full",
-                            self.job["id"], reservation)
+            self.settle(reservation, reply)
             extraction_id = hypotheses.record_extraction(
                 self.conn, self.schema, job_id=self.job["id"], document_id=document_id, content_hash=content_hash,
                 prompt=prompt, requested_model=self.settings.model, response_model=reply.model,
                 response_id=reply.response_id, stop_reason=reply.stop_reason, usage=reply.usage, checked=checked)
-        self.retries_in_a_row = 0
+        self.answered(reply)
         self.totals["documents"] += 1
-        self.totals["input_tokens"] += reply.usage.input_total
-        self.totals["output_tokens"] += reply.usage.output_tokens
         if extraction_id is None:
             self.totals["duplicates"] += 1
         else:
@@ -293,20 +363,6 @@ class _Extract:
             self.totals["hypotheses"] += len(checked.hypotheses)
             self.totals["rejected"] += len(checked.rejections)
         return True
-
-    def abandon(self, reservation: str) -> None:
-        with self.conn.transaction():
-            self.own()
-            ledger.abandon(self.conn, self.schema, reservation)
-
-    def retry(self, document_id: str, reason: str, retry_after: int | None) -> None:
-        self.retries += 1
-        self.retries_in_a_row += 1
-        if self.retries_in_a_row > MAX_RETRIES:
-            raise pacing.SourceError(f"{reason} ({MAX_RETRIES} retries in a row, at document {document_id})")
-        delay = RETRY_SECONDS if retry_after is None else min(max(retry_after, 1), MAX_RETRY_AFTER_SECONDS)
-        log.info("extraction %s: %s; retrying in %d s", self.job["id"], reason, delay)
-        self.worker.sleep(self.job, delay)
 
 
 def run(worker, job: dict, spec) -> str:

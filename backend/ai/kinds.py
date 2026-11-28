@@ -4,7 +4,7 @@ A kind's target is ``module:function`` under backend.ai. The function runs
 in a job process (backend/ai/child.py) with no database connection and no
 secret but the one its payload may carry (the OpenAlex API key, which only
 the metadata_sync driver hands over, or the model provider's, which only the
-extract driver does; no stored payload holds either); it takes
+extract and propose drivers do; no stored payload holds either); it takes
 a payload and returns JSON. The job process refuses any
 target not listed here.
 
@@ -59,6 +59,12 @@ KINDS: dict[str, AiKind] = {
     "extract": AiKind("extract", "backend.ai.models:answer", "extract", timeout_seconds=6 * 3600,
                       max_attempts=3, driver="backend.ai.extract:run", child_timeout_seconds=180,
                       child_output_max_bytes=512 * 1024),
+    # Proposes a strategy signal for each extracted hypothesis whose family
+    # is a DSL template (manage ai-propose). Each job process makes one
+    # model request; its answer is at most proposals.MAX_OUTPUT_BYTES.
+    "propose": AiKind("propose", "backend.ai.models:answer", "propose", timeout_seconds=6 * 3600,
+                      max_attempts=3, driver="backend.ai.propose:run", child_timeout_seconds=180,
+                      child_output_max_bytes=128 * 1024),
 }
 TARGETS = frozenset(kind.target for kind in KINDS.values())
 

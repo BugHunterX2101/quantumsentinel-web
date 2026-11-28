@@ -234,6 +234,10 @@ AI_WORKER_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     # extraction and its hypotheses and never changes either.
     "extractions": ("SELECT", "INSERT"),
     "hypotheses": ("SELECT", "INSERT"),
+    # Proposed strategy signals (migration 0020): append-only too. A proposal
+    # never becomes a strategy here; the AI worker has no privilege on any
+    # table of the trusted tier.
+    "proposals": ("SELECT", "INSERT"),
     # The daily token budget: it reserves, then settles, releases or orphans
     # a reservation, and never deletes one.
     "token_reservations": ("SELECT", "INSERT", "UPDATE"),
@@ -252,6 +256,7 @@ APP_AI_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "document_metadata": ("SELECT",),
     "extractions": ("SELECT",),
     "hypotheses": ("SELECT",),
+    "proposals": ("SELECT",),
     "token_reservations": ("SELECT",),
 }
 # Set on qs_ai_worker itself, so they hold whatever its client sets.

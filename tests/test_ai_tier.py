@@ -293,7 +293,7 @@ def ai(make_engine):
 def test_every_flag_starts_off_and_a_stage_needs_the_master_flag_too(ai):
     assert [(r["name"], r["enabled"], r["effective"]) for r in flags.listing(ai.conn, ai.schema)] == [
         (flags.MASTER, False, False), ("arxiv_sync", False, False), ("extract", False, False),
-        ("metadata_sync", False, False), ("selftest", False, False)]
+        ("metadata_sync", False, False), ("propose", False, False), ("selftest", False, False)]
     with pytest.raises(queue.StageOff):
         ai.enqueue()
     ai.switch(master=False, stage=True)

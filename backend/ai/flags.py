@@ -16,7 +16,7 @@ from psycopg import Connection, sql
 
 MASTER = "research_intelligence"
 # One flag per stage of the AI tier; later stages add theirs here.
-STAGES = frozenset({"selftest", "arxiv_sync", "metadata_sync", "extract"})
+STAGES = frozenset({"selftest", "arxiv_sync", "metadata_sync", "extract", "propose"})
 NAMES = frozenset({MASTER} | STAGES)
 
 
